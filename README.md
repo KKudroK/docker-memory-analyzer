@@ -54,6 +54,11 @@ LiME 문자열은 `dockerd`·`containerd` 힙, Docker API 버퍼, 로그, 파일
 
 ## 사용 방법
 
+*powershell 실행정책 차단 풀기 필요
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\실행.ps1" -CasePath "."
+```
+
 PowerShell에서 도구 폴더로 이동합니다.
 
 현재 케이스의 메타데이터와 메모리를 모두 분석합니다.
