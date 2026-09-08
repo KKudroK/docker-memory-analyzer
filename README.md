@@ -56,10 +56,6 @@ LiME 문자열은 `dockerd`·`containerd` 힙, Docker API 버퍼, 로그, 파일
 
 PowerShell에서 도구 폴더로 이동합니다.
 
-```powershell
-cd 'C:\Users\ohnah\Desktop\프로젝트 메모리 분석\희수_덤프\round1_basic\S03_paused\상태식별'
-```
-
 현재 케이스의 메타데이터와 메모리를 모두 분석합니다.
 
 ```powershell
