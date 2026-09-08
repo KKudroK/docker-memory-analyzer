@@ -1,44 +1,19 @@
-# Byte-compiled / optimized / DLL files
+.venv/
 __pycache__/
 *.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
+.pytest_cache/
+.coverage
+htmlcov/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+build/
 *.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# Project specific
-dumps/
+output/*
+!output/.gitkeep
+tmp/
+evidence/
 *.lime
 *.raw
 *.mem
-*.json
-!tests/*.json
-
-# IDE
-.vscode/
-.idea/
+*.vmem
+*.core
+*.elf

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "container-state-analyzer"
+version = "0.1.0"
+description = "Evidence-driven Docker container state analysis for Linux memory forensics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Container Memory Forensics Project"}]
+dependencies = []
+
+[project.scripts]
+container-state = "container_state_analyzer.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+container_state_analyzer = ["data/*.json"]
+

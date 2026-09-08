@@ -1,0 +1,114 @@
+{
+  "schema_version": "2.0",
+  "states": {
+    "created": {
+      "conditions": [
+        {"id":"CR01","artifact":"runtime.container_present","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_identity"},
+        {"id":"CR02","artifact":"runtime.state.running","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"CR03","artifact":"runtime.state.paused","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"CR04","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"CR05","artifact":"runtime.state.removal_in_progress","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"CR06","artifact":"runtime.state.dead","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"CR07","artifact":"runtime.state.pid","layer":"runtime","operator":"eq","expected":0,"strength":"supporting","polarity":"support","group":"runtime_process"},
+        {"id":"CR08","artifact":"runtime.started_at_zero","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"container_metadata"},
+        {"id":"CR09","artifact":"kernel.live_task_count","layer":"kernel","operator":"eq","expected":0,"strength":"decisive","polarity":"support","group":"kernel_execution","required_for_confirmation":true},
+        {"id":"CR10","artifact":"kernel.target_cgroup_present","layer":"kernel","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"cgroup_membership","required_for_confirmation":true},
+        {"id":"CR11","artifact":"kernel.overlay_mounted","layer":"kernel","operator":"eq","expected":false,"strength":"decisive","polarity":"support","group":"overlay_mount"},
+        {"id":"CR12","artifact":"container.upperdir_change_count","layer":"container","operator":"eq","expected":0,"strength":"supporting","polarity":"support","group":"overlay_mount"},
+        {"id":"CRX1","artifact":"kernel.live_task_count","layer":"kernel","operator":"gt","expected":0,"strength":"decisive","polarity":"contradiction","group":"kernel_execution"},
+        {"id":"CRX2","artifact":"kernel.overlay_mounted","layer":"kernel","operator":"eq","expected":true,"strength":"decisive","polarity":"contradiction","group":"overlay_mount"},
+        {"id":"CRX3","artifact":"runtime.started_at_zero","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"contradiction","group":"container_metadata"},
+        {"id":"CRX4","artifact":"runtime.state.running","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"CRX5","artifact":"runtime.state.paused","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"CRX6","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"CRX7","artifact":"runtime.state.removal_in_progress","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"CRX8","artifact":"runtime.state.dead","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"}
+      ]
+    },
+    "running": {
+      "conditions": [
+        {"id":"RU01","artifact":"runtime.state.running","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"RU02","artifact":"runtime.state.paused","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"RU03","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"RU04","artifact":"kernel.live_task_count","layer":"kernel","operator":"gt","expected":0,"strength":"decisive","polarity":"support","group":"kernel_execution","required_for_confirmation":true},
+        {"id":"RU05","artifact":"kernel.task_mm_all_present","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"kernel_execution"},
+        {"id":"RU06","artifact":"kernel.target_cgroup_present","layer":"kernel","operator":"eq","expected":true,"strength":"decisive","polarity":"support","group":"cgroup_membership"},
+        {"id":"RU07","artifact":"kernel.freezer.effective","layer":"kernel","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"freezer_state","valid_when":{"cgroup_version":"v2"}},
+        {"id":"RU08","artifact":"kernel.overlay_mounted","layer":"kernel","operator":"eq","expected":true,"strength":"decisive","polarity":"support","group":"overlay_mount"},
+        {"id":"RU09","artifact":"kernel.veth_present","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"network_namespace"},
+        {"id":"RUX1","artifact":"kernel.live_task_count","layer":"kernel","operator":"eq","expected":0,"strength":"decisive","polarity":"contradiction","group":"kernel_execution"},
+        {"id":"RUX2","artifact":"runtime.state.paused","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"RUX3","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"RUX4","artifact":"kernel.freezer.effective","layer":"kernel","operator":"eq","expected":true,"strength":"decisive","polarity":"contradiction","group":"freezer_state","valid_when":{"cgroup_version":"v2"}}
+      ]
+    },
+    "paused": {
+      "conditions": [
+        {"id":"PA01","artifact":"runtime.state.paused","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_flags","required_for_confirmation":true},
+        {"id":"PA02","artifact":"runtime.state.running","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"PA03","artifact":"kernel.live_task_count","layer":"kernel","operator":"gt","expected":0,"strength":"decisive","polarity":"support","group":"kernel_execution","required_for_confirmation":true},
+        {"id":"PA04","artifact":"kernel.freezer.requested","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"freezer_state","valid_when":{"cgroup_version":"v2"}},
+        {"id":"PA05","artifact":"kernel.freezer.effective","layer":"kernel","operator":"eq","expected":true,"strength":"decisive","polarity":"support","group":"freezer_state","valid_when":{"cgroup_version":"v2"},"required_for_confirmation":true},
+        {"id":"PA06","artifact":"kernel.freezer.all_tasks_frozen","layer":"kernel","operator":"eq","expected":true,"strength":"decisive","polarity":"support","group":"freezer_state","valid_when":{"cgroup_version":"v2"}},
+        {"id":"PA07","artifact":"kernel.target_cgroup_present","layer":"kernel","operator":"eq","expected":true,"strength":"decisive","polarity":"support","group":"cgroup_membership"},
+        {"id":"PAX1","artifact":"kernel.live_task_count","layer":"kernel","operator":"eq","expected":0,"strength":"decisive","polarity":"contradiction","group":"kernel_execution"},
+        {"id":"PAX2","artifact":"kernel.freezer.effective","layer":"kernel","operator":"eq","expected":false,"strength":"decisive","polarity":"contradiction","group":"freezer_state","valid_when":{"cgroup_version":"v2"}},
+        {"id":"PAX3","artifact":"runtime.state.paused","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"}
+      ]
+    },
+    "restarting": {
+      "conditions": [
+        {"id":"RE01","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_flags","required_for_confirmation":true},
+        {"id":"RE02","artifact":"runtime.state.running","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"RE03","artifact":"runtime.restart_count","layer":"runtime","operator":"gt","expected":0,"strength":"weak","polarity":"support","group":"runtime_history"},
+        {"id":"RE04","artifact":"runtime.restart_count_delta","layer":"runtime","operator":"gt","expected":0,"strength":"decisive","polarity":"support","group":"runtime_history"},
+        {"id":"RE05","artifact":"kernel.live_task_count","layer":"kernel","operator":"eq","expected":0,"strength":"decisive","polarity":"support","group":"kernel_execution","required_for_confirmation":true},
+        {"id":"RE06","artifact":"kernel.target_cgroup_present","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cgroup_membership"},
+        {"id":"RE07","artifact":"kernel.target_cgroup_residual","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cgroup_membership"},
+        {"id":"REX1","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"REX2","artifact":"runtime.state.paused","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"}
+      ]
+    },
+    "exited": {
+      "conditions": [
+        {"id":"EX01","artifact":"runtime.state.running","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"EX02","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"EX03","artifact":"runtime.state.dead","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"EX04","artifact":"runtime.state.removal_in_progress","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"EX05","artifact":"runtime.state.pid","layer":"runtime","operator":"eq","expected":0,"strength":"supporting","polarity":"support","group":"runtime_process"},
+        {"id":"EX06","artifact":"runtime.state.exit_code","layer":"runtime","operator":"ne","expected":0,"strength":"weak","polarity":"support","group":"runtime_history"},
+        {"id":"EX07","artifact":"runtime.started_at_zero","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"container_metadata"},
+        {"id":"EX08","artifact":"kernel.live_task_count","layer":"kernel","operator":"eq","expected":0,"strength":"decisive","polarity":"support","group":"kernel_execution","required_for_confirmation":true},
+        {"id":"EX09","artifact":"kernel.target_cgroup_present","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cgroup_membership","required_for_confirmation":true},
+        {"id":"EX10","artifact":"kernel.target_cgroup_residual","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cgroup_membership"},
+        {"id":"EX11","artifact":"kernel.overlay_mounted","layer":"kernel","operator":"eq","expected":false,"strength":"decisive","polarity":"support","group":"overlay_mount"},
+        {"id":"EXX1","artifact":"kernel.live_task_count","layer":"kernel","operator":"gt","expected":0,"strength":"decisive","polarity":"contradiction","group":"kernel_execution"},
+        {"id":"EXX2","artifact":"runtime.state.restarting","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"EXX3","artifact":"runtime.state.dead","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"},
+        {"id":"EXX4","artifact":"runtime.state.removal_in_progress","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"}
+      ]
+    },
+    "dead": {
+      "conditions": [
+        {"id":"DE01","artifact":"runtime.state.dead","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_flags","required_for_confirmation":true},
+        {"id":"DE02","artifact":"runtime.state.running","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"support","group":"runtime_flags"},
+        {"id":"DE03","artifact":"runtime.cleanup_error_present","layer":"runtime","operator":"eq","expected":true,"strength":"decisive","polarity":"support","group":"cleanup_failure"},
+        {"id":"DE04","artifact":"kernel.live_task_count","layer":"kernel","operator":"eq","expected":0,"strength":"decisive","polarity":"support","group":"kernel_execution","required_for_confirmation":true},
+        {"id":"DE05","artifact":"kernel.target_cgroup_residual","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cgroup_membership"},
+        {"id":"DEX1","artifact":"kernel.live_task_count","layer":"kernel","operator":"gt","expected":0,"strength":"decisive","polarity":"contradiction","group":"kernel_execution"},
+        {"id":"DEX2","artifact":"runtime.state.dead","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"}
+      ]
+    },
+    "removing": {
+      "conditions": [
+        {"id":"RM01","artifact":"runtime.state.removal_in_progress","layer":"runtime","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"runtime_flags","required_for_confirmation":true},
+        {"id":"RM02","artifact":"kernel.live_task_count","layer":"kernel","operator":"eq","expected":0,"strength":"decisive","polarity":"support","group":"kernel_execution","required_for_confirmation":true},
+        {"id":"RM03","artifact":"kernel.target_cgroup_residual","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cgroup_membership"},
+        {"id":"RM04","artifact":"kernel.cleanup_list_target_anchored","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cleanup_residue"},
+        {"id":"RM05","artifact":"kernel.slab_residue_present","layer":"kernel","operator":"eq","expected":true,"strength":"supporting","polarity":"support","group":"cleanup_residue"},
+        {"id":"RMX1","artifact":"kernel.live_task_count","layer":"kernel","operator":"gt","expected":0,"strength":"decisive","polarity":"contradiction","group":"kernel_execution"},
+        {"id":"RMX2","artifact":"runtime.state.removal_in_progress","layer":"runtime","operator":"eq","expected":false,"strength":"supporting","polarity":"contradiction","group":"runtime_flags"}
+      ]
+    }
+  }
+}
