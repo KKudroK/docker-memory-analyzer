@@ -1,8 +1,7 @@
 # Docker Container State Identifier
 
-Docker 컨테이너의 상태를 수집 자료와 Linux 메모리 덤프를 이용해 식별하는 포렌식 보조 도구입니다.
+Docker 컨테이너의 상태를 수집 자료와 Linux 메모리 덤프를 이용해 식별하는 포렌식 보조 도구
 
-이 도구의 분석 방식은 다음과 같습니다.
 
 > **Docker 메타데이터 + 수집된 cgroup/proc 상태 + LiME 문자열 교차검증**
 
