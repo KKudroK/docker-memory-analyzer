@@ -6,7 +6,7 @@ Linux 메모리 이미지에서 Docker 상태, 실행 문맥, 네트워크를 �
 |---|---|
 | 상태 식별 | [state_identification](state_identification/README.md) |
 | 실행 문맥 재구성 | [reconstruction](reconstruction/README.md) |
-| Volatility 플러그인 | [pluginss](plugins/README.md) |
+| Volatility 플러그인 | [plugins](plugins/README.md) |
 
 Python 3.10 이상, Volatility 3 **2.28.0** 기준입니다. 저장소 루트에서:
 
