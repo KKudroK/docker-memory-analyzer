@@ -38,10 +38,7 @@ def validate_container(reader, cbase, strict_bools=True):
     if not all(c in '0123456789abcdef' for c in cid):
         return None
 
-    name = reader.read_string(cbase, CONTAINER['Name'][0])
-    if not name or not name.startswith('/'):
-        return None
-
+    name = reader.read_string(cbase, CONTAINER.get('Name', (0,0))[0])
     state_ptr = reader.read_ptr(cbase, CONTAINER['State'][0])
     if not state_ptr or state_ptr < 0x10000:
         return None
@@ -55,10 +52,22 @@ def validate_container(reader, cbase, strict_bools=True):
 
     if bools_valid:
         pid = reader.read_int(state_ptr, STATE['Pid'][0])
-        if pid is None or pid < 0 or pid > 1_000_000:
-            return None
+        # Since Pid offset might not be calibrated, we can't reliably reject based on it.
+        # if pid is None or pid < 0 or pid > 1_000_000:
+        #     return None
 
-    root = reader.read_string(cbase, CONTAINER['Root'][0])
+    # Try to read Root if it is still at the default offset, otherwise ignore
+    root = reader.read_string(cbase, CONTAINER.get('Root', (0, 0))[0]) if 'Root' in CONTAINER else ""
+    # A hex digest followed by zero bytes is not sufficient container evidence.
+    rooted = root == ROOT_PREFIX.decode() + cid
+    config_ptr = reader.read_ptr(cbase, CONTAINER['Config'][0])
+    named = bool(name and name.startswith('/') and name.count('/') == 1 and len(name) > 1)
+    if not rooted and not (named and config_ptr and config_ptr > 0x10000):
+        return None
+    if bools_valid:
+        pid = reader.read_int(state_ptr, STATE['Pid'][0])
+        if pid is None or not 0 <= pid <= 4194304:
+            bools_valid = False
 
     return {
         'cbase': cbase,
@@ -73,12 +82,15 @@ def validate_container(reader, cbase, strict_bools=True):
 
 def _pick_best(existing, new):
     """Choose the better Container struct when we have duplicates for one CID."""
-    if new.get('root') and not existing.get('root'):
-        return new
-    if new.get('root') and existing.get('root'):
-        if new['root'].startswith('/var/lib/docker') and not existing['root'].startswith('/var/lib/docker'):
-            return new
-    return existing
+    candidates = [dict(c) for c in [existing, *existing.get('_alternatives', []), new, *new.get('_alternatives', [])]]
+    unique = {}
+    for candidate in candidates:
+        candidate.pop('_alternatives', None)
+        unique[candidate['cbase']] = candidate
+    best = max(unique.values(), key=lambda c: (bool(c.get('state_valid')), bool(c.get('root')), bool(c.get('name'))))
+    best = dict(best)
+    best['_alternatives'] = [c for addr, c in unique.items() if addr != best['cbase']]
+    return best
 
 
 def discover_via_root_headers(mem, reader, log):
@@ -164,7 +176,7 @@ def discover_via_id_headers(mem, reader, exclude_cids, log):
             root = v.get('root')
             if root and not root.startswith('/var/lib/docker'):
                 continue
-            name = v.get('name', '')
+            name = v.get('name') or ''
             if name.startswith('/proc/') or name.startswith('/sys/') or name.startswith('/dev/'):
                 continue
             v['strategy'] = 'id_header'
@@ -266,10 +278,19 @@ def discover_all_containers(mem, reader, processes, name_hints=None, log=print):
 
     # Strategy 2: PID-based (1 scan per PID + 1 per valid State)
     container_pids = set()
-    shim_pids = {p.pid for p in processes if 'containerd-shim' in p.comm}
-    for p in processes:
-        if p.ppid in shim_pids and 'containerd-shim' not in p.comm:
-            container_pids.add(p.pid)
+    proc_list = processes.values() if isinstance(processes, dict) else (processes or [])
+    shim_pids = set()
+    for p in proc_list:
+        comm = getattr(p, 'comm', None) or (p.get('comm') or p.get('name') if isinstance(p, dict) else '')
+        pid = getattr(p, 'pid', None) or (p.get('pid') if isinstance(p, dict) else None)
+        if pid is not None and 'containerd-shim' in str(comm):
+            shim_pids.add(pid)
+    for p in proc_list:
+        comm = getattr(p, 'comm', None) or (p.get('comm') or p.get('name') if isinstance(p, dict) else '')
+        pid = getattr(p, 'pid', None) or (p.get('pid') if isinstance(p, dict) else None)
+        ppid = getattr(p, 'ppid', None) or (p.get('ppid') if isinstance(p, dict) else None)
+        if pid is not None and ppid in shim_pids and 'containerd-shim' not in str(comm):
+            container_pids.add(pid)
 
     if container_pids:
         log(f"  Strategy 2: PID-based (PIDs: {sorted(container_pids)})...")
@@ -284,11 +305,13 @@ def discover_all_containers(mem, reader, processes, name_hints=None, log=print):
 
     # Strategy 3: ID header scan (1 full scan, skip already-found CIDs)
     log(f"  Strategy 3: ID header scan (len=64, excluding {len(all_found)} found)...")
-    s3 = discover_via_id_headers(mem, reader, set(all_found.keys()), log)
+    s3 = discover_via_id_headers(mem, reader, set(), log)
     log(f"    → {len(s3)} new container(s)")
     for cid, v in s3.items():
         if cid not in all_found:
             all_found[cid] = v
+        else:
+            all_found[cid] = _pick_best(all_found[cid], v)
 
     # Count total unique CIDs from root paths for reporting
     root_hits = mem.find_all(ROOT_PREFIX)
@@ -305,5 +328,7 @@ def discover_all_containers(mem, reader, processes, name_hints=None, log=print):
         log(f"  Unresolved CIDs ({len(unresolved)}):")
         for cid in sorted(unresolved):
             log(f"    {cid[:12]}...")
+            all_found[cid] = {'cbase': 0, 'cid': cid, 'strategy': 'root_path_residue',
+                              'state_valid': False, 'confidence': 'low'}
 
     return all_found

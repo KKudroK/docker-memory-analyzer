@@ -32,7 +32,11 @@ env.bak/
 venv.bak/
 
 # Project specific
+outputs/
+symbols/
+.venv/
 dumps/
+tests/
 *.lime
 *.raw
 *.mem

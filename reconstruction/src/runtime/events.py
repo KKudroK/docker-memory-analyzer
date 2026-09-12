@@ -1,7 +1,7 @@
 """Docker event extraction from cached process memory.
 
-Searches for the Events ring buffer (up to 256 Message entries)
-by finding known event action strings and validating the surrounding struct.
+Carves Message-shaped allocations by Actor.ID and Type. Ring-buffer membership
+is not established, so duplicate and stale allocations retain their addresses.
 """
 import struct
 import datetime
@@ -38,9 +38,6 @@ def extract_events(mem, reader, target_cids=None, log=print):
     events = []
     seen_addrs = set()
 
-    if not target_cids:
-        return events
-
     # Strategy: Find all Go string headers where length == 64
     len_bytes = struct.pack('<Q', 64)
     len_hits = mem.find_all(len_bytes)
@@ -62,7 +59,9 @@ def extract_events(mem, reader, target_cids=None, log=print):
         except Exception:
             continue
 
-        if cid not in target_cids:
+        if len(cid) != 64 or any(c not in '0123456789abcdef' for c in cid):
+            continue
+        if target_cids is not None and cid not in target_cids:
             continue
 
         # This header belongs to an Actor.ID field
@@ -99,5 +98,5 @@ def extract_events(mem, reader, target_cids=None, log=print):
             'addr': msg_base,
         })
 
-    events.sort(key=lambda e: e.get('time_nano') or e.get('time_unix') or 0)
+    events.sort(key=lambda e: e.get('time_nano') or (e.get('time_unix') or 0) * 1000000000)
     return events

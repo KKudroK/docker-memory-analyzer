@@ -1,1 +1,2 @@
-volatility3>=2.5.0
+volatility3==2.28.0
+pyelftools==0.32

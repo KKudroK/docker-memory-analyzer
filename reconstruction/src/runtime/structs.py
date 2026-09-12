@@ -36,6 +36,22 @@ CONTAINER = {
     'ShmPath':                  (0x0258, 16, 'string'),
     'ResolvConfPath':           (0x0268, 16, 'string'),
 }
+
+def load_calibrated_offsets():
+    """Read candidate offsets without mutating process-global structure definitions."""
+    import os, json
+    calibrated_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'symbols', 'dockerd', 'calibrated.json')
+    if os.path.exists(calibrated_path):
+        try:
+            with open(calibrated_path, 'r') as f:
+                data = json.load(f)
+                offsets = data.get('offsets', {})
+                return offsets
+        except Exception as e:
+            raise ValueError(f'Invalid candidate offset file: {calibrated_path}') from e
+    return {}
+
+# load_calibrated_offsets()
 CONTAINER_SIZE = 0x2a8
 
 # ── State struct (192 bytes / 0xc0) ──
@@ -80,12 +96,44 @@ CONFIG_SIZE = 0x120
 
 # ── HostConfig struct (1064 bytes / 0x428) ──
 HOSTCONFIG = {
+    'Binds':                       (0x0000, 24, 'string_slice'),
     'NetworkMode':                 (0x0040, 16, 'string'),
     'RestartPolicy.Name':          (0x0058, 16, 'string'),
     'RestartPolicy.MaxRetryCount': (0x0068,  8, 'int'),
     'AutoRemove':                  (0x0070,  1, 'bool'),
     'Privileged':                  (0x01c0,  1, 'bool'),
     'Runtime':                     (0x0220, 16, 'string'),
+    'ContainerIDFile':             (0x0018, 16, 'string'),
+    'LogConfig.Type':              (0x0028, 16, 'string'),
+    'VolumeDriver':                (0x0078, 16, 'string'),
+    'VolumesFrom':                 (0x0088, 24, 'string_slice'),
+    'CapAdd':                      (0x00b8, 24, 'string_slice'),
+    'CapDrop':                     (0x00d0, 24, 'string_slice'),
+    'CgroupnsMode':                (0x00e8, 16, 'string'),
+    'DNS':                         (0x00f8, 24, 'string_slice'),
+    'DNSOptions':                  (0x0110, 24, 'string_slice'),
+    'DNSSearch':                    (0x0128, 24, 'string_slice'),
+    'ExtraHosts':                   (0x0140, 24, 'string_slice'),
+    'GroupAdd':                     (0x0158, 24, 'string_slice'),
+    'IpcMode':                      (0x0170, 16, 'string'),
+    'PidMode':                      (0x01b0, 16, 'string'),
+    'ReadonlyRootfs':               (0x01c2, 1, 'bool'),
+    'SecurityOpt':                  (0x01c8, 24, 'string_slice'),
+    'UTSMode':                      (0x01f0, 16, 'string'),
+    'UsernsMode':                   (0x0200, 16, 'string'),
+    'ShmSize':                      (0x0210, 8, 'int64'),
+    'Resources.CPUShares':          (0x0248, 8, 'int64'),
+    'Resources.Memory':            (0x0250, 8, 'int64'),
+    'Resources.NanoCPUs':           (0x0258, 8, 'int64'),
+    'Resources.CgroupParent':       (0x0260, 16, 'string'),
+    'Resources.CPUPeriod':          (0x02f0, 8, 'int64'),
+    'Resources.CPUQuota':           (0x02f8, 8, 'int64'),
+    'Resources.CpusetCpus':         (0x0310, 16, 'string'),
+    'Resources.CpusetMems':         (0x0320, 16, 'string'),
+    'Resources.MemoryReservation': (0x0378, 8, 'int64'),
+    'Resources.MemorySwap':        (0x0380, 8, 'int64'),
+    'MaskedPaths':                 (0x03f0, 24, 'string_slice'),
+    'ReadonlyPaths':               (0x0408, 24, 'string_slice'),
 }
 HOSTCONFIG_SIZE = 0x428
 
@@ -147,19 +195,8 @@ def state_to_status(s):
 
     Mirrors container/state.go StateString() logic.
     """
-    if s.get('Running'):
-        if s.get('Paused'):
-            return 'paused'
-        if s.get('Restarting'):
-            return 'restarting'
-        return 'running'
-    if s.get('RemovalInProgress'):
-        return 'removing'
-    if s.get('Dead'):
-        return 'dead'
-    if s.get('HasBeenStartedBefore'):
-        return 'exited'
-    return 'created'
+    from .state_identification import state_to_status as identify_state
+    return identify_state(s)
 
 
 class StructReader:
@@ -167,6 +204,13 @@ class StructReader:
 
     def __init__(self, mem):
         self.mem = mem
+        self.diagnostics = []
+        self.layouts = {}
+        self.field_reads = []
+        self.structure_names = {}
+
+    def layout(self, definition):
+        return self.layouts.get(id(definition), definition)
 
     def read_bytes(self, addr, size):
         return self.mem.read_safe(addr, size)
@@ -176,7 +220,13 @@ class StructReader:
         if raw is None:
             return None
         ptr, length = struct.unpack('<QQ', raw)
-        if length == 0 or length > 65536 or ptr < 0x10000:
+        self.field_reads.append({'structure': 'Go.string', 'field': 'data/length',
+                                 'base_address': hex(base), 'offset': hex(offset),
+                                 'field_address': hex(base + offset), 'size': 16,
+                                 'target_address': hex(ptr), 'target_size': length})
+        if length == 0:
+            return ''
+        if length > 16 * 1024 * 1024 or ptr < 0x10000:
             return None
         data = self.mem.read_safe(ptr, length)
         if data is None:
@@ -226,6 +276,23 @@ class StructReader:
         return wall, ext
 
     def read_field(self, base, struct_def, field_name):
+        resolved = self.layout(struct_def)
+        value = self._read_field_value(base, struct_def, field_name)
+        if field_name in resolved:
+            offset, size, kind = resolved[field_name]
+            name = next((n for n, d in [('Container', CONTAINER), ('State', STATE), ('Config', CONFIG),
+                                       ('HostConfig', HOSTCONFIG), ('Event', EVENT_MESSAGE)] if d is struct_def),
+                        self.structure_names.get(id(struct_def), 'structure'))
+            record = {'structure': name, 'field': field_name, 'base_address': hex(base),
+                      'offset': hex(offset), 'field_address': hex(base + offset),
+                      'size': size, 'type': kind, 'read_status': 'decoded' if value is not None else 'unavailable_or_unsupported'}
+            if kind in ('string', 'slice', 'string_slice', 'ptr', 'map'):
+                record['target_address'] = hex(self.read_ptr(base, offset) or 0)
+            self.field_reads.append(record)
+        return value
+
+    def _read_field_value(self, base, struct_def, field_name):
+        struct_def = self.layout(struct_def)
         if field_name not in struct_def:
             return None
         offset, _size, ftype = struct_def[field_name]
@@ -235,16 +302,53 @@ class StructReader:
             return self.read_bool(base, offset)
         elif ftype in ('int', 'int64'):
             return self.read_int(base, offset)
-        elif ftype in ('ptr', 'map'):
+        elif ftype == 'uint64':
+            return self.read_uint(base, offset)
+        elif ftype in ('ptr', 'map', 'chan'):
             return self.read_ptr(base, offset)
-        elif ftype == 'time':
+        elif ftype in ('time', 'time.Time'):
             return self.read_time(base, offset)
+        elif ftype == 'atomic.Bool':
+            raw = self.mem.read_safe(base + offset, 4)
+            return bool(int.from_bytes(raw, 'little')) if raw is not None and int.from_bytes(raw, 'little') in (0, 1) else None
+        elif ftype == 'string_slice':
+            return self.read_string_slice(base, offset)
         elif ftype == 'slice':
             raw = self.mem.read_safe(base + offset, 24)
             if raw is None:
                 return None
             return struct.unpack('<QQQ', raw)
+        elif ftype in ('interface', 'iface'):
+            raw = self.mem.read_safe(base + offset, 16)
+            if raw is None:
+                return None
+            type_ptr, data_ptr = struct.unpack('<QQ', raw)
+            return {'type': type_ptr, 'data': data_ptr}
         return None
+
+    def read_string_slice(self, base, offset):
+        raw = self.mem.read_safe(base + offset, 24)
+        if raw is None:
+            self.diagnostics.append({'stage': 'slice.header', 'address': base + offset, 'reason': 'unreadable'})
+            return None
+        ptr, length, cap = struct.unpack('<QQQ', raw)
+        self.field_reads.append({'structure': 'Go.[]string', 'field': 'data/length/capacity',
+                                 'base_address': hex(base), 'offset': hex(offset),
+                                 'field_address': hex(base + offset), 'size': 24,
+                                 'target_address': hex(ptr), 'length': length, 'capacity': cap})
+        if length == 0:
+            return []
+        if length > cap or length > 1048576 or ptr < 0x10000:
+            self.diagnostics.append({'stage': 'slice.header', 'address': base + offset, 'reason': 'invalid_or_limit', 'length': length, 'capacity': cap})
+            return None
+            
+        result = []
+        for i in range(length):
+            value = self.read_string(ptr, i * 16)
+            result.append(value)
+            if value is None:
+                self.diagnostics.append({'stage': 'slice.element', 'address': ptr + i * 16, 'index': i, 'reason': 'unreadable_or_invalid'})
+        return result
 
     # ── High-level parsers ──
 
@@ -265,6 +369,11 @@ class StructReader:
         r['HasBeenManuallyRestarted'] = self.read_field(cbase, CONTAINER, 'HasBeenManuallyRestarted')
         r['Managed'] = self.read_field(cbase, CONTAINER, 'Managed')
         r['Created'] = self.read_field(cbase, CONTAINER, 'Created')
+        r['Args'] = self.read_string_slice(cbase, CONTAINER['Args'][0])
+        for name, (_, _, kind) in self.layout(CONTAINER).items():
+            key = name + '_ptr' if kind in ('ptr', 'map') else name
+            if key not in r:
+                r[key] = self.read_field(cbase, CONTAINER, name)
         return r
 
     def parse_state(self, state_addr):
@@ -275,6 +384,12 @@ class StructReader:
             s[name] = self.read_field(state_addr, STATE, name)
         s['Pid'] = self.read_field(state_addr, STATE, 'Pid')
         s['ExitCode'] = self.read_field(state_addr, STATE, 'ExitCode')
+        offset, size, kind = self.layout(STATE)['ExitCode']
+        raw = self.mem.read_safe(state_addr + offset, size)
+        s['ExitCode_evidence'] = {'source': 'dockerd.heap', 'field': 'State.ExitCode',
+            'address': hex(state_addr + offset), 'offset': hex(offset), 'size': size,
+            'encoding': 'little_endian_signed_Go_int', 'raw_hex': raw.hex() if raw is not None else None,
+            'decoded': int.from_bytes(raw, 'little', signed=True) if raw and len(raw) == size else None}
         s['ErrorMsg'] = self.read_field(state_addr, STATE, 'ErrorMsg')
         s['Health_ptr'] = self.read_field(state_addr, STATE, 'Health')
         s['StartedAt'] = self.read_field(state_addr, STATE, 'StartedAt')
@@ -290,13 +405,21 @@ class StructReader:
             r[name] = self.read_field(config_addr, CONFIG, name)
         for name in ('AttachStdin', 'AttachStdout', 'AttachStderr', 'Tty', 'OpenStdin', 'StdinOnce'):
             r[name] = self.read_field(config_addr, CONFIG, name)
+        
+        r['Env'] = self.read_string_slice(config_addr, CONFIG['Env'][0])
+        r['Cmd'] = self.read_string_slice(config_addr, CONFIG['Cmd'][0])
+        r['Entrypoint'] = self.read_string_slice(config_addr, CONFIG['Entrypoint'][0])
+        r['Labels_ptr'] = self.read_field(config_addr, CONFIG, 'Labels')
+        for name, (_, _, kind) in self.layout(CONFIG).items():
+            key = name + '_ptr' if kind in ('ptr', 'map') else name
+            if key not in r:
+                r[key] = self.read_field(config_addr, CONFIG, name)
         return r
 
     def parse_hostconfig(self, hc_addr):
         """Read HostConfig struct fields."""
         r = {}
-        for name in ('NetworkMode', 'RestartPolicy.Name', 'RestartPolicy.MaxRetryCount',
-                      'AutoRemove', 'Privileged', 'Runtime'):
+        for name in self.layout(HOSTCONFIG):
             r[name] = self.read_field(hc_addr, HOSTCONFIG, name)
         return r
 

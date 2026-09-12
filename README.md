@@ -1,27 +1,23 @@
 # Docker Memory Analyzer
 
-<div align="center">
-  <p><strong>컨테이너 환경의 침해사고 분석을 위한 메모리 포렌식 기반 실행 문맥 재구성 도구</strong></p>
-</div>
+Linux 메모리 이미지에서 Docker 상태, 실행 문맥, 네트워크를 분석합니다.
 
-## Overview
+| 기능 | 실행법 및 결과 예시 |
+|---|---|
+| 상태 식별 | [state_identification](state_identification/README.md) |
+| 실행 문맥 재구성 | [reconstruction](reconstruction/README.md) |
+| volatility-docker 고도화 | [volatility_docker](volatility_docker/README.md) |
 
-**Docker Memory Analyzer**는 대상 시스템의 메모리 덤프를 기반으로 컨테이너의 상태와 실행 문맥을 파악하기 위한 종합 분석 도구입니다.
+Python 3.10 이상, Volatility 3 **2.28.0** 기준입니다. 저장소 루트에서:
 
-기존의 정적인 로그나 파일 시스템 아티팩트 분석의 한계를 극복하기 위해, 메모리에 남아있는 휘발성 데이터를 다각도로 수집하고 통합 분석합니다. 이를 통해 악의적인 사용자가 증거를 인멸하거나 데몬이 비정상 종료된 상황에서도 컨테이너의 라이프사이클 이벤트와 과거 상태를 신뢰성 있게 재구성하는 것을 목표로 합니다.
-
-## Getting Started
-
-### Prerequisites
-- Python 3.10+
-- Linux Memory Dump file (e.g., LiME format)
-
-### Installation
-```bash
-git clone https://github.com/KKudroK/docker-memory-analyzer.git
-cd docker-memory-analyzer
-pip install -r requirements.txt
+```powershell
+python -m venv .venv
+.venv/Scripts/Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+덤프와 해당 커널에 정확히 대응하는 Linux ISF는 별도로 준비합니다. README의 `dumps/sample.lime`과 `symbols`는 사용자 입력 경로입니다. 덤프·심볼·대상 런타임 바이너리는 배포하지 않습니다.
+
+상태 식별과 재구성은 공통 수집 엔진을 사용하므로 각각 독립 실행할 수 있도록 공통 소스를 포함합니다. 두 폴더를 동시에 PYTHONPATH에 넣지 말고 해당 진입 스크립트를 실행하세요. 네트워크 플러그인은 두 기능에 의존하지 않습니다.
+
+검증: 코어 테스트 30개, 네트워크 단위 테스트 23개, S01 실덤프 네트워크 검사 40개. 모든 커널·런타임 버전에서의 동작을 보장하는 것은 아닙니다. [수정 내역과 검증 범위](volatility_docker/REVIEW.md)를 참고하세요.
