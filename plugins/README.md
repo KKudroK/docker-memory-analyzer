@@ -30,13 +30,3 @@ vol -q -p volatility_docker/src/plugins -s symbols -o outputs/network -f dumps/s
 ```
 
 `network_evidence.json`에 추가 수집 데이터, 출처, 오류와 미지원 경로를 기록합니다.
-
-## 개발
-
-```powershell
-python volatility_docker/scripts/build_network_plugin.py
-python volatility_docker/scripts/test_network_plugin.py
-python volatility_docker/scripts/test_network_compatibility.py
-```
-
-`src/network_analysis` 수정 후 빌더로 단일 배포 파일을 생성합니다. 단위 테스트 23개와 S01 실덤프 검증 40개를 통과했습니다. [검토 기록](REVIEW.md)에 호환성 검증 범위를 구분했습니다.
