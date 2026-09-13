@@ -9,8 +9,8 @@ The plugin deliberately separates three facts that are easy to conflate:
 * a mount's source is visible at a particular path in the host namespace.
 
 Only the second fact makes a namespace a default output candidate.  A host
-source is reported as confirmed only when the mount root dentry can be mapped
-through a host-namespace mount that references the same superblock.
+source is reported as confirmed only when a complete host index yields one
+fully checked, unshadowed route through a mount sharing its superblock.
 """
 
 from dataclasses import dataclass
@@ -341,6 +341,31 @@ def _object_address(obj) -> int:
         return int(obj.vol.offset)
 
 
+def _object_readable(obj) -> bool:
+    """Validate pointer targets and embedded structs with their own layer APIs.
+
+    Pointer.is_readable() checks the pointed-to object.  Embedded StructType
+    objects (for example mount.mnt and list heads) do not provide that method;
+    their storage range must be checked in their layer instead.  Do not treat
+    an absent pointer-only method as unreadable memory.
+    """
+
+    try:
+        if obj is None:
+            return False
+        pointer_check = getattr(obj, "is_readable", None)
+        if callable(pointer_check):
+            return bool(obj) and bool(pointer_check())
+        return bool(obj._context.layers[obj.vol.layer_name].is_valid(
+            int(obj.vol.offset), int(obj.vol.size)
+        ))
+    except (
+        AttributeError, KeyError, IndexError, TypeError, ValueError,
+        exceptions.InvalidAddressException, exceptions.VolatilityException,
+    ):
+        return False
+
+
 def _dentry_under(dentry, ancestor_address: int, max_depth: int = 4096) -> bool:
     """Check dentry ancestry using normalized target addresses.
 
@@ -379,6 +404,134 @@ def _dentry_under(dentry, ancestor_address: int, max_depth: int = 4096) -> bool:
     return False
 
 
+def _read_dentry_name(dentry) -> Tuple[str, str]:
+    """Bound qstr reads before decoding, preserving valid filename whitespace."""
+
+    qname = dentry.d_name
+    declared_length = int(qname.len) if qname.has_member("len") else None
+    if declared_length is not None and not 1 <= declared_length <= 255:
+        return "", "invalid-name"
+    name = qname.name_as_str()
+    if (
+        not name or name in {".", ".."} or "/" in name
+        or "\x00" in name or "\ufffd" in name
+        or any(ord(char) < 32 or ord(char) == 127 for char in name)
+        or len(name.encode("utf-8")) > 255
+    ):
+        return "", "invalid-name"
+    if declared_length is not None and declared_length != len(name.encode("utf-8")):
+        return "", "truncated-name"
+    return name, ""
+
+
+def _walk_mount_path(
+    root_dentry,
+    root_vfsmnt,
+    dentry,
+    vfsmnt,
+    *,
+    max_depth: int = 4096,
+    covering_mounts=None,
+    require_live_inode: bool = True,
+) -> Tuple[str, str]:
+    """Build a path only after reaching the exact (mount, dentry) root.
+
+    Upstream do_get_path() can return a plausible suffix when an unreadable
+    parent stops its walk.  Here an incomplete walk never becomes a path.
+    Each comparison uses pointer targets, not pointer-field storage offsets.
+    A namespace covering-mount index additionally rejects paths hidden by a
+    different mount; without that index this proves topology, not visibility.
+    The container-side mountinfo path needs topology only.  Host-source and
+    propagation proofs additionally require readable, linked inodes.
+    """
+
+    parts: List[str] = []
+    seen = set()
+    # When leaving a child mount, its attachment at the parent dentry is the
+    # one covering edge that belongs to this route rather than obscuring it.
+    allowed_cover = None
+    crossed_mount = False
+    try:
+        if not all(
+            obj and _object_readable(obj)
+            for obj in (root_dentry, root_vfsmnt, dentry, vfsmnt)
+        ):
+            return "", "INCOMPLETE:unreadable-root-or-source"
+        root_key = (_object_address(root_vfsmnt), _object_address(root_dentry))
+        for _ in range(max_depth):
+            if not (dentry and _object_readable(dentry) and vfsmnt and _object_readable(vfsmnt)):
+                return "", "INCOMPLETE:unreadable-route"
+            key = (_object_address(vfsmnt), _object_address(dentry))
+            if key in seen:
+                return "", "INCOMPLETE:cycle"
+            seen.add(key)
+
+            if require_live_inode:
+                inode = dentry.d_inode
+                if not (inode and _object_readable(inode)) or int(inode.i_nlink) <= 0:
+                    return "", "INCOMPLETE:missing-or-unlinked-inode"
+
+            if covering_mounts is not None:
+                covers = covering_mounts.get(key, set())
+                if len(covers) > 1:
+                    # Sibling attachments do not encode which stacked mount
+                    # wins lookup; a different valid alias cannot settle it.
+                    return "", "INCOMPLETE:stacked-attachment"
+                if covers and covers != {allowed_cover}:
+                    return "", "COVERED"
+                if allowed_cover is not None and allowed_cover not in covers:
+                    return "", "INCOMPLETE:missing-attachment"
+            allowed_cover = None
+
+            if key == root_key:
+                return "/" + "/".join(reversed(parts)), "COMPLETE"
+
+            mount_root = vfsmnt.get_mnt_root()
+            if not (mount_root and _object_readable(mount_root)):
+                return "", "INCOMPLETE:unreadable-mount-root"
+            if key[1] == _object_address(mount_root):
+                parent_mnt = vfsmnt.get_vfsmnt_parent()
+                mountpoint = vfsmnt.get_mnt_mountpoint()
+                if not (
+                    parent_mnt and _object_readable(parent_mnt)
+                    and mountpoint and _object_readable(mountpoint)
+                ):
+                    return "", "INCOMPLETE:unreadable-attachment"
+                if _object_address(parent_mnt) == key[0]:
+                    return "", "OUTSIDE_ROOT"
+                allowed_cover = key[0]
+                crossed_mount = True
+                dentry, vfsmnt = mountpoint, parent_mnt
+                continue
+
+            parent = dentry.d_parent
+            if not (parent and _object_readable(parent)):
+                return "", "INCOMPLETE:unreadable-parent"
+            if _object_address(parent) == key[1]:
+                # A same-superblock bind mount may cover a disjoint subtree.
+                # Reaching its filesystem root without its mount root proves
+                # that this candidate is not an ancestor of the source.
+                return "", "OUTSIDE_ROOT" if crossed_mount else "OUTSIDE_MOUNT"
+
+            name, name_issue = _read_dentry_name(dentry)
+            if name_issue:
+                return "", f"INCOMPLETE:{name_issue}"
+            parts.append(name)
+            dentry = parent
+    except (
+        AttributeError, IndexError, TypeError, ValueError,
+        exceptions.InvalidAddressException, exceptions.VolatilityException,
+    ) as exc:
+        return "", f"INCOMPLETE:{type(exc).__name__}"
+    return "", "INCOMPLETE:depth-limit"
+
+
+def _strict_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt, **kwargs) -> str:
+    """Return a complete path to an exact root, or empty on any failed proof."""
+
+    return _walk_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt, **kwargs)[0]
+
+
 def _identify_path(path: str) -> Optional[Identity]:
     value = _clean_path(path)
     if not value:
@@ -394,10 +547,19 @@ def _identify_path(path: str) -> Optional[Identity]:
 
 
 def _identify_paths(paths: Iterable[str]) -> Optional[Identity]:
+    identities = []
     for path in paths:
         identity = _identify_path(path)
         if identity:
-            return identity
+            identities.append(identity)
+    # A namespace can see another container's files.  Never pick an arbitrary
+    # first ID if the mount evidence contains more than one container/pod.
+    for kind in ("container", "pod"):
+        candidates = [item for item in identities if item.id_kind == kind]
+        if candidates:
+            if len({item.identifier for item in candidates}) != 1:
+                return None
+            return sorted(candidates, key=lambda item: (item.runtime, item.evidence))[0]
     return None
 
 
@@ -418,7 +580,7 @@ def _comm_matches(comm: str, signature: str) -> bool:
 def _safe_namespace_inode(task, member: str) -> Optional[int]:
     try:
         namespace = task.nsproxy.member(member)
-        if not namespace or not namespace.is_readable():
+        if not namespace or not _object_readable(namespace):
             return None
         if hasattr(namespace, "get_inode"):
             return int(namespace.get_inode())
@@ -460,122 +622,257 @@ def _pid_namespace_values(task) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _cgroup_path(cgroup) -> str:
-    """Reconstruct a cgroup path from its kernfs node ancestry."""
+    """Return a full kernfs path, or no path when ancestry is incomplete.
+
+    A NULL parent is a terminator only at cgroup.root.cgrp.kn.  In particular,
+    an unreadable parent is not a root and must not turn a suffix into an
+    apparently absolute path.  kernfs used ``parent`` before ``__parent``.
+    """
 
     try:
         if (
             not cgroup
-            or not cgroup.is_readable()
+            or not _object_readable(cgroup)
             or not cgroup.has_member("kn")
             or not cgroup.kn
-            or not cgroup.kn.is_readable()
+            or not _object_readable(cgroup.kn)
         ):
             return ""
         node = cgroup.kn.dereference()
+        root_node = cgroup.root.cgrp.kn
+        if not root_node or not _object_readable(root_node):
+            raise ValueError("unreadable hierarchy root kernfs node")
+        root_address = _object_address(root_node)
     except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException):
+        vollog.warning("Incomplete cgroup path: hierarchy root/node is unavailable")
         return ""
 
     parts: List[str] = []
     seen = set()
     for _ in range(256):
         try:
-            address = int(node.vol.offset)
+            address = _object_address(node)
             if address in seen:
-                break
+                raise ValueError("cyclic kernfs ancestry")
             seen.add(address)
+            parent_member = "__parent" if node.has_member("__parent") else "parent"
+            parent = node.member(parent_member)
+            if address == root_address:
+                if parent:
+                    raise ValueError("hierarchy root has a non-NULL parent")
+                return "/" + "/".join(reversed(parts))
+            if not parent or not _object_readable(parent):
+                raise ValueError("kernfs ancestry ended before hierarchy root")
             name = utility.pointer_to_string(node.name, count=256)
-            if name and name != "/":
-                parts.append(name.strip("/"))
-            parent = node.member("__parent")
-            if not parent or not parent.is_readable():
-                break
+            # kernfs names are individual components, at most NAME_MAX bytes.
+            # Never normalize corrupt names into a different valid path.
+            if not name or len(name) >= 256 or "/" in name or name in {".", ".."}:
+                raise ValueError("invalid or truncated kernfs name")
+            parts.append(name)
             node = parent.dereference()
         except (
             AttributeError,
             TypeError,
             exceptions.InvalidAddressException,
             ValueError,
-        ):
-            break
-    return "/" + "/".join(reversed(parts)) if parts else "/"
+        ) as exc:
+            vollog.warning("Incomplete cgroup path: %s", exc)
+            return ""
+    vollog.warning("Incomplete cgroup path: kernfs ancestry exceeds 256 nodes")
+    return ""
 
 
-def _cgroup_memberships(task) -> Tuple[CgroupMembership, ...]:
-    """Collect cgroup v2, v1, or hybrid memberships from task->css_set.
+def _cgroup_hierarchy(cgroup, default_root_address=None):
+    """Identify a hierarchy by its root, never by its effective CSS address.
 
-    v2 stores the task's unified-hierarchy cgroup in css_set.dfl_cgrp.  v1
-    stores one cgroup_subsys_state pointer per controller in css_set.subsys[].
-    Controllers mounted on the same v1 hierarchy point at the same cgroup, so
-    they are grouped by cgroup target address instead of emitted repeatedly.
+    The default (v2) hierarchy owns hierarchy ID 0.  All active legacy roots
+    have positive IDs.  Unknown or inconsistent metadata is not called v1.
     """
+
+    if not cgroup or not _object_readable(cgroup):
+        raise ValueError("unreadable cgroup")
+    root = cgroup.root
+    if not root or not _object_readable(root):
+        raise ValueError("unreadable cgroup hierarchy root")
+    root_address = _object_address(root)
+    hierarchy_id = int(root.hierarchy_id)
+    if hierarchy_id < 0:
+        raise ValueError("invalid cgroup hierarchy ID")
+    is_default = hierarchy_id == 0
+    if default_root_address is not None and (
+        is_default != (root_address == default_root_address)
+    ):
+        raise ValueError("inconsistent cgroup default hierarchy root/ID")
+    return ("v2" if is_default else "v1"), root_address, root, hierarchy_id
+
+
+def _linked_cgroups(css_set, issues):
+    """Walk actual cgroup memberships, including controllerless v1 roots.
+
+    Volatility's generic list walker silently terminates on unreadable links.
+    This bounded walk reports that distinction and validates link ownership.
+    """
+
+    groups = []
+    try:
+        head = css_set.cgrp_links
+        context = head._context
+        type_name = head.vol.type_name.split("!", 1)[0] + "!cgrp_cset_link"
+        offset = context.symbol_space.get_type(type_name).relative_child_offset(
+            "cgrp_link"
+        )
+        head_address = _object_address(head)
+        previous = head_address
+        link_pointer = head.next
+        seen = {head_address}
+        for _ in range(4096):
+            link_address = _object_address(link_pointer)
+            if link_address == head_address:
+                if _object_address(head.prev) != previous:
+                    raise ValueError("cgrp_links tail disagrees with forward walk")
+                return groups, True
+            if not link_pointer or not _object_readable(link_pointer):
+                raise ValueError("unreadable cgrp_links entry")
+            if link_address in seen:
+                raise ValueError("cyclic cgrp_links outside list head")
+            seen.add(link_address)
+            link = context.object(
+                type_name, layer_name=head.vol.layer_name,
+                offset=link_address - offset,
+            )
+            if _object_address(link.cset) != _object_address(css_set):
+                raise ValueError("cgrp_links entry points to another css_set")
+            if _object_address(link.cgrp_link.prev) != previous:
+                raise ValueError("cgrp_links backlink mismatch")
+            groups.append(link.cgrp)
+            previous = link_address
+            link_pointer = link.cgrp_link.next
+        raise ValueError("cgrp_links exceeds 4096 entries")
+    except (
+        AttributeError, KeyError, TypeError, ValueError,
+        exceptions.SymbolError, exceptions.InvalidAddressException,
+    ) as exc:
+        issues.add(f"membership list incomplete ({type(exc).__name__}: {exc})")
+        return groups, False
+
+
+def _cgroup_memberships(task, issues_out=None) -> Tuple[CgroupMembership, ...]:
+    """Read actual memberships; effective v2 ancestor CSSes are not v1.
+
+    cgrp_links is authoritative across hierarchies, dfl_cgrp is the actual v2
+    membership, and subsys[] provides legacy controller names.  A subsys-only
+    fallback is accepted solely with a proven v1 root when links are missing.
+    Paths are absolute in their hierarchy, not cgroup-namespace-relative.
+    issues_out, when supplied, receives stable partial/conflict markers as
+    well as diagnostics so callers cannot promote incomplete IDs to verified.
+    """
+
+    issues = set()
+
+    def report_issues():
+        if not issues:
+            return
+        issues.add("cgroup-metadata-partial")
+        if issues_out is not None:
+            issues_out.update(issues)
+        try:
+            pid = int(task.pid)
+        except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException):
+            pid = "?"
+        vollog.warning("Incomplete cgroup metadata for PID %s: %s", pid, "; ".join(sorted(issues)))
 
     try:
         css_set = task.cgroups
-        if not css_set or not css_set.is_readable():
-            return ()
-    except (AttributeError, exceptions.InvalidAddressException):
+        if not css_set or not _object_readable(css_set):
+            raise ValueError("missing or unreadable css_set")
+    except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException) as exc:
+        issues.add(f"task cgroup metadata unavailable ({exc})")
+        report_issues()
         return ()
 
-    unified: Optional[CgroupMembership] = None
-    unified_address: Optional[int] = None
+    default_root_address = None
+    groups, links_complete = _linked_cgroups(css_set, issues)
+    unified_cgroup = None
     try:
-        if css_set.has_member("dfl_cgrp"):
-            cgroup = css_set.dfl_cgrp
-            path = _cgroup_path(cgroup)
-            if path:
-                unified_address = _object_address(cgroup)
-                unified = CgroupMembership(
-                    version="v2",
-                    controllers=(),
-                    path=path,
-                    cgroup_address=unified_address,
-                )
-    except (
-        AttributeError,
-        TypeError,
-        ValueError,
-        exceptions.InvalidAddressException,
-    ):
-        unified = None
-        unified_address = None
+        if css_set.has_member("dfl_cgrp") and css_set.dfl_cgrp:
+            unified_cgroup = css_set.dfl_cgrp
+            version, root_address, _, _ = _cgroup_hierarchy(unified_cgroup)
+            if version != "v2":
+                raise ValueError("dfl_cgrp does not belong to hierarchy 0")
+            default_root_address = root_address
+            groups.append(unified_cgroup)
+    except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException) as exc:
+        issues.add(f"default membership unavailable ({exc})")
 
-    legacy: Dict[int, Dict[str, object]] = {}
+    # One css_set must have one actual membership per hierarchy.  Reject a
+    # conflicting root entirely, rather than choosing the first ID/path.
+    entries: Dict[int, Dict[str, object]] = {}
+    conflicting_roots = set()
+    def add_group(cgroup):
+        version, root_address, root, hierarchy_id = _cgroup_hierarchy(
+            cgroup, default_root_address
+        )
+        address = _object_address(cgroup)
+        if root_address in entries and entries[root_address]["address"] != address:
+            conflicting_roots.add(root_address)
+            issues.add("cgroup-id-conflict")
+            issues.add("multiple memberships in the same hierarchy")
+            return
+        entries.setdefault(root_address, {
+            "version": version, "root": root, "hierarchy_id": hierarchy_id,
+            "address": address, "cgroup": cgroup, "controllers": set(),
+        })
+
+    for cgroup in groups:
+        try:
+            add_group(cgroup)
+        except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException) as exc:
+            issues.add(f"hierarchy unavailable ({exc})")
+
     try:
         subsystems = css_set.subsys if css_set.has_member("subsys") else ()
         subsystem_count = len(subsystems)
     except (AttributeError, TypeError, exceptions.InvalidAddressException):
         subsystems = ()
         subsystem_count = 0
-
-    for index in range(subsystem_count):
+        issues.add("controller array unreadable")
+    if subsystem_count > 256:
+        issues.add("controller array exceeds 256 entries")
+    for index in range(min(subsystem_count, 256)):
         try:
             css_pointer = subsystems[index]
-            if not css_pointer or not css_pointer.is_readable():
+            if not css_pointer:
                 continue
+            if not _object_readable(css_pointer):
+                raise ValueError("unreadable controller state")
             css = css_pointer.dereference()
-            if not css.has_member("cgroup") or not css.cgroup:
-                continue
             cgroup = css.cgroup
-            if not cgroup.is_readable():
-                continue
-            cgroup_address = _object_address(cgroup)
-            if unified_address is not None and cgroup_address == unified_address:
-                continue
-            path = _cgroup_path(cgroup)
-            if not path:
-                continue
-
-            controller = ""
-            if css.has_member("ss") and css.ss and css.ss.is_readable():
-                subsystem = css.ss.dereference()
-                if subsystem.has_member("name") and subsystem.name:
-                    controller = utility.pointer_to_string(subsystem.name, count=64)
-            controller = controller.strip() if controller else f"subsys-{index}"
-
-            entry = legacy.setdefault(
-                cgroup_address,
-                {"path": path, "controllers": set()},
+            version, root_address, _, _ = _cgroup_hierarchy(
+                cgroup, default_root_address
             )
+            # v2 effective CSS may belong to any ancestor of dfl_cgrp.  Its
+            # address differs from the membership without becoming a v1 root.
+            if version == "v2":
+                continue
+            if root_address not in entries:
+                if links_complete:
+                    issues.add("controller hierarchy absent from membership list")
+                    continue
+                add_group(cgroup)
+            entry = entries[root_address]
+            if entry["address"] != _object_address(cgroup):
+                conflicting_roots.add(root_address)
+                issues.add("cgroup-id-conflict")
+                issues.add("legacy controller disagrees with actual membership")
+                continue
+            controller = f"subsys-{index}"
+            if css.has_member("ss") and css.ss and _object_readable(css.ss):
+                subsystem = css.ss.dereference()
+                field = "legacy_name" if subsystem.has_member("legacy_name") and subsystem.legacy_name else "name"
+                if subsystem.has_member(field) and subsystem.member(field):
+                    controller = utility.pointer_to_string(subsystem.member(field), count=64)
+            if not controller or len(controller) >= 64:
+                raise ValueError("invalid controller name")
             entry["controllers"].add(controller)
         except (
             AttributeError,
@@ -583,24 +880,40 @@ def _cgroup_memberships(task) -> Tuple[CgroupMembership, ...]:
             TypeError,
             ValueError,
             exceptions.InvalidAddressException,
-        ):
-            continue
+        ) as exc:
+            issues.add(f"controller {index} unavailable ({exc})")
 
     memberships: List[CgroupMembership] = []
-    # On a legacy-only host dfl_cgrp may still point at the unused v2 root.
-    # A bare v2 root carries no runtime evidence, so omit it when real v1
-    # memberships exist.  In a hybrid setup a non-root v2 path is retained.
-    if unified and (unified.path != "/" or not legacy):
-        memberships.append(unified)
-    for address, entry in sorted(legacy.items()):
+    for root_address, entry in sorted(entries.items()):
+        if root_address in conflicting_roots:
+            continue
+        path = _cgroup_path(entry["cgroup"])
+        if not path:
+            issues.add("one or more hierarchy paths incomplete")
+            continue
+        if entry["version"] == "v1":
+            try:
+                root = entry["root"]
+                if root.has_member("name"):
+                    name = utility.array_to_string(root.name)
+                    if name:
+                        entry["controllers"].add("name=" + name)
+            except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException):
+                issues.add("legacy hierarchy name unreadable")
+            if not entry["controllers"]:
+                entry["controllers"].add(f"hierarchy-{entry['hierarchy_id']}")
         memberships.append(
             CgroupMembership(
-                version="v1",
+                version=str(entry["version"]),
                 controllers=tuple(sorted(entry["controllers"])),
-                path=str(entry["path"]),
-                cgroup_address=address,
+                path=path,
+                cgroup_address=int(entry["address"]),
             )
         )
+    # Keep the internal default-root membership even alongside v1.  '/' alone
+    # cannot distinguish a visible hybrid v2 root from an unused default root;
+    # this output does not infer which cgroup filesystems were mounted.
+    report_issues()
     return tuple(memberships)
 
 
@@ -661,7 +974,7 @@ def _runtime_from_ancestry(task, max_depth: int = 8) -> Tuple[str, str]:
 
         try:
             parent = current.real_parent if current.has_member("real_parent") else current.parent
-            if not parent or not parent.is_readable():
+            if not parent or not _object_readable(parent):
                 break
             current = parent
         except (AttributeError, exceptions.InvalidAddressException):
@@ -700,34 +1013,84 @@ class MountRecord:
     host_sources: Tuple[str, ...]
     source_confidence: str
     writable: bool
+    is_task_root: bool = False
 
 
 class HostMountResolver:
-    """Resolve mount-root dentries only through mounts visible to init_task."""
+    """Resolve complete, unshadowed host paths through init_task's namespace.
+
+    CONFIRMED describes a single visible alias in the collected host topology;
+    it does not identify the original bind-mount command or source pathname.
+    A partial index or unreadable candidate route prevents confirmation even
+    when another complete path was found, because alternatives remain unknown.
+    """
 
     def __init__(self, init_task):
         self._init_task = init_task
-        self._host_root_dentry = init_task.fs.get_root_dentry()
-        self._host_root_mnt = init_task.fs.get_root_mnt()
+        self._host_root_dentry = None
+        self._host_root_mnt = None
         self._by_superblock: Dict[int, List[object]] = {}
-
-        host_namespace = init_task.nsproxy.mnt_ns
+        self._covering_mounts: Dict[Tuple[int, int], set] = {}
+        self._index_complete = False
         try:
-            for host_mnt in host_namespace.get_mount_points():
+            self._host_root_dentry = init_task.fs.get_root_dentry()
+            self._host_root_mnt = init_task.fs.get_root_mnt()
+            if not all(
+                obj and _object_readable(obj)
+                for obj in (self._host_root_dentry, self._host_root_mnt)
+            ):
+                raise ValueError("unreadable host root")
+            host_namespace = init_task.nsproxy.mnt_ns
+            host_mounts, status = ContainerMounts._mount_points(host_namespace)
+            self._index_complete = status == "COMPLETE"
+            indexed_vfsmounts = set()
+            for host_mnt in host_mounts:
                 try:
                     superblock = host_mnt.get_mnt_sb()
-                    if superblock and superblock.is_readable():
-                        self._by_superblock.setdefault(
-                            _object_address(superblock), []
-                        ).append(host_mnt)
-                except (AttributeError, exceptions.InvalidAddressException):
+                    host_vfsmnt = host_mnt.get_vfsmnt_current()
+                    if not all(
+                        obj and _object_readable(obj) for obj in (superblock, host_vfsmnt)
+                    ):
+                        self._index_complete = False
+                        continue
+                    mount_address = _object_address(host_vfsmnt)
+                    if mount_address in indexed_vfsmounts:
+                        continue
+                    indexed_vfsmounts.add(mount_address)
+                    self._by_superblock.setdefault(
+                        _object_address(superblock), []
+                    ).append(host_mnt)
+
+                    parent_vfsmnt = host_mnt.get_vfsmnt_parent()
+                    if not (parent_vfsmnt and _object_readable(parent_vfsmnt)):
+                        self._index_complete = False
+                        continue
+                    parent_address = _object_address(parent_vfsmnt)
+                    if parent_address == mount_address:
+                        continue
+                    mountpoint = host_mnt.get_mnt_mountpoint()
+                    if not (mountpoint and _object_readable(mountpoint)):
+                        self._index_complete = False
+                        continue
+                    key = (parent_address, _object_address(mountpoint))
+                    self._covering_mounts.setdefault(key, set()).add(mount_address)
+                except (
+                    AttributeError, TypeError, ValueError,
+                    exceptions.InvalidAddressException, exceptions.VolatilityException,
+                ):
+                    self._index_complete = False
                     continue
+            if _object_address(self._host_root_mnt) not in indexed_vfsmounts:
+                self._index_complete = False
+            if any(parent not in indexed_vfsmounts for parent, _ in self._covering_mounts):
+                self._index_complete = False
         except (
-            AttributeError,
-            exceptions.InvalidAddressException,
-            exceptions.VolatilityException,
+            AttributeError, TypeError, ValueError,
+            exceptions.InvalidAddressException, exceptions.VolatilityException,
         ) as exc:
             vollog.warning("Host mount namespace index is incomplete: %s", exc)
+        if not self._index_complete:
+            vollog.warning("Host mount index is incomplete; source confidence is UNKNOWN")
 
     def resolve(self, mnt) -> SourceResolution:
         try:
@@ -735,36 +1098,33 @@ class HostMountResolver:
             source_dentry = mnt.get_mnt_root()
             if not (
                 superblock
-                and superblock.is_readable()
+                and _object_readable(superblock)
                 and source_dentry
-                and source_dentry.is_readable()
+                and _object_readable(source_dentry)
             ):
                 return SourceResolution((), SOURCE_UNKNOWN)
             host_mounts = self._by_superblock.get(_object_address(superblock), ())
-        except (AttributeError, exceptions.InvalidAddressException):
+        except (
+            AttributeError, TypeError, ValueError,
+            exceptions.InvalidAddressException, exceptions.VolatilityException,
+        ):
             return SourceResolution((), SOURCE_UNKNOWN)
 
         resolved = set()
+        complete = self._index_complete
         for host_mnt in host_mounts:
             try:
-                host_mount_root = host_mnt.get_mnt_root()
-                if not (
-                    host_mount_root
-                    and host_mount_root.is_readable()
-                ):
-                    continue
-                host_root_address = _object_address(host_mount_root)
-                if not _dentry_under(source_dentry, host_root_address):
-                    continue
-                path = linux.LinuxUtilities.do_get_path(
+                path, status = _walk_mount_path(
                     self._host_root_dentry,
                     self._host_root_mnt,
                     source_dentry,
                     host_mnt.get_vfsmnt_current(),
+                    covering_mounts=self._covering_mounts,
                 )
-                path = _clean_path(path)
-                if _usable_confirmed_path(path):
+                if status == "COMPLETE":
                     resolved.add(path)
+                elif status.startswith("INCOMPLETE:"):
+                    complete = False
             except (
                 AttributeError,
                 TypeError,
@@ -772,14 +1132,220 @@ class HostMountResolver:
                 exceptions.InvalidAddressException,
                 exceptions.VolatilityException,
             ):
+                complete = False
                 continue
 
         paths = tuple(sorted(resolved))
-        if not paths:
-            return SourceResolution((), SOURCE_UNKNOWN)
+        if not paths or not complete:
+            return SourceResolution(paths, SOURCE_UNKNOWN)
         if len(paths) == 1:
             return SourceResolution(paths, SOURCE_CONFIRMED)
         return SourceResolution(paths, SOURCE_AMBIGUOUS)
+
+
+def _bounded_dentry_path(dentry, max_depth: int = 4096) -> str:
+    """Filesystem-relative topology, not host visibility or inode liveness.
+
+    Used only for mountinfo's root field.  Follow the complete dentry chain
+    even when inode pages are missing, but never return a truncated suffix.
+    """
+
+    parts: List[str] = []
+    seen = set()
+    try:
+        for _ in range(max_depth):
+            if not (dentry and _object_readable(dentry)):
+                return ""
+            address = _object_address(dentry)
+            if address in seen:
+                return ""
+            seen.add(address)
+            parent = dentry.d_parent
+            if not (parent and _object_readable(parent)):
+                return ""
+            if _object_address(parent) == address:
+                return "/" + "/".join(reversed(parts))
+            name, issue = _read_dentry_name(dentry)
+            if issue:
+                return ""
+            parts.append(name)
+            dentry = parent
+    except (
+        AttributeError, IndexError, TypeError, ValueError,
+        exceptions.InvalidAddressException, exceptions.VolatilityException,
+    ):
+        return ""
+    return ""
+
+
+def _bounded_dominating_id(mnt, task, max_nodes: int = 4096) -> Optional[int]:
+    """Closest reachable master peer-group ID, 0 if absent, None if unknown.
+
+    Follows fs/pnode.c's get_dominating_id ordering.  Peer links are resolved
+    with upstream container_of using their *target* address, rather than the
+    pointer-field offset used by Volatility 2.28.0's next_peer().  All master,
+    peer and path walks are bounded; uncertainty in a closer group prevents
+    claiming that a more distant group is the closest dominator.
+    """
+
+    try:
+        namespace_address = _object_address(mnt.mnt_ns)
+        if not namespace_address:
+            return None
+        root_dentry = task.fs.get_root_dentry()
+        root_vfsmnt = task.fs.get_root_mnt()
+        current_master = mnt.mnt_master
+        master_seen = set()
+        visited_nodes = 0
+        vmlinux = None
+        while current_master:
+            if not _object_readable(current_master):
+                return None
+            master_address = _object_address(current_master)
+            if master_address in master_seen:
+                return None
+            master_seen.add(master_address)
+            group_id = int(current_master.mnt_group_id)
+            if group_id <= 0:
+                return None
+            peer = current_master
+            peer_seen = set()
+            group_uncertain = False
+            while True:
+                if visited_nodes >= max_nodes or not (peer and _object_readable(peer)):
+                    return None
+                visited_nodes += 1
+                peer_address = _object_address(peer)
+                if peer_address in peer_seen:
+                    return None
+                peer_seen.add(peer_address)
+                if int(peer.mnt_group_id) != group_id:
+                    return None
+                if _object_address(peer.mnt_ns) == namespace_address:
+                    _path, status = _walk_mount_path(
+                        root_dentry, root_vfsmnt,
+                        peer.get_mnt_root(), peer.get_vfsmnt_current(),
+                    )
+                    if status == "COMPLETE":
+                        return group_id
+                    if status.startswith("INCOMPLETE:"):
+                        group_uncertain = True
+
+                share = peer.mnt_share
+                link = share.next
+                if not (link and _object_readable(link)):
+                    return None
+                if _object_address(link.prev) != _object_address(share):
+                    return None
+                if _object_address(link) == _object_address(share):
+                    if peer_address != master_address:
+                        return None
+                    break
+                if vmlinux is None:
+                    vmlinux = linux.LinuxUtilities.get_module_from_volobj_type(
+                        mnt._context, mnt,
+                    )
+                peer = linux.LinuxUtilities.container_of(link, "mount", "mnt_share", vmlinux)
+                if _object_address(peer) == master_address:
+                    break
+            if group_uncertain:
+                return None
+            current_master = current_master.mnt_master
+        return 0
+    except (
+        AttributeError, IndexError, TypeError, ValueError,
+        exceptions.InvalidAddressException, exceptions.VolatilityException,
+    ):
+        return None
+
+
+def _read_mount_info(
+    mnt, task,
+) -> Tuple[Optional[mountinfo.MountInfoData], Tuple[str, ...]]:
+    """Read upstream mountinfo fields without its unbounded path traversals.
+
+    Kernel-specific field/flag interpretation stays in pinned upstream object
+    getters.  This adapter only assembles MountInfoData and supplies bounded
+    paths/propagation.  Optional failures retain readable attributes and are
+    returned explicitly instead of discarding the entire mount record.
+    """
+
+    issues: List[str] = []
+    try:
+        superblock = mnt.get_mnt_sb()
+        if not (superblock and _object_readable(superblock)):
+            return None, ("decode",)
+        mnt_id = int(mnt.mnt_id)
+        parent_id = int(mnt.mnt_parent.mnt_id)
+        st_dev = f"{int(superblock.major)}:{int(superblock.minor)}"
+        mnt_opts = [mnt.get_flags_access(), *mnt.get_flags_opts()]
+        mnt_type = superblock.get_type()
+        devname = mnt.get_devname() or "none"
+        sb_opts = [superblock.get_flags_access(), *superblock.get_flags_opts()]
+    except (
+        AttributeError, IndexError, TypeError, ValueError,
+        exceptions.InvalidAddressException, exceptions.VolatilityException,
+    ):
+        return None, ("decode",)
+
+    container_path = ""
+    mount_root_path = ""
+    path_status = "INCOMPLETE"
+    try:
+        root = mnt.get_mnt_root()
+        mount_root_path = _bounded_dentry_path(root)
+        container_path, path_status = _walk_mount_path(
+            task.fs.get_root_dentry(), task.fs.get_root_mnt(),
+            root, mnt.get_vfsmnt_current(),
+            require_live_inode=False,
+        )
+    except (
+        AttributeError, IndexError, TypeError, ValueError,
+        exceptions.InvalidAddressException, exceptions.VolatilityException,
+    ):
+        pass
+    # A detached self-parent namespace sentinel is intentionally outside the
+    # task root.  This proven absence is not an unreadable-path failure.
+    expected_internal_root = (
+        path_status == "OUTSIDE_ROOT" and mnt_id == parent_id
+        and mnt_type in INTERNAL_NAMESPACE_ROOT_FSTYPES
+    )
+    if not container_path and not expected_internal_root:
+        issues.append("path")
+    if not mount_root_path:
+        issues.append("mount-root")
+
+    fields: List[str] = []
+    try:
+        if mnt.is_shared():
+            shared_id = int(mnt.mnt_group_id)
+            if shared_id <= 0:
+                issues.append("propagation")
+            else:
+                fields.append(f"shared:{shared_id}")
+        if mnt.is_slave():
+            master_id = int(mnt.mnt_master.mnt_group_id)
+            if master_id <= 0:
+                issues.append("propagation")
+            else:
+                fields.append(f"master:{master_id}")
+                dominating_id = _bounded_dominating_id(mnt, task)
+                if dominating_id is None:
+                    issues.append("propagation")
+                elif dominating_id and dominating_id != master_id:
+                    fields.append(f"propagate_from:{dominating_id}")
+        if mnt.is_unbindable():
+            fields.append("unbindable")
+    except (
+        AttributeError, IndexError, TypeError, ValueError,
+        exceptions.InvalidAddressException, exceptions.VolatilityException,
+    ):
+        issues.append("propagation")
+
+    return mountinfo.MountInfoData(
+        mnt_id, parent_id, st_dev, mount_root_path, container_path,
+        mnt_opts, fields, mnt_type, devname, sb_opts,
+    ), tuple(dict.fromkeys(issues))
 
 
 def _mount_access(data) -> Tuple[bool, str]:
@@ -795,34 +1361,43 @@ def _expected_runtime_artifact(
     runtime: str,
     container_id: str,
     id_kind: str,
+    *,
+    fstype: str,
+    identity_verified: bool,
+    is_task_root: bool,
 ) -> bool:
-    expected_names = EXPECTED_RUNTIME_ARTIFACTS.get(container_path, ())
-    basename = host_path.rsplit("/", 1)[-1]
-    if basename in expected_names:
-        return True
-    if container_path != "/":
+    # The ID must come from independently read cgroup membership, not from
+    # this mount path being checked against itself.  Unknown layouts remain
+    # visible as REVIEW; a basename alone is never an infrastructure rule.
+    if not identity_verified or id_kind != "container" or not container_id:
         return False
-
-    # Common runtime layouts end their root mount in one of these names.
-    if basename in {"merged", "rootfs", "fs"}:
-        return True
-
-    # Some Docker versions expose the container root as
-    # /var/lib/docker/rootfs/overlayfs/<container-id>.  Do not whitelist an
-    # arbitrary runtime-storage child: require the exact Docker path grammar
-    # and correlation with the namespace identity selected from cgroup/mount
-    # evidence.
-    identity = _identify_path(host_path)
-    return bool(
-        runtime == "docker"
-        and id_kind == "container"
-        and container_id
-        and identity
-        and identity.runtime == "docker"
-        and identity.id_kind == "container"
-        and identity.identifier == container_id.lower()
-        and identity.evidence == "docker-rootfs-overlayfs"
-    )
+    identifier = re.escape(container_id)
+    if runtime == "docker":
+        expected_names = EXPECTED_RUNTIME_ARTIFACTS.get(container_path, ())
+        if container_path.startswith("/etc/") and expected_names:
+            names = "|".join(re.escape(name) for name in expected_names)
+            return bool(re.fullmatch(
+                rf"/var/lib/docker/containers/{identifier}/(?:{names})", host_path
+            ))
+    if container_path != "/" or not is_task_root:
+        return False
+    if fstype not in {"overlay", "fuse-overlayfs"}:
+        return False
+    if runtime == "docker":
+        # Docker's older overlay2 layout uses a layer ID, not a container ID.
+        # Its root is trusted only together with the task-root and independent
+        # cgroup evidence above; do not treat arbitrary */merged as equivalent.
+        return bool(re.fullmatch(
+            rf"/var/lib/docker/rootfs/overlayfs/{identifier}", host_path
+        ) or re.fullmatch(
+            rf"/var/lib/docker/overlay2/{_HEX64}/merged", host_path
+        ))
+    if runtime == "containerd":
+        return bool(re.fullmatch(
+            rf"/run/containerd/io\.containerd\.runtime\.v[12]\.task/"
+            rf"[^/]+/{identifier}/rootfs", host_path
+        ))
+    return False
 
 
 def _classify_mount(
@@ -830,6 +1405,8 @@ def _classify_mount(
     runtime: str,
     container_id: str = "",
     id_kind: str = "",
+    *,
+    identity_verified: bool = False,
 ) -> Tuple[str, str]:
     """Classify one mount without promoting an unproven path to host source."""
 
@@ -839,68 +1416,63 @@ def _classify_mount(
     source_names = {path.rsplit("/", 1)[-1] for path in record.host_sources}
     target_name = container_path.rsplit("/", 1)[-1]
 
+    if target_name in RUNTIME_SOCKET_NAMES or source_names & RUNTIME_SOCKET_NAMES:
+        return RISK_HIGH, "런타임 제어 소켓 경로가 마운트에 포함됨; 접근 가능 여부 확인 필요"
+
+    # Evaluate every complete host path before accepting an infrastructure
+    # exception.  A benign runtime alias cannot suppress '/' or another
+    # sensitive source in the same result.
+    if "/" in record.host_sources:
+        return RISK_HIGH, f"호스트 루트 경로가 연결됨 ({access})"
+
     if (
         int(record.data.mnt_id) == int(record.data.parent_id)
         and fstype in INTERNAL_NAMESPACE_ROOT_FSTYPES
+        and not record.is_task_root
+        and not record.host_sources
     ):
         return RISK_INFRA, "Mount Namespace 내부 root/sentinel mount"
 
-    if target_name in RUNTIME_SOCKET_NAMES or source_names & RUNTIME_SOCKET_NAMES:
-        return RISK_HIGH, "컨테이너에 런타임 제어 소켓이 노출됨"
-
     if record.host_sources:
-        runtime_sources = [
-            path for path in record.host_sources if _runtime_storage_path(path)
-        ]
-        if runtime_sources and all(
-            _expected_runtime_artifact(
-                container_path, path, runtime, container_id, id_kind
-            )
-            for path in runtime_sources
-        ):
-            return RISK_INFRA, "런타임이 생성한 표준 컨테이너 마운트"
-
-        if container_path in STANDARD_API_TARGETS.get(fstype, ()):
+        decisions = []
+        for host_path in record.host_sources:
             if (
                 fstype in {"sysfs", "cgroup", "cgroup2"}
                 and record.writable
-                and record.host_sources
             ):
-                return RISK_HIGH, f"호스트 커널 제어 파일시스템이 쓰기 가능하게 노출됨 ({fstype})"
-            return RISK_INFRA, f"표준 컨테이너 {fstype} 마운트"
+                decisions.append((RISK_HIGH, f"호스트와 연결된 {fstype} 마운트가 쓰기 가능함; 실제 권한 확인 필요"))
+            elif record.source_confidence != SOURCE_UNKNOWN and _expected_runtime_artifact(
+                container_path, host_path, runtime, container_id, id_kind,
+                fstype=fstype, identity_verified=identity_verified,
+                is_task_root=record.is_task_root,
+            ):
+                decisions.append((RISK_INFRA, "독립된 컨테이너 ID와 경로가 일치하는 런타임 마운트"))
+            elif (
+                record.source_confidence != SOURCE_UNKNOWN
+                and container_path in STANDARD_API_TARGETS.get(fstype, ())
+                and host_path == container_path
+                and not record.writable
+            ):
+                decisions.append((RISK_INFRA, f"표준 경로의 읽기 전용 {fstype} 마운트"))
+            elif _runtime_storage_path(host_path):
+                decisions.append((RISK_REVIEW, f"런타임 저장소의 데이터 또는 미확인 마운트 ({access})"))
+            elif any(_startswith_dir(host_path, prefix) for prefix in SENSITIVE_HOST_PREFIXES):
+                decisions.append((RISK_HIGH, f"민감 호스트 경로 {host_path} 연결 ({access})"))
+            else:
+                decisions.append((RISK_REVIEW, f"호스트 경로 마운트 ({access})"))
+        priority = {RISK_INFRA: 0, RISK_REVIEW: 1, RISK_HIGH: 2}
+        return max(decisions, key=lambda item: priority[item[0]])
 
-        if "/" in record.host_sources:
-            return RISK_HIGH, f"호스트 루트가 컨테이너에 노출됨 ({access})"
-
-        # Named volumes and runtime-managed user data are important inspection
-        # results, but their location below /var/lib/docker or equivalent does
-        # not by itself make them a host-escape finding.
-        if runtime_sources:
-            return RISK_REVIEW, f"런타임 저장소의 비표준/사용자 데이터 마운트 ({access})"
-
-        for host_path in record.host_sources:
-            for prefix in SENSITIVE_HOST_PREFIXES:
-                if _startswith_dir(host_path, prefix):
-                    return RISK_HIGH, f"민감 호스트 경로 {prefix} 노출 ({access})"
-
-        return RISK_REVIEW, f"확인된 호스트 경로 마운트 ({access})"
-
-    # A container root on overlay is expected, but only after the namespace has
-    # independently passed container detection.  It is not called a host root.
-    if runtime and container_path == "/" and fstype in {"overlay", "fuse-overlayfs"}:
-        return RISK_INFRA, "컨테이너 루트 파일시스템"
-
-    if fstype in API_FSTYPES:
-        return RISK_INFRA, "커널/메모리 기반 가상 파일시스템; 호스트 디스크 source 미확인"
-
-    return RISK_REVIEW, "호스트 source를 증명하지 못한 비가상 파일시스템 마운트"
+    # Missing source evidence is not a statement that a mount is harmless.
+    # Keep unresolved overlay and virtual/control filesystems in default output.
+    return RISK_REVIEW, f"호스트 경로 미확인 ({fstype}, {access}); 추가 확인 필요"
 
 
 class ContainerMounts(plugins.PluginInterface):
     """Find container-backed mount namespaces and inspect their mounts."""
 
     _required_framework_version = (2, 13, 0)
-    _version = (0, 3, 1)
+    _version = (0, 4, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -921,7 +1493,7 @@ class ContainerMounts(plugins.PluginInterface):
             ),
             requirements.ListRequirement(
                 name="pids",
-                description="Inspect these host PIDs explicitly (manual trust override)",
+                description="Inspect these host PIDs explicitly (manual selection)",
                 element_type=int,
                 optional=True,
             ),
@@ -951,11 +1523,11 @@ class ContainerMounts(plugins.PluginInterface):
             if not (
                 task
                 and task.fs
-                and task.fs.is_readable()
+                and _object_readable(task.fs)
                 and task.nsproxy
-                and task.nsproxy.is_readable()
+                and _object_readable(task.nsproxy)
                 and task.nsproxy.mnt_ns
-                and task.nsproxy.mnt_ns.is_readable()
+                and _object_readable(task.nsproxy.mnt_ns)
             ):
                 return None
             pid = int(task.pid)
@@ -973,10 +1545,14 @@ class ContainerMounts(plugins.PluginInterface):
         ):
             return None
 
-        cgroup_memberships = _cgroup_memberships(task)
+        cgroup_issues = set()
+        cgroup_memberships = _cgroup_memberships(task, issues_out=cgroup_issues)
         identity, identity_source, identity_conflict = _cgroup_identity(
             cgroup_memberships
         )
+        identity_conflict = identity_conflict or "cgroup-id-conflict" in cgroup_issues
+        if identity_conflict:
+            identity = None
         marker_matches = [
             (membership, _runtime_marker(membership.path))
             for membership in cgroup_memberships
@@ -1009,6 +1585,9 @@ class ContainerMounts(plugins.PluginInterface):
             evidence.append(f"supervisor:{supervisor_comm}")
         if ns_pid == 1:
             evidence.append("pid-namespace-init")
+        if "cgroup-metadata-partial" in cgroup_issues:
+            evidence.append("cgroup-metadata-partial")
+            score = min(score, 70)
 
         runtime = (
             identity.runtime if identity else marker_runtime or ancestry_runtime
@@ -1072,6 +1651,71 @@ class ContainerMounts(plugins.PluginInterface):
         )[0]
 
     @staticmethod
+    def _list_mount_points(mnt_ns, max_nodes: int = 100000) -> Tuple[List[object], str]:
+        """Collect a legacy namespace list only after proving return to its head.
+
+        Upstream list_head.to_list() silently stops at unreadable/repeated
+        links.  Treating that exhaustion as success could hide a covering host
+        mount, so validate both link directions and namespace ownership here.
+        On corruption the already validated prefix remains available as PARTIAL.
+        """
+
+        points: List[object] = []
+        try:
+            if not (mnt_ns and _object_readable(mnt_ns) and mnt_ns.has_member("list")):
+                raise ValueError("missing or unreadable legacy namespace list")
+            head = mnt_ns.list
+            if not _object_readable(head):
+                raise ValueError("unreadable legacy namespace list head")
+            context = head._context
+            table_name = head.vol.type_name.split("!", 1)[0]
+            mount_type = table_name + "!mount"
+            if not context.symbol_space.has_type(mount_type):
+                mount_type = table_name + "!vfsmount"
+            member_offset = context.symbol_space.get_type(mount_type).relative_child_offset(
+                "mnt_list"
+            )
+            namespace_address = _object_address(mnt_ns)
+            head_address = _object_address(head)
+            previous = head_address
+            link_pointer = head.next
+            seen = {head_address}
+            while True:
+                link_address = _object_address(link_pointer)
+                if link_address == head_address:
+                    if _object_address(head.prev) != previous:
+                        raise ValueError("legacy mount-list tail disagrees with forward walk")
+                    return points, "COMPLETE"
+                if len(points) >= max_nodes:
+                    raise ValueError("legacy mount list exceeds node limit")
+                if not link_pointer or not _object_readable(link_pointer):
+                    raise ValueError("unreadable legacy mount-list entry")
+                if link_address in seen:
+                    raise ValueError("cyclic legacy mount list outside its head")
+                seen.add(link_address)
+                link = link_pointer.dereference()
+                if _object_address(link.prev) != previous:
+                    raise ValueError("legacy mount-list backlink mismatch")
+                mount_address = link_address - member_offset
+                if mount_address < 0:
+                    raise ValueError("invalid legacy mount container address")
+                mnt = context.object(
+                    mount_type, layer_name=head.vol.layer_name,
+                    native_layer_name=head.vol.native_layer_name,
+                    offset=mount_address,
+                )
+                if mnt.has_member("mnt_ns") and _object_address(mnt.mnt_ns) != namespace_address:
+                    raise ValueError("legacy mount belongs to another namespace")
+                points.append(mnt)
+                previous = link_address
+                link_pointer = link.next
+        except (
+            AttributeError, KeyError, IndexError, TypeError, ValueError,
+            exceptions.InvalidAddressException, exceptions.VolatilityException,
+        ) as exc:
+            return points, f"PARTIAL:list-walk:{type(exc).__name__}:{exc}"
+
+    @staticmethod
     def _mount_points(mnt_ns) -> Tuple[List[object], str]:
         """Collect namespace mounts without losing every sibling to one bad RB node.
 
@@ -1093,18 +1737,7 @@ class ContainerMounts(plugins.PluginInterface):
             is_rb_tree = False
 
         if not is_rb_tree:
-            try:
-                for mnt in mnt_ns.get_mount_points():
-                    points.append(mnt)
-                return points, "COMPLETE"
-            except (
-                AttributeError,
-                TypeError,
-                ValueError,
-                exceptions.InvalidAddressException,
-                exceptions.VolatilityException,
-            ) as exc:
-                return points, f"PARTIAL:list-walk:{type(exc).__name__}"
+            return ContainerMounts._list_mount_points(mnt_ns)
 
         try:
             vmlinux = linux.LinuxUtilities.get_module_from_volobj_type(
@@ -1119,26 +1752,42 @@ class ContainerMounts(plugins.PluginInterface):
             node_pointer = stack.pop()
             try:
                 node_address = int(node_pointer)
-                if not node_address or node_address in seen_nodes:
+                if not node_address:
                     continue
+                if node_address in seen_nodes:
+                    skipped_nodes += 1
+                    continue
+                if len(seen_nodes) >= 100000:
+                    skipped_nodes += 1
+                    break
                 seen_nodes.add(node_address)
-                if not node_pointer.is_readable():
+                if not _object_readable(node_pointer):
                     skipped_nodes += 1
                     continue
                 node = node_pointer.dereference()
 
                 # Read child pointers before decoding the containing mount so a
                 # bad mount object cannot hide otherwise readable subtrees.
-                left = node.rb_left
-                right = node.rb_right
-                if right:
-                    stack.append(right)
-                if left:
-                    stack.append(left)
+                for member in ("rb_right", "rb_left"):
+                    try:
+                        child = node.member(member)
+                        if child:
+                            stack.append(child)
+                    except (AttributeError, exceptions.InvalidAddressException):
+                        skipped_nodes += 1
 
                 mnt = linux.LinuxUtilities.container_of(
                     node_pointer, "mount", "mnt_node", vmlinux
                 )
+                if mnt is None or (
+                    hasattr(mnt, "has_member") and mnt.has_member("mnt_ns")
+                    and _object_address(mnt.mnt_ns) != _object_address(mnt_ns)
+                ):
+                    # A readable RB node can still describe an unrelated mount
+                    # after corruption or a bad layout interpretation.  Child
+                    # pointers are already queued, so preserve those subtrees.
+                    skipped_nodes += 1
+                    continue
                 points.append(mnt)
             except (
                 AttributeError,
@@ -1159,7 +1808,7 @@ class ContainerMounts(plugins.PluginInterface):
     ) -> Tuple[List[MountRecord], str]:
         records: List[MountRecord] = []
         mounts, traversal_status = cls._mount_points(representative.mnt_ns)
-        decode_errors = 0
+        error_counts: Dict[str, int] = {}
         seen_mounts = set()
         for mnt in mounts:
             try:
@@ -1167,14 +1816,20 @@ class ContainerMounts(plugins.PluginInterface):
                 if mount_address in seen_mounts:
                     continue
                 seen_mounts.add(mount_address)
-                data = mountinfo.MountInfo.get_mountinfo(mnt, representative.task)
+                data, issues = _read_mount_info(mnt, representative.task)
+                for issue in issues:
+                    error_counts[issue] = error_counts.get(issue, 0) + 1
                 if data is None:
-                    decode_errors += 1
                     continue
 
+                is_task_root = (
+                    _object_address(mnt.get_vfsmnt_current()) == representative.root_key[0]
+                    and _object_address(mnt.get_mnt_root()) == representative.root_key[1]
+                )
                 is_internal_root = (
                     int(data.mnt_id) == int(data.parent_id)
                     and str(data.mnt_type) in INTERNAL_NAMESPACE_ROOT_FSTYPES
+                    and not is_task_root
                 )
                 source = (
                     SourceResolution((), SOURCE_UNKNOWN)
@@ -1186,11 +1841,12 @@ class ContainerMounts(plugins.PluginInterface):
                     MountRecord(
                         mnt=mnt,
                         data=data,
-                        container_path=_clean_path(data.path_root),
-                        mount_root=_clean_path(data.mnt_root_path),
+                        container_path=data.path_root,
+                        mount_root=data.mnt_root_path,
                         host_sources=source.paths,
                         source_confidence=source.confidence,
                         writable=writable,
+                        is_task_root=is_task_root,
                     )
                 )
             except (
@@ -1200,11 +1856,11 @@ class ContainerMounts(plugins.PluginInterface):
                 exceptions.InvalidAddressException,
                 exceptions.VolatilityException,
             ):
-                decode_errors += 1
+                error_counts["decode"] = error_counts.get("decode", 0) + 1
                 continue
 
-        if decode_errors:
-            suffix = f"decode={decode_errors}"
+        if error_counts:
+            suffix = ",".join(f"{name}={count}" for name, count in sorted(error_counts.items()))
             if traversal_status == "COMPLETE":
                 traversal_status = f"PARTIAL:{suffix}"
             else:
@@ -1213,27 +1869,40 @@ class ContainerMounts(plugins.PluginInterface):
 
     @staticmethod
     def _mount_identity(records: Sequence[MountRecord]) -> Optional[Identity]:
-        # Confirmed host-visible paths have priority.  Mount ROOT and devname
-        # are fallbacks and can enrich identity, but never certify Host Source.
-        confirmed_paths = [path for record in records for path in record.host_sources]
-        identity = _identify_paths(confirmed_paths)
-        if identity:
-            return identity
-
-        fallback_paths = []
+        # Mount paths can enrich identity but never independently certify it.
+        # Consider all available evidence, so conflicting IDs cannot be hidden
+        # by a first-match return or a later fallback.
+        paths = [path for record in records for path in record.host_sources]
         for record in records:
             if _runtime_storage_path(record.mount_root):
-                fallback_paths.append(record.mount_root)
+                paths.append(record.mount_root)
             devname = _clean_path(record.data.devname)
             if _runtime_storage_path(devname):
-                fallback_paths.append(devname)
-        return _identify_paths(fallback_paths)
+                paths.append(devname)
+        return _identify_paths(paths)
+
+    @staticmethod
+    def _namespace_id_conflict(observations: Sequence[TaskObservation]) -> bool:
+        if any("cgroup-id-conflict" in item.evidence for item in observations):
+            return True
+        for kind in ("container", "pod"):
+            identifiers = {
+                item.identity.identifier for item in observations
+                if item.identity and item.identity.id_kind == kind
+            }
+            if len(identifiers) > 1:
+                return True
+        return False
 
     @staticmethod
     def _namespace_identity(
         observations: Sequence[TaskObservation], mount_identity: Optional[Identity]
     ) -> Optional[Identity]:
-        identities = [item.identity for item in observations if item.identity]
+        if ContainerMounts._namespace_id_conflict(observations):
+            return None
+        representative = ContainerMounts._representative(observations)
+        ordered = [representative] + [item for item in observations if item is not representative]
+        identities = [item.identity for item in ordered if item.identity]
         # A container ID is more useful than a pod ID.  Cgroup evidence remains
         # preferred over mount-path fallback within the same kind.
         for id_kind in ("container", "pod"):
@@ -1254,10 +1923,19 @@ class ContainerMounts(plugins.PluginInterface):
         identity = self._namespace_identity(observations, mount_identity)
         score = max(item.score for item in observations)
         evidence = {value for item in observations for value in item.evidence}
+        conflict = self._namespace_id_conflict(observations)
 
         if mount_identity:
             score = max(score, 70)
             evidence.add(f"mount-path:{mount_identity.evidence}")
+            if identity and identity.id_kind == mount_identity.id_kind and identity.identifier != mount_identity.identifier:
+                evidence.add("cgroup-mount-id-mismatch")
+
+        if conflict:
+            score = 60
+            evidence.add("namespace-id-conflict")
+        if "cgroup-metadata-partial" in evidence:
+            score = min(score, 70)
 
         if manual:
             detection = DETECTION_MANUAL
@@ -1271,6 +1949,9 @@ class ContainerMounts(plugins.PluginInterface):
             evidence.add("mount-namespace-only")
 
         runtime = identity.runtime if identity else representative.runtime
+        if conflict:
+            runtimes = {item.runtime for item in observations if item.runtime}
+            runtime = next(iter(runtimes)) if len(runtimes) == 1 else ""
         identifier = identity.identifier if identity else ""
         id_kind = identity.id_kind if identity else ""
         return (
@@ -1306,10 +1987,42 @@ class ContainerMounts(plugins.PluginInterface):
                 _score,
             ) = self._namespace_metadata(observations, mount_identity, manual)
 
+            root_variants = len({item.root_key for item in observations})
+            # Report namespace failures independently of mount-row filtering.
+            # Even an empty JSON result must have a diagnostic on stderr.
+            if traversal_status != "COMPLETE":
+                vollog.warning(
+                    "Mount namespace %s (PID %s): %s; decoded=%s. "
+                    "Empty/filtered output does not establish absence of mounts.",
+                    ns_id, representative.pid, traversal_status, len(records),
+                )
+            elif not records:
+                vollog.warning(
+                    "Mount namespace %s (PID %s): no mount records available",
+                    ns_id, representative.pid,
+                )
             if detection == DETECTION_LOW and not include_candidates:
                 continue
-
-            root_variants = len({item.root_key for item in observations})
+            if root_variants > 1:
+                vollog.warning(
+                    "Mount namespace %s has %s task roots; paths are relative to PID %s",
+                    ns_id, root_variants, representative.pid,
+                )
+            conflict = self._namespace_id_conflict(observations)
+            if conflict:
+                vollog.warning(
+                    "Mount namespace %s has conflicting cgroup identities; "
+                    "Container ID is withheld", ns_id,
+                )
+            identity_verified = bool(
+                not conflict and id_kind == "container" and container_id
+                and not any("cgroup-metadata-partial" in item.evidence for item in observations)
+                and any(
+                    item.identity and item.identity.id_kind == "container"
+                    and item.identity.identifier == container_id
+                    for item in observations
+                )
+            )
             cgroup_memberships = sorted(
                 {
                     membership.display()
@@ -1321,7 +2034,8 @@ class ContainerMounts(plugins.PluginInterface):
 
             for record in records:
                 risk, reason = _classify_mount(
-                    record, runtime, container_id, id_kind
+                    record, runtime, container_id, id_kind,
+                    identity_verified=identity_verified,
                 )
                 if risk == RISK_INFRA and not show_all:
                     continue
