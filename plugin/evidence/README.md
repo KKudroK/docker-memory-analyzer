@@ -7,7 +7,7 @@
 | [memory.lime.gz](https://github.com/KKudroK/docker-memory-analyzer/releases/download/containercaps-v1.4.0/memory.lime.gz) | 1,160,793,053 bytes | `memory.lime` — 4,239,450,044 bytes |
 | [ubuntu-7.0.0-31-btf.json.gz](https://github.com/KKudroK/docker-memory-analyzer/releases/download/containercaps-v1.4.0/ubuntu-7.0.0-31-btf.json.gz) | 3,730,789 bytes | `symbols/linux/ubuntu-7.0.0-31-btf.json` — 33,439,006 bytes |
 
-두 파일을 `플러그인/evidence/downloads/`에 저장하고, `플러그인/` 폴더에서 실행합니다. 압축 파일과 복원된 자료를 함께 보관할 공간이 약 5.44GB 필요합니다.
+두 파일을 `plugin/evidence/downloads/`에 저장하고, `plugin/` 폴더에서 실행합니다. 압축 파일과 복원된 자료를 함께 보관할 공간이 약 5.44GB 필요합니다.
 
 ```powershell
 .\.venv\Scripts\python.exe tools/unpack_evidence.py evidence/downloads/memory.lime.gz evidence/downloads/ubuntu-7.0.0-31-btf.json.gz

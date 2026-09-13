@@ -14,7 +14,7 @@ Linux 메모리 덤프에서 **Docker cgroup v2에 속한 프로세스·스레�
 
 ## 설치와 실행
 
-아래 명령은 이 `플러그인/` 폴더에서 실행합니다. PowerShell 예시이며 Linux에서는 가상환경 Python 경로를 `.venv/bin/python`으로 바꾸고, 아래 `New-Item` 대신 `mkdir native-results`를 사용합니다.
+아래 명령은 이 `plugin/` 폴더에서 실행합니다. PowerShell 예시이며 Linux에서는 가상환경 Python 경로를 `.venv/bin/python`으로 바꾸고, 아래 `New-Item` 대신 `mkdir native-results`를 사용합니다.
 
 ```powershell
 python -m venv .venv
