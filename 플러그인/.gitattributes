@@ -1,0 +1,2 @@
+# Preserve the exact validated bytes and SHA-256 values across Windows/Linux.
+* -text

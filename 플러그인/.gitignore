@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+results/
+native-results/
+container_caps_runs/
+*.lime
+*.raw
+*.mem
+*.gz
+*.part
+evidence/symbols/
+evidence/downloads/
