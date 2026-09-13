@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ContainerCaps 1.4.0 — 단일 파일 배포판.
+"""ContainerCaps 1.4.1 — 단일 파일 배포판.
 
 Docker cgroup v2의 태스크별 capabilities와 보안 맥락을 메모리에서 읽는다.
 플러그인 자체는 이 파일 하나이며, Python과 Volatility는 별도로 설치한다.
@@ -25,7 +25,7 @@ symbols는 덤프와 일치하는 ISF가 들어 있는 linux/의 상위 폴더�
 
 파일 구성: 1) 저장 자료 해석·표 2) 사용자 CLI 3) 선택적 스키마 준비
            4) 심볼/PID 5) cgroup 소속 6) capability 판독 7) 보안 맥락 8) 수집 플러그인
-실행 로직 버전은 기존 1.4.0을 유지하며 배포 구조만 한 파일로 통합했다.
+1.4.1: cap_last_cap 타입 누락을 보완하고, 보조 범위 조회 실패 시 원시 권한을 보존한다.
 """
 
 import argparse
@@ -47,7 +47,7 @@ import tempfile
 import unicodedata
 
 BASE = Path(__file__).resolve().parent
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 CAPS = ('cap_inheritable', 'cap_permitted', 'cap_effective', 'cap_bounding', 'cap_ambient')
 CAP_FIELDS = CAPS
 
@@ -1167,32 +1167,61 @@ def _read_mask(cap, raw):
 
 
 def _kernel_range(module):
+    # 보조 범위의 실패가 이미 읽은 capability 마스크·바이트를 무효화하지 않게 한다.
+    # 타입 보완 근거는 범위 관측에만 남긴다. 정상적인 기존 타입은 덮어쓰지 않는다.
+    details = {}
     try:
         if not module.has_symbol('cap_last_cap'):
             return None, None, _observation(
                 'capability_kernel_range', 'not_present',
                 'cap_last_cap symbol is absent; kernel capability range is unknown')
-        value = module.object_from_symbol('cap_last_cap')
+        if module.get_symbol('cap_last_cap').type is None:
+            details = {'type_source': 'linux_int_fallback', 'object_type': 'int'}
+            try:
+                integer_type = module.get_type('int')
+            except exceptions.SymbolError as exc:
+                raise UnsupportedLayout('Untyped cap_last_cap requires an available int type: ' + str(exc)) from exc
+            # Linux의 cap_last_cap은 int다. 현재 지원하는 x86-64의 signed 32-bit
+            # 형식인지 먼저 확인하고, 주소·모듈 재배치는 Volatility API에 맡긴다.
+            if (getattr(integer_type.vol, 'object_class', None) is not objects.Integer or
+                    integer_type.size != 4 or
+                    getattr(integer_type.vol, 'data_format', None) != objects.DataFormatInfo(4, 'little', True)):
+                raise UnsupportedLayout('Untyped cap_last_cap requires a signed 32-bit little-endian int type')
+            details['object_type'] = integer_type.vol.type_name
+            # object_from_symbol은 'int' 문자열에 심볼 테이블명을 붙이지 않는다.
+            # 현재 모듈에서 찾은 템플릿을 넘겨 같은 커널의 정수형을 사용한다.
+            value = module.object_from_symbol('cap_last_cap', object_type=integer_type)
+        else:
+            value = module.object_from_symbol('cap_last_cap')
         if not isinstance(value, objects.Integer):
             return None, None, _observation(
                 'capability_kernel_range', 'unsupported',
-                'cap_last_cap is not a symbol-defined integer')
+                'cap_last_cap is not a symbol-defined integer', **details)
         last = int(value)
         if last < 0:
             return None, None, _observation(
-                'capability_kernel_range', 'inconsistent', 'cap_last_cap is negative', value=last)
+                'capability_kernel_range', 'inconsistent', 'cap_last_cap is negative', value=last, **details)
         if last > 63:
             return None, None, _observation(
                 'capability_kernel_range', 'unsupported',
-                'cap_last_cap exceeds the supported 64-bit capability representation', value=last)
+                'cap_last_cap exceeds the supported 64-bit capability representation', value=last, **details)
         return (1 << (last + 1)) - 1, last, _observation(
-            'capability_kernel_range', 'ok', 'Kernel capability range read from cap_last_cap', value=last)
+            'capability_kernel_range', 'ok', 'Kernel capability range read from cap_last_cap', value=last, **details)
+    except UnsupportedLayout as exc:
+        return None, None, _observation(
+            'capability_kernel_range', 'unsupported', str(exc), **details)
     except exceptions.SymbolError as exc:
         return None, None, _observation(
-            'capability_kernel_range', 'not_present', f'cap_last_cap is unavailable: {exc}')
+            'capability_kernel_range', 'not_present', f'cap_last_cap is unavailable: {exc}', **details)
     except exceptions.InvalidAddressException as exc:
         return None, None, _observation(
-            'capability_kernel_range', 'read_error', f'Cannot read cap_last_cap: {exc}')
+            'capability_kernel_range', 'read_error', f'Cannot read cap_last_cap: {exc}', **details)
+    except Exception as exc:
+        # TypeError·ValueError·기타 보조 조회 실패도 범위만 미확인으로 남긴다.
+        # 원시 capability 자체의 읽기/구조 검사는 이 예외 경계 밖에서 수행한다.
+        return None, None, _observation(
+            'capability_kernel_range', 'read_error',
+            f'Cannot read cap_last_cap: {type(exc).__name__}: {exc}', **details)
 
 
 def _bit_labels(mask):
@@ -1215,6 +1244,7 @@ def decode_capability(context, module, cap):
     if len(raw) != size:
         raise ValueError('Short read of capability structure')
     raw_mask, layout = _read_mask(cap, raw)
+    # _kernel_range는 보조 관측이다. 실패해도 아래 원시 증거와 이름 해석은 계속한다.
     kernel_mask, last_cap, range_observation = _kernel_range(module)
     # 표시용 decoded_mask와 원래 저장된 raw_mask를 분리한다. 커널 범위 밖 비트나
     # 설치된 이름 목록에 없는 비트도 JSON에서 사라지지 않게 보존한다.
@@ -1706,7 +1736,7 @@ LOG = logging.getLogger(__name__)
 class ContainerCaps(interfaces.plugins.PluginInterface):
     """Group Docker cgroup-v2 tasks and extract their capabilities."""
     _required_framework_version = (2, 13, 0)
-    _version = (1, 4, 0)
+    _version = (1, 4, 1)
 
     @classmethod
     def get_requirements(cls):
