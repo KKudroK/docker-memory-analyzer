@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ContainerCaps 1.4.1 — 단일 파일 배포판.
+"""ContainerCaps — 단일 파일 배포판 (버전은 --version으로 확인).
 
 Docker cgroup v2의 태스크별 capabilities와 보안 맥락을 메모리에서 읽는다.
 플러그인 자체는 이 파일 하나이며, Python과 Volatility는 별도로 설치한다.
@@ -25,7 +25,8 @@ symbols는 덤프와 일치하는 ISF가 들어 있는 linux/의 상위 폴더�
 
 파일 구성: 1) 저장 자료 해석·표 2) 사용자 CLI 3) 선택적 스키마 준비
            4) 심볼/PID 5) cgroup 소속 6) capability 판독 7) 보안 맥락 8) 수집 플러그인
-1.4.1: cap_last_cap 타입 누락을 보완하고, 보조 범위 조회 실패 시 원시 권한을 보존한다.
+cap_last_cap 타입 누락과 보조 조회 실패를 처리하며, 전역 관측 상태도 함께 보고한다.
+화면의 제어문자는 이스케이프하고 원본 문자열은 감사 JSON에 보존한다.
 """
 
 import argparse
@@ -47,7 +48,9 @@ import tempfile
 import unicodedata
 
 BASE = Path(__file__).resolve().parent
-VERSION = '1.4.1'
+# 버전은 여기서만 정의한다. CLI·Volatility 클래스·감사 JSON이 같은 값을 사용한다.
+VERSION_INFO = (1, 4, 2)
+VERSION = '.'.join(map(str, VERSION_INFO))
 CAPS = ('cap_inheritable', 'cap_permitted', 'cap_effective', 'cap_bounding', 'cap_ambient')
 CAP_FIELDS = CAPS
 
@@ -84,8 +87,61 @@ def clean(value):
     """Render memory-sourced strings as data, including terminal controls."""
     if value is None:
         return '확인 불가'
-    return ''.join(c if not unicodedata.category(c).startswith('C') else repr(c)[1:-1]
+    return ''.join(c if not (unicodedata.category(c).startswith('C') or
+                            unicodedata.category(c) in ('Zl', 'Zp')) else repr(c)[1:-1]
                    for c in str(value))
+
+
+def clean_data(value):
+    """Make a display-only copy; preserve original evidence and schema keys."""
+    if isinstance(value, str):
+        return clean(value)
+    if isinstance(value, dict):
+        return {key: clean_data(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clean_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(clean_data(item) for item in value)
+    return value
+
+
+def global_observations(audit):
+    """Read global evidence once, including compatibility-only older results."""
+    if 'global_observations' in audit:
+        observations = audit['global_observations']
+    else:
+        # 이전 파일을 다시 저장하거나 버전을 바꾸지 않고 기록된 전역 실패를 반영한다.
+        observations = (audit.get('compatibility') or {}).get('security', [])
+    result = []
+    for item in observations if isinstance(observations, list) else []:
+        entry = dict(item)
+        entry.setdefault('source', 'security')
+        if entry not in result:
+            result.append(entry)
+    return result
+
+
+def audit_quality(audit):
+    """Shared counts for reports, native warnings and the convenience CLI exit."""
+    counts = {key: len(audit.get(key) or []) for key in
+              ('membership_errors', 'field_errors', 'traversal_errors', 'partial_observations')}
+    issues = [item for item in global_observations(audit) if item['status'] != 'ok']
+    # 전역 실패를 태스크마다 복제하지 않는다. 구성원 자체의 성공 상태도 유지한다.
+    counts['global_errors'] = sum(item['status'] in ('read_error', 'inconsistent') for item in issues)
+    counts['global_partial_observations'] = len(issues)
+    return counts
+
+
+def quality_totals(quality):
+    errors = sum(quality.get(key, 0) for key in
+                 ('membership_errors', 'field_errors', 'traversal_errors', 'global_errors'))
+    partial = quality.get('partial_observations', 0) + quality.get('global_partial_observations', 0)
+    return errors, partial
+
+
+def global_issue_text(observations):
+    return '; '.join(clean(item['feature']) + ' ' + clean(STATUS.get(item['status'], item['status']))
+                     for item in observations if item['status'] != 'ok')
 
 
 def number(value):
@@ -232,8 +288,7 @@ def build_report(audit, members):
             'discovered_docker_tasks': audit.get('discovered_docker_tasks'),
             'unmarked_tasks': audit.get('tasks_without_docker_marker', audit.get('non_docker_tasks')),
             'include_threads': audit.get('include_threads'),
-            'quality': {k: len(audit.get(k) or []) for k in
-                        ('membership_errors', 'field_errors', 'traversal_errors', 'partial_observations')},
+            'quality': audit_quality(audit), 'global_observations': global_observations(audit),
             'thread_inventory': audit.get('thread_inventory', []), 'groups': groups}
 
 
@@ -247,6 +302,11 @@ def rows(report):
     q = report['quality']
     yield '전체', '분석 범위', f"태스크 {report['enumerated_tasks']} | Docker 표식 {report['discovered_docker_tasks']} | 표시 컨테이너 {len(report['groups'])}"
     yield '전체', '관측 품질', '소속 오류 {membership_errors} / 필드 오류 {field_errors} / 순회 오류 {traversal_errors} / 부분 관측 {partial_observations}'.format(**q)
+    if q.get('global_partial_observations'):
+        yield '전체', '전역 관측', f"오류 {q['global_errors']} / 부분 {q['global_partial_observations']}"
+        for item in report.get('global_observations', []):
+            if item['status'] != 'ok':
+                yield '전역 확인', item['feature'], STATUS.get(item['status'], item['status']) + ': ' + item.get('reason', '')
     yield '전체', '선택 기준', f"Docker cgroup v2 커널 연결 관계. 표식 없는 태스크 {report['unmarked_tasks']}개는 미표시. 다른 런타임 부재 판정 아님."
     yield '전체', '수집 범위', '프로세스와 스레드' if report['include_threads'] else '대표 스레드만 수집됨; 전체 스레드 비교 불가'
     for group in report['groups']:
@@ -379,9 +439,12 @@ def format_summary(report):
     def line(row):
         return '  '.join(text + ' ' * (width - cell_width(text)) for text, width in zip(row, widths)).rstrip()
     q = report['quality']
-    errors = sum(q[k] for k in ('membership_errors', 'field_errors', 'traversal_errors'))
-    output = [f"Container Caps {clean(report['plugin_version'])} | 컨테이너 {len(report['groups'])} · 표시 태스크 {len(table)} | 오류 {errors} · 부분 {q['partial_observations']}",
-              '', line(headers), '-' * cell_width(line(headers))]
+    errors, partial = quality_totals(q)
+    output = [f"Container Caps {clean(report['plugin_version'])} | 컨테이너 {len(report['groups'])} · 표시 태스크 {len(table)} | 오류 {errors} · 부분 {partial}"]
+    issues = global_issue_text(report.get('global_observations', []))
+    if issues:
+        output.append('전역 확인: ' + issues)
+    output.extend(['', line(headers), '-' * cell_width(line(headers))])
     output.extend(line(row) for row in table)
     if not table:
         output.append('선택 조건에 맞는 Docker 표식 구성원 없음.')
@@ -440,7 +503,7 @@ STATUS_LABELS = {'ok': '확인', 'unsupported': '미지원', 'not_present': '필
 
 
 def display(value):
-    return '<확인 불가>' if value is None else str(value)
+    return '<확인 불가>' if value is None else clean(value)
 
 
 def capability_text(member, field):
@@ -608,7 +671,7 @@ def main(argv=None):
             parser.error('스키마 준비/원복 옵션은 분석·조회 옵션과 함께 사용하지 마세요.')
         path = installed_schema()
         print(prepare_schema(path, restore=args.restore_lab_schema))
-        print(f'대상: {path}')
+        print(f'대상: {clean(path)}')
         return 0
 
     if args.container and not re.fullmatch(r'[0-9a-fA-F]{6,64}', args.container):
@@ -629,50 +692,66 @@ def main(argv=None):
     # 컨테이너 선택은 표시할 구성원만 제한한다. 오류·수집 범위는 전체 실행의 기록을 유지한다.
     groups = group_members(select_members(audit, args.container, args.leaders))
     errors = {k: audit[k] for k in ('membership_errors', 'field_errors', 'traversal_errors')}
+    quality = audit_quality(audit)
+    # 종료 상태는 표시 필터나 이스케이프 처리 전에 전체 원본 관측으로 판단한다.
+    exit_code = 2 if any(quality.values()) or any(m.get('Status') == 'partial' for m in audit['members']) else 0
     summary = {
         'saved_result': bool(args.saved), 'created_utc': audit['created_utc'],
         'directory': str(directory), 'enumerated_tasks': audit['enumerated_tasks'],
         'tasks_without_docker_marker': audit.get('tasks_without_docker_marker', audit.get('non_docker_tasks')),
         'discovered_docker_tasks': audit['discovered_docker_tasks'],
         'scope': audit['scope'], 'errors': errors, 'groups': groups,
+        'quality': quality, 'global_observations': global_observations(audit),
         'thread_inventory': audit.get('thread_inventory', []),
         'plugin_version': audit.get('plugin_version'), 'kernel_banner': audit.get('kernel_banner'),
         'compatibility': audit.get('compatibility'), 'feature_status': compatibility_summary(audit),
         'partial_observations': audit.get('partial_observations', []),
         'not_evaluated': audit.get('not_evaluated', ['Permission context was not collected in this older result']),
     }
+    # 이전 상세/목록/호환성 화면은 복사본만 정제한다. JSON과 집합 비교는 원본을 쓴다.
+    if not args.json and (args.compatibility or args.list or args.view == 'details'):
+        audit = clean_data(audit)
+        summary = clean_data(summary)
+        groups = summary['groups']
     if args.json:
         # CLI JSON은 선택한 구성원과 그룹 자료다. native --view analyst의 보고서와 형식이 다르다.
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        # 터미널 JSON은 Unicode 제어문자도 escape한다. 파싱하면 원본 문자열로 복원된다.
+        print(json.dumps(summary, ensure_ascii=True, indent=2))
     elif args.compatibility:
         print(f"Container Caps {audit.get('plugin_version', '<과거 결과>')} | 저장된 분석의 구조별 관측")
         print('대상 커널: ' + display(audit.get('kernel_banner')))
         compatibility = audit.get('compatibility')
         if compatibility:
-            print('소속 검사: ' + json.dumps(compatibility['membership'], ensure_ascii=False))
-            print('PID 구조: ' + json.dumps(compatibility.get('pid_namespace'), ensure_ascii=False))
-            for item in compatibility.get('security', []):
-                print(f"  {item['feature']}: {STATUS_LABELS.get(item['status'], item['status'])} — {item.get('reason', '')}")
+            # 사전 키를 바꾸면 서로 다른 키가 충돌할 수 있어 직렬화한 표시 문자열을 정제한다.
+            print('소속 검사: ' + clean(json.dumps(compatibility['membership'], ensure_ascii=False)))
+            print('PID 구조: ' + clean(json.dumps(compatibility.get('pid_namespace'), ensure_ascii=False)))
         else:
             print('이 과거 결과에는 구조별 지원 검사가 기록되지 않았습니다.')
+        for item in summary['global_observations']:
+            print(f"  {item['feature']}: {STATUS_LABELS.get(item['status'], item['status'])} — {item.get('reason', '')}")
         for item in summary['feature_status']:
             layout = ' | ' + str(item['layout']) if item['layout'] else ''
             print(f"  {item['source']}.{item['feature']}: {STATUS_LABELS.get(item['status'], item['status'])} | {item['tasks']}개 태스크{layout}")
             for reason in item['reasons']:
                 print('    ' + reason)
-        print(f'근거·원시 필드·로그: {directory}')
+        print(f'근거·원시 필드·로그: {clean(directory)}')
     elif args.view in ('summary', 'analyst') and not args.list:
         report = build_report(audit, [member for group in groups for member in group['members']])
         print('저장 결과 재표시' if args.saved else '새 메모리 분석 결과')
         print(format_summary(report) if args.view == 'summary' else
               format_report(report, shutil.get_terminal_size((112, 30)).columns), end='')
-        print(f'\n상세·원시 바이트: {directory / "containercaps-audit.json"}')
+        print(f'\n상세·원시 바이트: {clean(directory / "containercaps-audit.json")}')
         print('조회: --container <ID> | 상세 JSON: --json | 전체 설명: --view analyst')
     else:
         print(('저장 결과' if args.saved else '새 분석 결과') + f" | 분석 시각(UTC): {audit['created_utc']}")
         if audit.get('kernel_banner'):
             print(f"Container Caps {audit.get('plugin_version', '?')} | 커널: {audit['kernel_banner']}")
         print(f"열거한 태스크 {audit['enumerated_tasks']}개 | Docker 표식 소속 {audit['discovered_docker_tasks']}개 | 표시 컨테이너 {len(groups)}개")
+        total_errors, total_partial = quality_totals(quality)
+        print(f'관측 품질: 오류 {total_errors} · 부분 {total_partial}')
+        issues = global_issue_text(summary['global_observations'])
+        if issues:
+            print('전역 확인: ' + issues)
         print('식별 기준: Docker cgroup v2 경로와 커널 연결 관계')
         for group in groups:
             members = group['members']
@@ -712,7 +791,7 @@ def main(argv=None):
                     print(f"  PID {comparison['pid']} 스레드 간 차이: " + ', '.join(comparison['different_observed_fields']))
         if not groups:
             print('선택 조건에 맞는 Docker 표식 소속을 찾지 못했습니다. 다른 런타임까지 부재를 뜻하지는 않습니다.')
-        if any(errors.values()) or audit.get('partial_observations'):
+        if any(quality.values()):
             print('\n일부 관측이 불완전합니다. 오류 내용은 containercaps-audit.json을 확인하세요.')
         if audit.get('thread_inventory'):
             counts = audit['thread_inventory']
@@ -723,9 +802,9 @@ def main(argv=None):
         if audit.get('not_evaluated'):
             print('미평가: ' + '; '.join(audit['not_evaluated']))
             print('all은 해당 user namespace의 capability 집합을 뜻합니다. 호스트 파일 접근이나 seccomp/LSM 통과를 판정하지 않습니다.')
-        print(f'\n근거·원시 필드·로그: {directory}')
+        print(f'\n근거·원시 필드·로그: {clean(directory)}')
     # Volatility가 정상 종료해도 일부 필드/순회 실패가 있으면 래퍼는 종료 코드 2로 알린다.
-    return 2 if any(errors.values()) or audit.get('partial_observations') or any(m.get('Status') == 'partial' for m in audit['members']) else 0
+    return exit_code
 
 
 # 3. 선택적 실험 스키마 준비: 원본 해시·백업을 확인하고 명시적으로만 실행
@@ -836,7 +915,7 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except (OSError, ValueError, KeyError, RuntimeError, importlib.metadata.PackageNotFoundError) as exc:
-        print(f'vcaps: {exc}', file=sys.stderr)
+        print(f'vcaps: {clean(exc)}', file=sys.stderr)
         sys.exit(1)
 
 
@@ -1736,7 +1815,7 @@ LOG = logging.getLogger(__name__)
 class ContainerCaps(interfaces.plugins.PluginInterface):
     """Group Docker cgroup-v2 tasks and extract their capabilities."""
     _required_framework_version = (2, 13, 0)
-    _version = (1, 4, 1)
+    _version = VERSION_INFO
 
     @classmethod
     def get_requirements(cls):
@@ -1875,7 +1954,8 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         # audit는 실행 전체, members의 각 항목은 태스크 하나의 값과 그 값을 읽은 근거다.
         audit = {
             'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            'plugin_version': '1.4.0', 'kernel_banner': security.banner,
+            'plugin_version': VERSION, 'kernel_banner': security.banner,
+            'global_observations': [dict(item, source='security') for item in security.observations],
             'compatibility': {
                 'policy': 'matching symbols; structure-selected readers; cgroup v2 and Intel64',
                 'membership': resolver.compatibility,
@@ -1987,12 +2067,15 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     self._observations(member, audit, 'thread_inventory', [{'feature': 'thread_coverage',
                         'status': 'inconsistent', 'reason': 'Observed TIDs and signal.nr_threads disagree'}])
         audit['coverage_complete_within_enumerated_tasks'] = not (audit['membership_errors'] or audit['traversal_errors'])
+        audit['quality'] = audit_quality(audit)
         # self.open은 Volatility 출력 디렉터리(-o)를 따른다. 화면을 줄여도 원시 근거는
         # 감사 JSON에 남기며, analyst JSON에는 집합 비교와 확인 항목을 추가한다.
         with self.open('containercaps-audit.json') as handle:
             handle.write(json.dumps(audit, ensure_ascii=False, indent=2).encode('utf-8'))
-        if audit['membership_errors'] or audit['field_errors'] or audit['traversal_errors']:
-            LOG.warning('ContainerCaps: incomplete observations; inspect containercaps-audit.json (%d membership, %d field, %d traversal errors)', len(audit['membership_errors']), len(audit['field_errors']), len(audit['traversal_errors']))
+        if any(audit['quality'].values()):
+            total_errors, total_partial = quality_totals(audit['quality'])
+            LOG.warning('ContainerCaps: incomplete observations; inspect containercaps-audit.json (errors=%d, partial=%d; global errors=%d, global partial=%d)',
+                        total_errors, total_partial, audit['quality']['global_errors'], audit['quality']['global_partial_observations'])
         if self.config.get('view', 'raw') == 'analyst':
             report = build_report(audit, selected)
             with self.open('containercaps-analyst.json') as handle:
@@ -2007,6 +2090,8 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                    ('Securebits', int), ('MountNS', int), ('NetNS', int), ('Status', str)] + [(x, str) for x in CAP_FIELDS]
         def generate():
             for member in selected:
-                values = tuple(member[key] if member[key] is not None else renderers.NotAvailableValue() for key, _ in columns)
+                # TreeGrid는 표시용이다. renderer JSON도 정제된 셀이며 원본은 audit JSON에 있다.
+                values = tuple((clean(member[key]) if kind is str else member[key])
+                               if member[key] is not None else renderers.NotAvailableValue() for key, kind in columns)
                 yield 0, values
         return renderers.TreeGrid(columns, generate())
