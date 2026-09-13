@@ -132,6 +132,15 @@ IDENTITY_PATTERNS: Tuple[Tuple[re.Pattern, str, str, str], ...] = (
     ),
     (
         re.compile(
+            rf"(?:^|/)var/lib/docker/rootfs/overlayfs/({_HEX64})(?:/|$)",
+            re.IGNORECASE,
+        ),
+        "docker",
+        "container",
+        "docker-rootfs-overlayfs",
+    ),
+    (
+        re.compile(
             rf"(?:^|/)(?:var/lib|var/run)/containers/storage/"
             rf"overlay-containers/({_HEX64})(?:/|$)",
             re.IGNORECASE,
@@ -432,7 +441,18 @@ def _pid_namespace_values(task) -> Tuple[Optional[int], Optional[int]]:
             return None, None
         pid_object = pid_pointer.dereference()
         level = int(pid_object.level)
-        upid = pid_object.numbers[level]
+        # pid.numbers[] is a flexible-array member.  BTF/DWARF ISFs commonly
+        # describe it with count 0 even though the dump contains level + 1
+        # struct upid entries immediately after struct pid.  Recast it with
+        # the runtime length before indexing the innermost namespace entry.
+        if level < 0 or level > 32:
+            return None, None
+        numbers = pid_object.numbers.cast(
+            "array",
+            count=level + 1,
+            subtype=pid_object.numbers.vol.subtype,
+        )
+        upid = numbers[level]
         ns_id = int(upid.ns.ns.inum)
         return ns_id, int(upid.nr)
     except (AttributeError, IndexError, TypeError, ValueError, exceptions.InvalidAddressException):
@@ -769,15 +789,48 @@ def _mount_access(data) -> Tuple[bool, str]:
     return writable, "rw" if writable else "ro"
 
 
-def _expected_runtime_artifact(container_path: str, host_path: str) -> bool:
+def _expected_runtime_artifact(
+    container_path: str,
+    host_path: str,
+    runtime: str,
+    container_id: str,
+    id_kind: str,
+) -> bool:
     expected_names = EXPECTED_RUNTIME_ARTIFACTS.get(container_path, ())
     basename = host_path.rsplit("/", 1)[-1]
     if basename in expected_names:
         return True
-    return container_path == "/" and basename in {"merged", "rootfs", "fs"}
+    if container_path != "/":
+        return False
+
+    # Common runtime layouts end their root mount in one of these names.
+    if basename in {"merged", "rootfs", "fs"}:
+        return True
+
+    # Some Docker versions expose the container root as
+    # /var/lib/docker/rootfs/overlayfs/<container-id>.  Do not whitelist an
+    # arbitrary runtime-storage child: require the exact Docker path grammar
+    # and correlation with the namespace identity selected from cgroup/mount
+    # evidence.
+    identity = _identify_path(host_path)
+    return bool(
+        runtime == "docker"
+        and id_kind == "container"
+        and container_id
+        and identity
+        and identity.runtime == "docker"
+        and identity.id_kind == "container"
+        and identity.identifier == container_id.lower()
+        and identity.evidence == "docker-rootfs-overlayfs"
+    )
 
 
-def _classify_mount(record: MountRecord, runtime: str) -> Tuple[str, str]:
+def _classify_mount(
+    record: MountRecord,
+    runtime: str,
+    container_id: str = "",
+    id_kind: str = "",
+) -> Tuple[str, str]:
     """Classify one mount without promoting an unproven path to host source."""
 
     container_path = record.container_path
@@ -800,7 +853,10 @@ def _classify_mount(record: MountRecord, runtime: str) -> Tuple[str, str]:
             path for path in record.host_sources if _runtime_storage_path(path)
         ]
         if runtime_sources and all(
-            _expected_runtime_artifact(container_path, path) for path in runtime_sources
+            _expected_runtime_artifact(
+                container_path, path, runtime, container_id, id_kind
+            )
+            for path in runtime_sources
         ):
             return RISK_INFRA, "런타임이 생성한 표준 컨테이너 마운트"
 
@@ -844,7 +900,7 @@ class ContainerMounts(plugins.PluginInterface):
     """Find container-backed mount namespaces and inspect their mounts."""
 
     _required_framework_version = (2, 13, 0)
-    _version = (0, 3, 0)
+    _version = (0, 3, 1)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -1264,7 +1320,9 @@ class ContainerMounts(plugins.PluginInterface):
             cgroup_text = " | ".join(cgroup_memberships)
 
             for record in records:
-                risk, reason = _classify_mount(record, runtime)
+                risk, reason = _classify_mount(
+                    record, runtime, container_id, id_kind
+                )
                 if risk == RISK_INFRA and not show_all:
                     continue
 
