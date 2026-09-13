@@ -7,15 +7,15 @@ Docker cgroup v2의 태스크별 capabilities와 보안 맥락을 메모리에�
 설치 (검증 환경: Python 3.12, 전용 가상환경):
     python -m pip install volatility3==2.28.0 pefile==2024.8.26 jsonschema==4.26.0
 핵심 표 / 상세 JSON / 저장 결과 조회:
-    python containercaps.py --dump memory.lime --symbols symbols --output-root results
-    python containercaps.py --saved --output-root results --json
-    python containercaps.py --saved --output-root results --container <ID접두사>
+    python inspect-caps.py --dump memory.lime --symbols symbols --output-root results
+    python inspect-caps.py --saved --output-root results --json
+    python inspect-caps.py --saved --output-root results --container <ID접두사>
 Volatility 명령 직접 실행 (이 파일이 있는 폴더에서):
-    python containercaps.py --volatility -p . -s symbols -f memory.lime -o results containercaps.ContainerCaps --view analyst
-    vol -p . -s symbols -f memory.lime -o results containercaps.ContainerCaps --view analyst
+    python inspect-caps.py --volatility -p . -s symbols -f memory.lime -o results inspect-caps.ContainerCaps --view analyst
+    vol -p . -s symbols -f memory.lime -o results inspect-caps.ContainerCaps --view analyst
 실험용 BTF ISF를 사용할 때만 필요한 메타데이터 준비 / 원복:
-    python containercaps.py --prepare-lab-schema
-    python containercaps.py --restore-lab-schema
+    python inspect-caps.py --prepare-lab-schema
+    python inspect-caps.py --restore-lab-schema
 
 symbols는 덤프와 일치하는 ISF가 들어 있는 linux/의 상위 폴더다.
 기본 화면은 7열 요약이며 상세 근거는 결과 폴더의 JSON에 저장한다.
@@ -52,7 +52,7 @@ CAPS = ('cap_inheritable', 'cap_permitted', 'cap_effective', 'cap_bounding', 'ca
 CAP_FIELDS = CAPS
 
 # --volatility는 첫 번째 옵션이다. 클래스 정의 전에 공식 CLI로 진입해야
-# __main__과 volatility3.plugins.containercaps의 플러그인이 이중 등록되지 않는다.
+# __main__과 정식 플러그인 모듈에 클래스가 이중 등록되는 것을 막는다.
 # Windows에서 하위 프로세스가 시작될 때 CLI가 재귀 실행되지 않도록 보호한다.
 if __name__ == '__main__' and sys.argv[1:2] == ['--volatility']:
     multiprocessing.freeze_support()
@@ -556,7 +556,7 @@ def run_analysis(args):
     command = [sys.executable, '-X', 'utf8', str(Path(__file__).resolve()), '--volatility',
                '-q', '--offline', '-f', str(dump), '-s', str(symbols),
                '-p', str(BASE), '-o', str(out), '-r', 'json',
-               'containercaps.ContainerCaps']
+               'inspect-caps.ContainerCaps']
     manifest = {
         'wrapper_version': VERSION, 'volatility_version': importlib.metadata.version('volatility3'),
         'python_version': platform.python_version(), 'analysis_platform': platform.platform(),
@@ -586,7 +586,7 @@ def run_analysis(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Docker cgroup v2별 프로세스·스레드 capabilities 추출',
-        epilog='공식 CLI: python containercaps.py --volatility -p . [Volatility 옵션] containercaps.ContainerCaps --view analyst')
+        epilog='공식 CLI: python inspect-caps.py --volatility -p . [Volatility 옵션] inspect-caps.ContainerCaps --view analyst')
     parser.add_argument('--version', action='version', version=VERSION)
     parser.add_argument('--container', default='', help='전체 Docker ID 또는 6자리 이상의 고유 접두사')
     parser.add_argument('--list', action='store_true', help='컨테이너별 구성원 수만 표시')
