@@ -1,3 +1,0 @@
-volatility3==2.28.0
-pefile==2024.8.26
-jsonschema==4.26.0
