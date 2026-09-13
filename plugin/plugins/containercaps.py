@@ -33,6 +33,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
 
     @classmethod
     def get_requirements(cls):
+        # pslist/mountinfo의 version은 각 플러그인 API 버전이며 pip 패키지 버전과 구별한다.
         return [
             requirements.ModuleRequirement(name='kernel', description='Linux x86-64 kernel with matching symbols and cgroup v2', architectures=['Intel64']),
             requirements.VersionRequirement(name='pslist', component=pslist.PsList, version=(4, 0, 0)),
@@ -48,6 +49,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
     @staticmethod
     def _observations(member, audit, source, observations):
         """Preserve unavailable data separately from successful empty values."""
+        # 태스크별 근거와 전체 실행의 품질 기록을 함께 갱신한다. partial은 악성 여부가 아니다.
         for observation in observations:
             entry = dict(observation, source=source)
             if entry in member['observations']:
@@ -152,6 +154,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
 
     def run(self):
         module = self.context.modules[self.config['kernel']]
+        # 소속 복원에 필수인 cgroup 구조는 먼저 검사한다. 선택적인 PID/보안 필드는 부분 수집한다.
         resolver = CgroupV2Resolver(module)
         security = SecurityReader(self.context, module)
         try:
@@ -162,6 +165,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         if prefix and not re.fullmatch(r'[0-9a-fA-F]{6,64}', prefix):
             raise ValueError('Container prefix must be 6-64 hexadecimal characters')
         prefix = prefix.lower()
+        # audit는 실행 전체, members의 각 항목은 태스크 하나의 값과 그 값을 읽은 근거다.
         audit = {
             'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'plugin_version': '1.4.0', 'kernel_banner': security.banner,
@@ -194,6 +198,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 if address in seen:
                     continue
                 seen.add(address)
+                # Linux task.pid는 개별 TID, task.tgid는 프로세스 PID다. 표의 PID/TID도 이 구분을 따른다.
                 tid = int(task.pid)
                 tgid = int(task.tgid)
                 all_tids_by_pid.setdefault(tgid, set()).add(tid)
@@ -225,6 +230,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     'cgroup_chain': chain, 'capability_evidence': {}, 'observations': [],
                 }
                 for field in CAP_FIELDS:
+                    # 읽기 전 값은 미확인(None)이다. 읽기에 성공한 빈 권한 집합과 구별한다.
                     member[field] = None
                 try:
                     pid_chain = self._pid_chain(task, module)
@@ -258,6 +264,8 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         audit['selected_containers'] = len({(m['ContainerID'], m['ContainerRoot']) for m in selected})
         audit['enumerated_tasks'] = len(seen)
         audit['discovered_docker_tasks'] = len(audit['members'])
+        # 같은 프로세스의 스레드가 다른 cgroup에 있을 수 있어 전체 열거 TID로 nr_threads를 대조한다.
+        # 대표 스레드만 수집했거나 비교 근거가 모자라면 count_matches는 미확인(None)으로 남긴다.
         for pid in sorted({m['PID'] for m in audit['members']}):
             members = [m for m in audit['members'] if m['PID'] == pid]
             expected = {m['ExpectedThreads'] for m in members if m['ExpectedThreads'] is not None}

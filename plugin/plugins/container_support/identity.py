@@ -24,6 +24,8 @@ def identify_docker(chain):
         if cid is None and index and chain[index - 1]['name'] == 'docker' and FULL_ID.fullmatch(name):
             cid = name.lower()
         if cid is not None:
+            # 루트에서 태스크 쪽으로 읽으므로 나중의 표식이 가장 가까운 컨테이너다.
+            # root_address는 태스크의 말단 cgroup이 아니라 Docker 표식이 붙은 객체 주소다.
             found = {
                 'id': cid, 'root_address': node['address'],
                 'root_path': '/' + '/'.join(x['name'] for x in chain[:index + 1] if x['name']),
@@ -72,6 +74,7 @@ def read_cgroup_chain(start, limit=128, parent_field=None):
             raise ValueError('cgroup CSS parent and kernfs parent disagree')
         chain.append({'address': hex(address), 'kernfs': hex(int(node.vol.offset)), 'name': name})
         current = parent
+    # 순회는 말단→루트지만 반환은 루트→말단이다. 경로 조립과 표식 선택은 이 순서를 쓴다.
     return list(reversed(chain))
 
 
@@ -116,9 +119,11 @@ class CgroupV2Resolver:
             raise ValueError('css_set.dfl_cgrp: null default cgroup pointer')
         cgroup = cset.dfl_cgrp.dereference()
         address = int(cgroup.vol.offset)
+        # 경로 문자열이나 컨테이너 ID가 같아도 서로 다른 cgroup 객체의 결과를 섞지 않는다.
         if address not in self.cache:
             # 전체 경로를 성공적으로 읽은 뒤에만 캐시해 일시적인 읽기 실패를 숨기지 않는다.
             chain = read_cgroup_chain(cgroup, parent_field=self.parent_field)
             self.cache[address] = (chain, identify_docker(chain))
         chain, group = self.cache[address]
+        # 앞의 두 값은 Volatility 객체, chain/group은 보고서용 값이다. 표식이 없으면 group=None.
         return cset, cgroup, chain, group

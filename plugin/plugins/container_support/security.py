@@ -70,6 +70,8 @@ def anonymous_member(obj, name, depth=0):
 
 
 def map_kernel_id(extents, value):
+    # cred에서 읽은 커널 ID를 해당 user namespace에서 보이는 ID로 변환한다.
+    # kernel_first 구간에 대응하는 항목이 없으면 추정 ID 대신 None을 반환한다.
     matches = [e['namespace_first'] + value - e['kernel_first'] for e in extents
                if e['kernel_first'] <= value < e['kernel_first'] + e['count']]
     if len(matches) > 1:
@@ -84,6 +86,7 @@ def read_id_map(idmap, module):
     if count == 0:
         return []
     source = anonymous_member(idmap, 'extent')
+    # 작은 매핑은 구조체 안의 extent, 큰 매핑은 forward가 가리키는 별도 배열에 저장된다.
     if count <= len(source):
         values = [source[i] for i in range(count)]
     else:
@@ -159,6 +162,7 @@ class SecurityReader:
                 seen.add(key)
                 node = {'address': hex(key), 'inum': None, 'level': None, 'owner_kernel_uid': None,
                         'group_kernel_gid': None, 'uid_map': None, 'gid_map': None}
+                # 필드 판독 전에 노드를 넣어 이후 오류가 나도 도달한 주소와 부분 관측을 남긴다.
                 result['chain_leaf_to_initial'].append(node)
                 feature = 'user_namespace.' + hex(key)
                 node['inum'] = capture(observations, feature + '.inum', lambda: namespace_inum(current))
@@ -198,6 +202,8 @@ class SecurityReader:
         return result
 
     def credentials(self, cred):
+        # 입력은 역참조된 cred 객체다. 현재 cred인지 real_cred인지는 호출자가 구분하며,
+        # 여기서는 각 객체를 독립적으로 읽어 두 자격 증명의 관측이 서로 덮어쓰이지 않게 한다.
         observations = []
         result = {'address': hex(int(cred.vol.offset)), 'ids_kernel': {}, 'ids_in_user_namespace': {},
                   'capability_evidence': {}, 'capabilities': {}, 'securebits': None,
@@ -275,6 +281,7 @@ class SecurityReader:
         raise UnsupportedLayout('Neither contiguous gid nor small_block/blocks layout exists')
 
     def enrich_identity(self, result, cred):
+        # credentials()의 결과에 ID 적용 범위를 덧붙인다. CAPS 판독 성공 여부와는 독립적이다.
         observations = result.setdefault('observations', [])
         result['user_namespace'] = {'scope': 'unknown', 'chain_leaf_to_initial': [], 'observations': []}
         scope = capture(observations, 'credentials.user_namespace', lambda: self.user_namespace(dereference(member(cred, 'user_ns'), 'user namespace')))
@@ -282,6 +289,7 @@ class SecurityReader:
             result['user_namespace'] = scope
             observations.extend(scope['observations'])
         chain = result['user_namespace']['chain_leaf_to_initial']
+        # 체인의 첫 노드가 이 cred의 user namespace이므로 해당 노드의 ID 매핑을 사용한다.
         leaf = chain[0] if chain else {}
         for name, value in result['ids_kernel'].items():
             mappings = leaf.get('uid_map' if 'uid' in name else 'gid_map')
@@ -355,6 +363,7 @@ class SecurityReader:
                 pointer = member(item, 'prev')
             return len(seen)
         observed = capture(observations, 'seccomp.filter_chain', walk_filters)
+        # 중간에 끊겨도 도달한 필터 수는 남긴다. 실제 전체 개수로 쓸 수 있는지는 chain_complete로 구분한다.
         result['observed_filter_count'] = len(result['filters'])
         result['chain_complete'] = observed is not None
         if observed is not None:
@@ -402,6 +411,8 @@ class SecurityReader:
             result['task_root_dentry'] = capture(observations, 'mounts.root_dentry', lambda: hex(int(member(root, 'dentry'))))
         if namespace is None:
             return result
+        # 같은 mount namespace에서도 태스크의 root가 다르면 보이는 경로가 달라진다.
+        # 따라서 캐시는 namespace와 root의 mount/dentry 주소가 모두 같은 경우에만 공유한다.
         key = (result['namespace_address'], result['task_root_mount'], result['task_root_dentry'])
         if all(key) and key in self.mount_cache:
             return self.mount_cache[key]

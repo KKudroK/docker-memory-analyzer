@@ -29,6 +29,7 @@ def require_type(module, name, feature):
 
 
 def require_fields(module, name, fields, feature):
+    # 메모리를 읽기 전에 ISF 타입에 필수 멤버가 있는지 검사하고, 같은 타입 템플릿을 돌려준다.
     template = require_type(module, name, feature)
     for field in fields:
         if not template.has_member(field):
@@ -85,6 +86,7 @@ def inspect_pid_layout(module):
     if type(size) is not int or size <= 0:
         raise UnsupportedLayoutError(feature, 'upid', 'invalid symbol type size')
     layout.update(numbers_offset=offset, upid_size=size)
+    # 이 layout은 아래 판독기의 주소 계산과 외부 호환성 보고에 함께 쓰이는 선택 결과다.
     return {'feature': feature, 'status': 'ok', 'layout': layout}
 
 
@@ -126,6 +128,7 @@ def read_pid_chain(task, module):
             inum = int(namespace.ns.inum) if layout['namespace_id'] == 'ns.inum' else int(namespace.proc_inum)
             result.append({'level': index, 'id': nr, 'namespace': inum})
         field = 'task_struct.pid'
+        # numbers[0]과 task.pid는 태스크의 호스트 TID다. 프로세스 대표 ID인 tgid와 대조하지 않는다.
         if result[0]['id'] != int(task.pid):
             raise ValueError('task_struct.pid and pid.numbers[0].nr: Host TID and PID-object ID disagree')
         return result

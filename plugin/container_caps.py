@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Convenience CLI around the separate ContainerCaps Volatility plugin."""
+# 사용자용 진입점: Volatility를 실행해 수집한 감사 자료를 컨테이너별로 표시한다.
+# 실제 커널 구조 판독은 plugins/containercaps.py와 container_support/가 담당한다.
+# 실행 예: python container_caps.py --dump memory.lime --symbols symbols --output-root results
+# symbols는 덤프와 일치하는 ISF가 있는 linux/ 폴더의 상위 경로다.
+# 재조회 예: python container_caps.py --saved --output-root results
 import argparse
 import datetime
 import hashlib
@@ -50,6 +55,7 @@ def compatibility_summary(audit):
 
 
 def select_members(audit, prefix='', leaders=False):
+    # 저장할 때 제외한 스레드는 다시 표시할 수 없으므로 수집 범위를 먼저 확인한다.
     prefix = prefix.lower()
     if prefix and not re.fullmatch(r'[0-9a-f]{6,64}', prefix):
         raise ValueError('컨테이너 ID는 6~64자리 16진수로 입력하세요.')
@@ -65,6 +71,7 @@ def select_members(audit, prefix='', leaders=False):
 
 
 def group_members(members):
+    # member 한 개는 태스크(TID) 하나다. 그룹은 권한을 합산하지 않고 구성원 목록을 보관한다.
     groups = {}
     for member in members:
         key = (member['ContainerID'], member['ContainerRoot'])
@@ -147,6 +154,7 @@ def run_analysis(args):
                             for p in (BASE / 'container_caps.py', BASE / 'run_volatility.py')},
     }
     print('메모리 덤프에서 컨테이너 소속과 권한을 읽는 중입니다. 수 분 걸릴 수 있습니다.', file=sys.stderr)
+    # 표 렌더러의 rows.json과 플러그인의 감사 JSON을 분리한다. 재조회는 감사 JSON을 사용한다.
     with (out / 'rows.json').open('w', encoding='utf-8') as rows, (out / 'run.log').open('w', encoding='utf-8') as log:
         result = subprocess.run(command, stdout=rows, stderr=log)
     manifest['exit_code'] = result.returncode
@@ -193,6 +201,7 @@ def main(argv=None):
     else:
         directory = run_analysis(args)
     audit = read_json(directory / 'containercaps-audit.json')
+    # 컨테이너 선택은 표시할 구성원만 제한한다. 오류·수집 범위는 전체 실행의 기록을 유지한다.
     groups = group_members(select_members(audit, args.container, args.leaders))
     errors = {k: audit[k] for k in ('membership_errors', 'field_errors', 'traversal_errors')}
     summary = {
@@ -208,6 +217,7 @@ def main(argv=None):
         'not_evaluated': audit.get('not_evaluated', ['Permission context was not collected in this older result']),
     }
     if args.json:
+        # CLI JSON은 선택한 구성원과 그룹 자료다. native --view analyst의 보고서와 형식이 다르다.
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.compatibility:
         print(f"Container Caps {audit.get('plugin_version', '<과거 결과>')} | 저장된 분석의 구조별 관측")

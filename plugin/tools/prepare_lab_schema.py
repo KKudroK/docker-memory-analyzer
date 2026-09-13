@@ -21,6 +21,7 @@ import tempfile
 
 
 VOLATILITY_VERSION = "2.28.0"
+# btf/symdb는 심볼 생성 출처의 이름이다. 허용해도 필드 오프셋·주소나 스키마 검증은 바꾸지 않는다.
 STOCK_PATTERN = "^(dwarf|symtab|system-map)$"
 LAB_PATTERN = "^(btf|symdb|dwarf|symtab|system-map)$"
 # PyPI volatility3 2.28.0 wheel에 포함된 원본 스키마의 SHA-256이다.

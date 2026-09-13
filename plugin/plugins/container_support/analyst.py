@@ -42,6 +42,7 @@ def number(value):
 
 def cap_entry(member, field):
     evidence = (member.get('capability_evidence') or {}).get(field) or {}
+    # 과거 감사 파일의 권한 이름만으로 마스크를 역산하지 않는다. None은 미기록, 0은 빈 집합이다.
     mask = number(evidence.get('raw_mask'))
     names = evidence.get('names')
     value = member.get(field)
@@ -64,6 +65,7 @@ def task_report(member):
     # 이름 문자열이 아닌 보존된 원시 마스크로 집합 차이를 계산한다. 미기록 값은 미확인이다.
     # Bounding은 exec 시 취득 제한이므로 E가 B 밖에 있다는 이유만으로 불일치로 분류하지 않는다.
     sets = {field: cap_entry(member, field) for field in CAPS}
+    # i/p/e/b/a는 각각 상속 후보·보유·현재 유효·exec 취득 제한·ambient 집합의 비트마스크다.
     i, p, e, b, a = (sets[field]['mask'] for field in CAPS)
     deltas = {
         'permitted_not_effective': p & ~e if p is not None and e is not None else None,
@@ -126,6 +128,7 @@ def compare(tasks):
         values = [t['sets'][field]['mask'] if field in CAPS else t['source'].get(field) for t in tasks]
         if any(v is None or (field == 'CapabilityScope' and v == 'unknown') for v in values):
             unknown.append(field)
+        # 일부 태스크가 미확인이어도 나머지 관측값끼리 차이가 있으면 두 상태를 함께 남긴다.
         if len({json.dumps(v, sort_keys=True) for v in values if v is not None and v != 'unknown'}) > 1:
             different.append(field)
     def ids(m):
@@ -152,8 +155,10 @@ def compare(tasks):
 
 
 def build_report(audit, members):
+    # audit의 전체 수집 메타데이터와 선택된 members를 결합하며, source에 원래 관측값을 유지한다.
     grouped = {}
     for member in sorted(members, key=lambda m: (m['ContainerID'], m['ContainerRoot'], m['PID'], m['TID'])):
+        # 같은 ID라도 cgroup 루트 객체가 다르면 별도 그룹으로 두어 근거가 다른 태스크를 섞지 않는다.
         key = (member['ContainerID'], member['ContainerRoot'])
         group = grouped.setdefault(key, {'container_id': key[0], 'root_address': key[1],
                                         'path': member.get('ContainerPath'), 'members': []})
@@ -266,10 +271,12 @@ def summary_rows(report):
     # 표는 태스크마다 한 행으로 유지한다. Check는 조사할 근거의 요약이며 위험 점수가 아니다.
     ids = [g['container_id'] for g in report['groups']]
     width = 12
+    # 서로 다른 전체 ID의 접두사가 겹치면 구별될 때까지 표시 길이만 늘린다.
     while width < 64 and len({cid[:width] for cid in ids}) != len(set(ids)):
         width += 1
     for group in report['groups']:
         duplicate = ids.count(group['container_id']) > 1
+        # 전체 ID가 같은 별도 루트 그룹은 /C번호로 구분하고, 실제 루트 주소는 상세 보고서에 둔다.
         identity = group['container_id'][:width] + ('/' + group['label'] if duplicate else '')
         for task in group['members']:
             member = task['source']
@@ -286,6 +293,7 @@ def summary_rows(report):
             scope = {'initial_user_namespace': '초기', 'descendant_user_namespace': '하위'}.get(member.get('CapabilityScope'), '미확인')
             seccomp = {0: 'off', 1: 'strict', 2: 'filter/' + clean(member.get('SeccompFilters'))}.get(member.get('SeccompMode'), '미확인')
             codes = {c['code'] for c in task['checks']}
+            # 한 칸에는 아래 우선순위의 대표 항목을 표시한다. 생략된 checks도 상세 JSON에는 유지된다.
             if codes & {'PARTIAL_DATA', 'MASKS_UNAVAILABLE'}:
                 check = '부분/미확인'
             elif codes & {'EFFECTIVE_OUTSIDE_PERMITTED', 'AMBIENT_OUTSIDE_PI', 'UNKNOWN_BITS', 'OUT_OF_RANGE_BITS'}:
@@ -325,6 +333,7 @@ def format_summary(report):
 
 
 def cell_width(text):
+    # 한글의 화면 폭과 결합 문자를 반영해 문자 수가 아닌 터미널 셀 수로 열을 맞춘다.
     return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
 
 

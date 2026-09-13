@@ -1,4 +1,5 @@
 """Run Volatility using the Python environment chosen by the caller."""
+# Volatility 인자를 그대로 전달하는 진입점이다. 표시·저장 결과 조회는 container_caps.py가 담당한다.
 import multiprocessing
 
 

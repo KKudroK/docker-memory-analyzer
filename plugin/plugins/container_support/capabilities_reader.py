@@ -28,6 +28,7 @@ def _unsigned(value, width, cap, raw):
     result = int(value)
     if not 0 <= result < (1 << (width * 8)):
         raise ValueError('Capability integer exceeds its unsigned storage width')
+    # 심볼 객체가 해석한 값과 보고서에 보존할 바이트가 같은 위치·값을 가리키는지 확인한다.
     if result != int.from_bytes(raw[relative:relative + width], fmt.byteorder, signed=False):
         raise ValueError('Capability value disagrees with the preserved raw bytes')
     return result
@@ -48,6 +49,7 @@ def _read_mask(cap, raw):
             raise UnsupportedLayout('Capability cap array must contain one or two u32 words')
         mask = 0
         for index, word in enumerate(value):
+            # cap[0]은 하위 32비트다. 각 원소의 바이트 순서 해석은 _unsigned에서 끝난다.
             mask |= _unsigned(word, 4, cap, raw) << (32 * index)
         return mask, f'cap_u32_array_{count}'
     return _unsigned(value, 4, cap, raw), 'cap_u32_scalar'
@@ -132,6 +134,8 @@ def decode_capability(context, module, cap):
     if out_of_range:
         suffix = '[out_of_range: ' + ', '.join(_bit_labels(out_of_range)) + ']'
         text = (text + ' ' + suffix).lstrip()
+    # text는 표시용, evidence는 재검증용 원시 값, observations는 해석의 지원·일관성 상태다.
+    # 호출자는 빈 text(읽힌 권한 없음)와 판독 예외(읽지 못함)를 별도로 처리한다.
     return {
         'text': text,
         'evidence': {
