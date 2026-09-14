@@ -13,8 +13,9 @@ Usage (stock Volatility 3 >= 2.28.0; use a matching, schema-valid Linux ISF):
     vol --offline -p /path/to/plugins -s /path/to/symbols -f memory.lime \
         -o /path/to/results ps.Ps --ps
 
-Console rows pair each host PID with its namespace PID. A container with only
-residual evidence has no process PID. Complete command lines, threads, raw
+Output uses category/value rows, with one block per process and separate
+runtime state fields. JSON/CSV renderers use the same two-column schema.
+A container with only residual evidence has no process PID. Full commands, threads, raw
 cache pages/Go objects, field addresses, and 102 artifact statuses are kept in
 ps_evidence.json. Configured Privileged is recovered Docker configuration;
 effective capabilities are independently observed, never a privileged verdict.
@@ -48,6 +49,8 @@ CGROUP_ID = re.compile(r"/(?:docker/|docker-)([0-9a-f]{64})(?:\.scope)?(?=/|$)")
 FILE_ID = re.compile(r"(?:^|/)containers/([0-9a-f]{64})/(config\.v2\.json|hostconfig\.json)\Z")
 UTC = datetime.timezone.utc
 STAGES = ("tasks", "namespaces", "cgroups", "mounts", "page_cache", "runtime")
+RUNTIME_STATE_FIELDS = ("Running", "Paused", "Restarting", "Dead", "RemovalInProgress",
+                        "Pid", "ExitCode", "StartedAt", "FinishedAt")
 
 
 ARTIFACT_CATALOG = [
@@ -861,7 +864,7 @@ class Collector:
         self.layer = context.layers[self.kernel.layer_name]
         self.stage = "tasks"
         self.report = {"schema_version": 1, "method": "ANALYSIS.md six independent discovery paths",
-                       "provenance": {"plugin_version": "1.1.0", "volatility_version": constants.PACKAGE_VERSION,
+                       "provenance": {"plugin_version": "1.2.0", "volatility_version": constants.PACKAGE_VERSION,
                            "collection_started_utc": datetime.datetime.now(UTC).isoformat(),
                            "kernel_module": kernel_name, "kernel_layer": self.kernel.layer_name,
                            "isf_url": context.symbol_space[self.kernel.symbol_table_name].config.get("isf_url"),
@@ -1838,6 +1841,7 @@ def artifact_vectors(report):
 
 
 def presentation(report):
+    """Prepare process records without changing the collected evidence."""
     columns = ["Container ID", "Name", "Host PID", "NS PID", "Command", "Process Start UTC",
                "Created UTC", "Runtime State Evidence", "Configured Privileged", "Effective UID",
                "Effective Caps", "Association", "Sources"]
@@ -1850,7 +1854,7 @@ def presentation(report):
         states = []
         for evidence in obj["state_observations"]:
             fields = evidence["value"]
-            pairs = [f"{k}={fields[k]}" for k in ("Running", "Paused", "Restarting", "Dead", "RemovalInProgress", "Pid", "ExitCode", "StartedAt", "FinishedAt") if fields.get(k) is not None]
+            pairs = [f"{k}={fields[k]}" for k in RUNTIME_STATE_FIELDS if fields.get(k) is not None]
             states.append(evidence["source"] + ": " + ",".join(pairs))
         names = [m["value"].get("Name") for m in obj["metadata"]]
         names.extend(report["runtime_heap"][i].get("name") for i in obj["heap_candidates"])
@@ -1864,10 +1868,35 @@ def presentation(report):
     return [(name, str) for name in columns], [tuple(v.replace("\n", "\\n").replace("\t", "\\t") for v in row) for row in rows]
 
 
+def vertical_presentation(report):
+    """Render process records as category/value blocks with raw values only."""
+    columns, records = presentation(report)
+    containers = {item["id"]: item for item in report["containers"]}
+    rows = []
+
+    def cell(value):
+        return str(value).replace("\n", "\\n").replace("\t", "\\t")
+
+    for record in records:
+        if rows:
+            rows.append(("", ""))
+        for (category, _), value in zip(columns, record):
+            observations = containers[record[0]]["state_observations"]
+            if category == "Runtime State Evidence" and observations:
+                for observation in observations:
+                    rows.append((category, cell(observation["source"])))
+                    rows.extend((field, cell(observation["value"][field]))
+                                for field in RUNTIME_STATE_FIELDS
+                                if observation["value"].get(field) is not None)
+            else:
+                rows.append((category, value))
+    return [("category", str), ("value", str)], rows
+
+
 class Ps(interfaces.plugins.PluginInterface):
-    """Inventory Docker process associations and residual evidence (--ps)."""
+    """Inventory Docker processes and residual evidence as category/value blocks."""
     _required_framework_version = (2, 28, 0)
-    _version = (1, 1, 0)
+    _version = (1, 2, 0)
 
     @classmethod
     def get_requirements(cls):
@@ -1884,5 +1913,5 @@ class Ps(interfaces.plugins.PluginInterface):
             vollog.warning("ps: %d collection issues; review coverage and evidence in ps_evidence.json", len(report["errors"]))
         if not report["containers"]:
             vollog.warning("ps: no attributed candidates in searched memory; see coverage in ps_evidence.json")
-        columns, rows = presentation(report)
+        columns, rows = vertical_presentation(report)
         return renderers.TreeGrid(columns, ((0, row) for row in rows))
