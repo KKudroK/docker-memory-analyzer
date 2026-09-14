@@ -1,9 +1,9 @@
 """Docker process and residual-artifact inventory for stock Volatility 3.
 
 Deploy this file in a plugin directory and run ``ps.Ps --ps``. No files in
-Volatility's installation are replaced. All six ANALYSIS.md discovery paths
-run regardless of whether a container task was found. ps_evidence.json keeps
-raw observations, addresses, conflicts, coverage, and the artifact vector.
+Volatility's installation are replaced. Independent discovery paths run
+regardless of whether a container task was found. ps_evidence.json keeps
+process and container records, source addresses, conflicts, and scan coverage.
 
 Runtime heap results are structurally validated candidates, not proof that a
 ContainerStore/GC root still owns the object. Docker lifecycle labels are not
@@ -15,9 +15,10 @@ Usage (stock Volatility 3 >= 2.28.0; use a matching, schema-valid Linux ISF):
 
 Output uses category/value rows, with one block per process and separate
 runtime state fields. JSON/CSV renderers use the same two-column schema.
-A container with only residual evidence has no process PID. Full commands, threads, raw
-cache pages/Go objects, field addresses, and 102 artifact statuses are kept in
-ps_evidence.json. Configured Privileged is recovered Docker configuration;
+A container with only residual evidence has no process PID. Full commands,
+threads, recovered cache pages, Go field evidence, and scan limits are kept
+in ps_evidence.json (schema 2). Research catalogs and observation vectors
+are not collected by this plugin. Configured Privileged is recovered Docker configuration;
 effective capabilities are independently observed, never a privileged verdict.
 Overlay layer paths use verified ISF/live BTF types and retain their path scope.
 Task and thread lists are audited in both directions; damaged lists stay partial.
@@ -51,112 +52,6 @@ UTC = datetime.timezone.utc
 STAGES = ("tasks", "namespaces", "cgroups", "mounts", "page_cache", "runtime")
 RUNTIME_STATE_FIELDS = ("Running", "Paused", "Restarting", "Dead", "RemovalInProgress",
                         "Pid", "ExitCode", "StartedAt", "FinishedAt")
-
-
-ARTIFACT_CATALOG = [
-    (1, 'task_struct', 'tasks'),
-    (2, 'task_struct.pid', 'tasks'),
-    (3, 'task_struct.tgid', 'tasks'),
-    (4, 'task_struct.comm', 'tasks'),
-    (5, 'task_struct.__state', 'tasks'),
-    (6, 'task_struct.exit_state', 'tasks'),
-    (7, 'task_struct.exit_code', 'tasks'),
-    (8, 'task_struct.flags', 'tasks'),
-    (9, 'task_struct.mm', 'tasks'),
-    (10, 'task_struct.group_leader', 'tasks'),
-    (11, 'task_struct.parent', 'tasks'),
-    (12, 'task_struct.real_parent', 'tasks'),
-    (13, 'thread_pid', 'tasks'),
-    (14, 'struct pid', 'tasks'),
-    (15, 'pid.level', 'tasks'),
-    (16, 'pid.numbers[]', 'tasks'),
-    (17, 'numbers[0].nr', 'tasks'),
-    (18, 'numbers[level].nr', 'tasks'),
-    (19, 'numbers[level].ns', 'tasks'),
-    (20, 'nsproxy', 'namespaces'),
-    (21, 'mnt_ns', 'namespaces'),
-    (22, 'Mount Namespace ID', 'namespaces'),
-    (23, 'uts_ns', 'namespaces'),
-    (24, 'UTS Namespace ID', 'namespaces'),
-    (25, 'ipc_ns', 'namespaces'),
-    (26, 'IPC Namespace ID', 'namespaces'),
-    (27, 'net_ns', 'namespaces'),
-    (28, 'Network Namespace ID', 'namespaces'),
-    (29, 'cgroup_ns', 'namespaces'),
-    (30, 'Cgroup Namespace ID', 'namespaces'),
-    (31, 'PID Namespace ID', 'namespaces'),
-    (32, 'Namespace 공유 관계', 'namespaces'),
-    (33, 'Default Cgroup Root', 'cgroups'),
-    (34, 'struct cgroup', 'cgroups'),
-    (35, 'populated 관련 값', 'cgroups'),
-    (36, 'frozen 관련 값', 'cgroups'),
-    (37, 'dying 관련 값', 'cgroups'),
-    (38, 'self/css', 'cgroups'),
-    (39, 'kernfs_node', 'cgroups'),
-    (40, 'kernfs_node.name', 'cgroups'),
-    (41, 'kernfs_node.__parent', 'cgroups'),
-    (42, 'Parent Chain', 'cgroups'),
-    (43, 'Cgroup Path', 'cgroups'),
-    (44, 'Container ID', 'cgroups'),
-    (45, 'Task-Cgroup association', 'cgroups'),
-    (46, 'Task 없는 Cgroup 여부', 'cgroups'),
-    (47, 'Mount Namespace / Mount Tree', 'mounts'),
-    (48, 'struct mount', 'mounts'),
-    (49, 'vfsmount', 'mounts'),
-    (50, 'mount root', 'mounts'),
-    (51, 'super_block', 'mounts'),
-    (52, 'filesystem type', 'mounts'),
-    (53, 'dentry', 'mounts'),
-    (54, 'Dentry Path', 'mounts'),
-    (55, 'inode', 'mounts'),
-    (56, 'Overlay FS', 'mounts'),
-    (57, 'Overlay 관련 경로', 'mounts'),
-    (58, 'rootfs', 'mounts'),
-    (59, 'Container Path', 'mounts'),
-    (60, 'Layer 정보', 'mounts'),
-    (61, 'Cached Docker File', 'page_cache'),
-    (62, 'config.v2.json', 'page_cache'),
-    (63, 'hostconfig.json', 'page_cache'),
-    (64, 'Cached file path', 'page_cache'),
-    (65, 'Cached file inode', 'page_cache'),
-    (66, 'address_space', 'page_cache'),
-    (67, 'Cached Page', 'page_cache'),
-    (68, 'Recovered File Content', 'page_cache'),
-    (69, 'JSON Parsing 상태', 'page_cache'),
-    (70, 'Container ID', 'page_cache'),
-    (71, 'State 관련 값', 'page_cache'),
-    (72, 'PID 관련 값', 'page_cache'),
-    (73, 'Timestamp', 'page_cache'),
-    (74, '기타 설정값', 'page_cache'),
-    (75, 'dockerd process', 'runtime'),
-    (76, 'containerd process', 'runtime'),
-    (77, 'containerd-shim-runc-v2', 'runtime'),
-    (78, 'Container Process', 'runtime'),
-    (79, 'PID', 'runtime'),
-    (80, 'PPID', 'runtime'),
-    (81, 'comm', 'runtime'),
-    (82, 'Process Tree', 'runtime'),
-    (83, 'Command Line', 'runtime'),
-    (84, 'Runtime Path', 'runtime'),
-    (85, 'shim cmdline', 'runtime'),
-    (86, 'Container ID from shim/path', 'runtime'),
-    (87, 'Process Address Space', 'runtime'),
-    (88, 'VMA', 'runtime'),
-    (89, 'Heap Region', 'runtime'),
-    (90, 'Go Runtime Object', 'runtime'),
-    (91, 'Container 관련 구조체', 'runtime'),
-    (92, 'Structure Parse 상태', 'runtime'),
-    (93, 'State 구조', 'runtime'),
-    (94, 'Boolean Flags', 'runtime'),
-    (95, 'PID', 'runtime'),
-    (96, 'ExitCode', 'runtime'),
-    (97, 'StartedAt', 'runtime'),
-    (98, 'FinishedAt', 'runtime'),
-    (99, 'Container ID from Heap', 'runtime'),
-    (100, 'Container ID 일치 여부', 'runtime'),
-    (101, 'PID 일치 여부', 'runtime'),
-    (102, 'Process 관계 일치 여부', 'runtime'),
-]
 
 
 class Unsupported(ValueError):
@@ -392,15 +287,10 @@ def go_time(pm, address, fields):
 def collect_heap(collector, task):
     """Discover Go layouts in this dump, then validate Container/State candidates."""
     pm = ProcessImage(collector, task)
-    entity = "task:" + hex(task.vol.offset)
     space = {"pid": int(task.pid), "task": hex(task.vol.offset), "layer": pm.layer.name,
              "mm": hex(int(task.mm)), "pgd": hex(int(task.mm.pgd)), "vmas": pm.vmas,
              "resident_bytes": pm.resident_bytes, "gaps": pm.gaps, "truncated": pm.truncated}
     collector.report.setdefault("runtime_address_spaces", []).append(space)
-    for number, value in ((87, {k: v for k, v in space.items() if k != "vmas"}), (88, pm.vmas),
-                          (89, [v for v in pm.vmas if v["flags"] & 2 and v["file_va"] == "0x0"])):
-        collector.evidence(number, value, task, entity)
-
     def discover(first_field, required):
         names, descriptors = set(), {}
         for va in pm.find(bytes([len(first_field)]) + first_field.encode(), writable=False):
@@ -507,8 +397,8 @@ def collect_heap(collector, task):
                     continue
                 state = pm.num(va + cf["State"]["offset"])
                 rec = {"process_pid": int(task.pid), "container_id": cid, "container": pm.loc(va),
-                       "name": name, "root": root, "state": {}, "lifecycle": {}, "field_evidence": {},
-                       "parse_errors": [], "raw_objects": {}, "attribution": "structurally validated candidate; GC/ContainerStore reachability unverified"}
+                       "name": name, "root": root, "state": {}, "field_evidence": {},
+                       "parse_errors": [], "attribution": "structurally validated candidate; GC/ContainerStore reachability unverified"}
                 collector.report["runtime_heap"].append(rec)
                 if not pm.vma(state) or not pm.vma(state)["flags"] & 2:
                     rec["parse_errors"].append({"field": "State", "reason": "Outside writable VMA"})
@@ -518,7 +408,7 @@ def collect_heap(collector, task):
                         desc = fields[field]
                         if desc["kind"] not in (1, 2, 3, 4, 5, 6) or desc["size"] not in (1, 2, 4, 8):
                             raise Unsupported("Unexpected Go scalar type")
-                        if field not in ("Pid", "ExitCode", "RestartCount") and (desc["kind"], desc["size"]) != (1, 1):
+                        if field not in ("Pid", "ExitCode") and (desc["kind"], desc["size"]) != (1, 1):
                             raise Unsupported("State flag is not a Go bool")
                         pos = address + desc["offset"]
                         raw = pm.read(pos, desc["size"])
@@ -529,7 +419,7 @@ def collect_heap(collector, task):
                                 raise ValueError("Nonboolean Go field")
                             return bool(value)
                         return value
-                    for field in ("Running", "Paused", "Restarting", "OOMKilled", "RemovalInProgress", "Dead", "removed", "Pid", "ExitCode"):
+                    for field in ("Running", "Paused", "Restarting", "RemovalInProgress", "Dead", "Pid", "ExitCode"):
                         if field not in sf:
                             continue
                         try:
@@ -543,31 +433,9 @@ def collect_heap(collector, task):
                             rec["state"][field] = observed["utc"]
                         except (ValueError, OverflowError) as exc:
                             rec["parse_errors"].append({"field": field, "reason": str(exc)})
-                    for field in ("HasBeenStartedBefore", "HasBeenManuallyStopped", "HasBeenManuallyRestarted", "RestartCount"):
-                        if field in cf:
-                            try:
-                                rec["lifecycle"][field] = scalar(va, cf, field, "Container")
-                            except ValueError as exc:
-                                rec["parse_errors"].append({"field": field, "reason": str(exc)})
-                    for label, pos, size in (("container", va, ct["size"]), ("state", state, st["size"])):
-                        try:
-                            raw = pm.read(pos, size)
-                            rec["raw_objects"][label] = {**pm.loc(pos), "length": size,
-                                "base64": base64.b64encode(raw).decode(), "sha256": hashlib.sha256(raw).hexdigest()}
-                        except ValueError as exc:
-                            rec["parse_errors"].append({"field": label, "reason": str(exc)})
                 rec["parse_status"] = "PARTIAL" if rec["parse_errors"] else "FOUND"
                 if rec["parse_errors"]:
                     collector.issue("Go candidate fields", task, Incomplete(str(rec["parse_errors"])))
-                heap_entity = "heap:" + str(int(task.pid)) + ":" + hex(va)
-                values = ((90, rec["container"]), (91, {"id": cid, "root": root, "name": name}),
-                    (92, rec["parse_status"]), (93, rec.get("state_object")), (94, {k: v for k, v in rec["state"].items() if isinstance(v, bool)}),
-                    (95, rec["state"].get("Pid")), (96, rec["state"].get("ExitCode")),
-                    (97, rec["field_evidence"].get("State.StartedAt")), (98, rec["field_evidence"].get("State.FinishedAt")), (99, cid))
-                for number, value in values:
-                    collector.evidence(number, value, task, heap_entity, [cid], "dockerd Go heap candidate")
-                    if value is not None:
-                        collector.report["evidence"][-1]["location"] = pm.loc(state if 93 <= number <= 98 else va)
             except (ValueError, UnicodeError, struct.error) as exc:
                 if len(rejected) < LIMIT:
                     rejected.append({"candidate": pm.loc(va), "reason": str(exc)})
@@ -863,14 +731,14 @@ class Collector:
         self.kernel = context.modules[kernel_name]
         self.layer = context.layers[self.kernel.layer_name]
         self.stage = "tasks"
-        self.report = {"schema_version": 1, "method": "ANALYSIS.md six independent discovery paths",
-                       "provenance": {"plugin_version": "1.2.0", "volatility_version": constants.PACKAGE_VERSION,
+        self.report = {"schema_version": 2, "method": "Docker process inventory with independent residual discovery",
+                       "provenance": {"plugin_version": "1.3.0", "volatility_version": constants.PACKAGE_VERSION,
                            "collection_started_utc": datetime.datetime.now(UTC).isoformat(),
                            "kernel_module": kernel_name, "kernel_layer": self.kernel.layer_name,
                            "isf_url": context.symbol_space[self.kernel.symbol_table_name].config.get("isf_url"),
                            "input_layers": [{"name": name, "location": context.layers[name].config.get("location")}
                                             for name in context.layers if context.layers[name].config.get("location")]},
-                       "coverage": {}, "errors": [], "evidence": [], "tasks": [],
+                       "coverage": {}, "errors": [], "tasks": [],
                        "namespaces": [], "cgroups": [], "mounts": [], "cached_files": [],
                        "runtime_processes": [], "runtime_heap": [], "containers": [],
                        "limits": {"objects_per_traversal": LIMIT, "metadata_file_bytes": FILE_LIMIT,
@@ -889,8 +757,6 @@ class Collector:
         self.host_ns = {}
         self.init = None
         self.boot = None
-        self.stage_counts = {}
-        self.enum_constants = None
         self.task_discovery = {}
         self.report["task_list_integrity"] = []
         self.overlay_cache = {}
@@ -949,14 +815,6 @@ class Collector:
             self.issue(operation, obj, exc)
             return default
 
-    def evidence(self, number, value, obj, entity, ids=(), source=None):
-        if value is None:
-            return
-        entry = {"artifact": number, "stage": self.stage, "value": value,
-                 "location": self.location(obj), "entity": entity,
-                 "container_ids": sorted(set(ids)), "source": source or self.stage}
-        self.report["evidence"].append(entry)
-
     def obj(self, name, address):
         return self.kernel.object(name, offset=int(address), absolute=True)
 
@@ -992,10 +850,19 @@ class Collector:
         started = time.perf_counter()
         vollog.info("ps: collecting %s", name)
         self.read(name, name, function)
-        count = sum(1 for e in self.report["evidence"] if e["stage"] == name)
+        # Count native records, independently of optional/research serialization.
+        fields = {"tasks": ("tasks",), "namespaces": ("namespaces",),
+                  "cgroups": ("cgroups",), "mounts": ("mounts",),
+                  "page_cache": ("cached_files",),
+                  "runtime": ("runtime_processes", "runtime_heap")}[name]
+        count = sum(len(self.report[field]) for field in fields)
+        if name == "namespaces":
+            count = sum(row["kind"] == "mnt" for row in self.report["namespaces"])
         issues = self.report["errors"][errors:]
         self.report["coverage"][name] = {"status": "PARTIAL" if issues else "FOUND" if count else "NOT FOUND",
-            "completed_without_errors": not issues, "observations": count, "errors": len(issues),
+            "completed_without_errors": not issues, "records": count, "record_collections": list(fields),
+            "scope": "mount namespaces only" if name == "namespaces" else "reachable objects within configured traversal limits",
+            "errors": len(issues),
             "elapsed_seconds": round(time.perf_counter() - started, 3)}
 
     def namespace(self, ptr, kind, entity=None):
@@ -1140,29 +1007,18 @@ class Collector:
                     self.tasks[self.address(thread)] = thread
             self.read("thread list", task, threads)
         for address, task in self.tasks.items():
-            entity = "task:" + hex(address)
-            row = {"address": hex(address), "entity": entity, "namespaces": {}, "container_ids": [],
+            row = {"address": hex(address), "location": self.location(task),
+                   "namespaces": {}, "container_ids": [],
                    "discovery": self.task_discovery.get(address, [])}
             self.report["tasks"].append(row)
             self.task_rows[address] = row
-            self.evidence(1, True, task, entity)
-            fields = {"pid": 2, "tgid": 3, "__state": 5, "exit_state": 6, "exit_code": 7,
-                      "flags": 8, "mm": 9, "group_leader": 10, "parent": 11, "real_parent": 12}
-            for field, number in fields.items():
-                actual = "state" if field == "__state" and not task.has_member(field) else field
-                value = self.read("task." + actual, task, lambda f=actual: int(task.member(f)))
-                row[field] = value
-                self.evidence(number, value, task, entity, source="task." + actual)
+            # Only fields used by process display, identity, or ancestry.
+            for field in ("pid", "tgid", "real_parent"):
+                row[field] = self.read("task." + field, task, lambda f=field: int(task.member(f)))
             row["comm"] = self.read("task.comm", task, lambda: utility.array_to_string(task.comm))
-            self.evidence(4, row["comm"], task, entity)
             chain = self.read("task.pid_chain", task, lambda: self.pid_chain(task), [])
             row["pid_chain"] = chain
             if chain:
-                pid_address = hex(int(task.thread_pid if task.has_member("thread_pid") else task.pids[0].pid))
-                self.evidence(13, pid_address, task, entity)
-                for number, value in ((14, pid_address), (15, len(chain) - 1), (16, chain),
-                                      (17, chain[0]["nr"]), (18, chain[-1]["nr"]), (19, chain[-1]["namespace"])):
-                    self.evidence(number, value, task, entity)
                 row["namespace_tid"] = chain[-1]["nr"]
                 row["namespaces"]["pid"] = chain[-1]["namespace"]
             groups = self.read("task.cgroups", task, lambda: self.task_cgroups(task), [])
@@ -1173,6 +1029,7 @@ class Collector:
             if task.has_member("cred") and task.cred:
                 cred = self.read("task.cred", task, lambda: task.cred.dereference())
                 if cred is not None:
+                    row["credential_location"] = self.location(cred)
                     def effective_uid():
                         value = cred.member("euid")
                         return int(value.val) if value.has_member("val") else int(value)
@@ -1180,46 +1037,21 @@ class Collector:
                     row["effective_caps"] = self.read("cred.cap_effective", cred, lambda: hex(capability_mask(cred.cap_effective)))
 
     def collect_namespaces(self):
+        """Mount namespaces needed for VFS traversal; PID namespaces come from tasks."""
         host = self.init or self.symbol("init_task", "task_struct")
         all_tasks = [(host, None)] + [(t, self.task_rows[a]) for a, t in self.tasks.items()]
-        mapping = {"mnt": (21, 22), "uts": (23, 24), "ipc": (25, 26), "net": (27, 28), "cgroup": (29, 30)}
         for task, row in all_tasks:
-            entity = row["entity"] if row else "host"
+            entity = "task:" + row["address"] if row else "host"
             proxy = self.read("nsproxy", task, lambda: task.nsproxy.dereference() if task.nsproxy else None)
             if proxy is None:
                 continue
-            self.evidence(20, hex(proxy.vol.offset), proxy, entity)
-            for kind, numbers in mapping.items():
-                ns = self.read(kind + " namespace", proxy, lambda k=kind: self.namespace(proxy.member(k + "_ns"), k, entity))
-                if ns is None:
-                    continue
-                if row is None:
-                    self.host_ns[kind] = ns
-                else:
-                    row["namespaces"][kind] = ns
-                self.evidence(numbers[0], ns["address"], proxy, entity)
-                self.evidence(numbers[1], ns["inum"], int(ns["address"], 16), entity)
+            ns = self.read("mnt namespace", proxy, lambda: self.namespace(proxy.mnt_ns, "mnt", entity))
+            if ns is None:
+                continue
             if row is None:
-                chain = self.read("host PID namespace", task, lambda: self.pid_chain(task), [])
-                if chain:
-                    self.host_ns["pid"] = chain[-1]["namespace"]
-            elif row.get("pid_chain"):
-                self.evidence(31, row["pid_chain"][-1]["namespace"], task, entity)
-        for row in self.report["tasks"]:
-            row["namespace_relations"] = {kind: ("host_shared" if ns["address"] == self.host_ns[kind]["address"] else "different")
-                for kind, ns in row["namespaces"].items() if kind in self.host_ns}
-            self.evidence(32, row["namespace_relations"], int(row["address"], 16), row["entity"])
-
-    def enum(self, name):
-        # Constants may be masks or bit indices; the caller chooses per enum.
-        if self.enum_constants is None:
-            table = self.context.symbol_space[self.kernel.symbol_table_name]
-            self.enum_constants = {}
-            for enum_name in table.enumerations:
-                self.enum_constants.update(table.get_enumeration(enum_name).choices)
-        if name in self.enum_constants:
-            return int(self.enum_constants[name])
-        raise Unsupported("Missing enum constant " + name)
+                self.host_ns["mnt"] = ns
+            else:
+                row["namespaces"]["mnt"] = ns
 
     def collect_cgroups(self):
         roots = []
@@ -1233,7 +1065,7 @@ class Collector:
             raise Unsupported("No supported global cgroup root symbol")
         pending = []
         for root in roots:
-            self.evidence(33, hex(root.vol.offset), root, "global_cgroup_root")
+            self.report.setdefault("cgroup_roots", []).append(self.location(root))
             pending.append(root.cgrp)
         seen = set()
         while pending:
@@ -1251,31 +1083,9 @@ class Collector:
                         pending.append(child.cgroup.dereference())
             self.read("cgroup children", group, children)
         for address, (group, row) in self.cgroups.items():
-            entity, ids = "cgroup:" + hex(address), row["container_ids"]
-            self.evidence(34, row["address"], group, entity, ids)
-            self.evidence(43, row["path"], group, entity, ids)
-            for cid in ids:
-                self.evidence(44, cid, group, entity, ids)
-            raw = {}
-            for field in ("nr_populated_csets", "nr_populated_domain_children", "nr_populated_threaded_children", "flags"):
-                if group.has_member(field):
-                    raw[field] = self.read("cgroup." + field, group, lambda f=field: int(group.member(f)))
-            row["raw_state"] = raw
-            pop = [v for k, v in raw.items() if k != "flags"]
-            row["populated"] = any(v != 0 for v in pop) if pop and all(v is not None for v in pop) else None
-            row["frozen"] = self.read("cgroup frozen", group, lambda: bool(int(group.flags) & (1 << self.enum("CGRP_FROZEN"))))
-            row["dying"] = self.read("cgroup dying", group, lambda: bool(int(group.self.flags) & self.enum("CSS_DYING")))
-            for number, value in ((35, row["populated"]), (36, row["frozen"]), (37, row["dying"]), (38, hex(group.self.vol.offset))):
-                self.evidence(number, value, group, entity, ids)
-            if group.has_member("kn") and group.kn:
-                self.evidence(39, hex(int(group.kn)), group, entity, ids)
-                self.evidence(40, self.read("kernfs name", group.kn, lambda: self.string(group.kn.name)), group.kn.dereference(), entity, ids)
-                self.evidence(41, self.read("kernfs parent", group.kn, lambda: hex(int(group.kn.member("__parent") if group.kn.has_member("__parent") else group.kn.parent))), group.kn.dereference(), entity, ids)
-                self.evidence(42, row["parent_trace"], group.kn.dereference(), entity, ids, "kernfs parent traversal")
-            members = [t["address"] for t in self.report["tasks"] if row["address"] in t.get("cgroups", [])]
-            row["task_members"] = members
-            self.evidence(45, members, group, entity, ids)
-            self.evidence(46, not members, group, entity, ids, "no task association in observed task inventory; not an exited verdict")
+            row["location"] = self.location(group)
+            row["task_members"] = [t["address"] for t in self.report["tasks"]
+                                   if row["address"] in t.get("cgroups", [])]
 
     def backing_path(self, dentry, sb):
         """Path relative to the backing superblock root, not a host-absolute path."""
@@ -1436,16 +1246,8 @@ class Collector:
                                        else row["overlay"]["status"])
         row["container_ids"] = sorted({cid for path in (row["host_path"], row["path"], row["root_path"]) if path
             for cid in re.findall(r"/containers/([0-9a-f]{64})(?=/|$)", path)})
-        entity, ids = "mount:" + hex(address), row["container_ids"]
-        for number, value in ((47, {"namespace": row["namespace"], "mount": row["address"], "parent": hex(int(mount.mnt_parent))}),
-                              (48, row["address"]), (49, hex(mount.mnt.vol.offset) if mount.has_member("mnt") else row["address"]),
-                              (50, row["root_dentry"]), (51, row["superblock"]), (52, row["fstype"]),
-                              (53, row["root_dentry"]), (54, {"host": row["host_path"], "namespace": row["path"]}),
-                              (55, row["root_inode"]), (56, "overlay" in row["fstype"]),
-                              (57, row["host_path"] if "overlay" in row["fstype"] else None),
-                              (58, {"root_dentry": row["root_dentry"], "path": row["root_path"]} if "overlay" in row["fstype"] else None),
-                              (59, ids if ids else None), (60, row["layer_paths"] if row["layer_paths"] else None)):
-            self.evidence(number, value, mount, entity, ids)
+        row["location"] = self.location(mount)
+        row["parent"] = hex(int(mount.mnt_parent))
 
     def collect_mounts(self):
         if self.init is None:
@@ -1497,17 +1299,14 @@ class Collector:
             self.read("super_blocks", "super_blocks", superblocks)
 
     def recover_file(self, inode, path, cid, filename):
-        entity = "inode:" + hex(inode.vol.offset)
         row = {"path": path, "container_id": cid, "filename": filename, "inode": hex(inode.vol.offset),
-               "pages": [], "holes": [], "json_parse": "NOT FOUND"}
+               "location": self.location(inode), "pages": [], "holes": [], "json_parse": "NOT FOUND"}
         self.report["cached_files"].append(row)
         size = int(inode.i_size)
         if not 0 < size <= FILE_LIMIT:
             raise Incomplete("Empty/over-limit metadata inode")
         row["size"] = size
-        for number, value in ((61, True), (62 if filename == "config.v2.json" else 63, True),
-                              (64, path), (65, row["inode"]), (66, hex(int(inode.i_mapping)))):
-            self.evidence(number, value, inode, entity, [cid])
+        row["mapping"] = hex(int(inode.i_mapping))
         mapping = inode.i_mapping.dereference()
         storage = linux.IDStorage.choose_id_storage(self.context, self.kernel.name)
         pieces = {}
@@ -1552,7 +1351,6 @@ class Collector:
                     row["pages"].append({"file_offset": offset, "page": hex(page.vol.offset),
                         "length": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
                         "base64": base64.b64encode(raw).decode()})
-                    self.evidence(67, row["pages"][-1], page, entity, [cid])
                 self.read("cached page", page, content)
         self.read("inode pages", inode, recover)
         prefix = bytearray()
@@ -1563,6 +1361,7 @@ class Collector:
                 row["holes"].append({"offset": offset, "length": expected})
             if offset == len(prefix) and raw is not None:
                 prefix.extend(raw)
+        row["contiguous_prefix_bytes"] = len(prefix)
         row["complete"] = len(prefix) == size and not row["holes"]
         if row["holes"]:
             self.issue("metadata coverage", inode, Incomplete("Missing cache ranges; no zero filling"))
@@ -1581,15 +1380,6 @@ class Collector:
             row["identity_conflict"] = embedded is not None and embedded != cid
             if row["identity_conflict"]:
                 self.issue("metadata identity", inode, ValueError("Path and JSON ID disagree"))
-            self.evidence(68, {"contiguous_prefix_bytes": len(prefix), "complete": row["complete"]}, inode, entity, [cid])
-            self.evidence(69, row["json_parse"], inode, entity, [cid])
-            self.evidence(70, embedded, inode, entity, [cid])
-            state = data.get("State")
-            if isinstance(state, dict):
-                self.evidence(71, state, inode, entity, [cid], "cached config State; freshness unverified")
-                self.evidence(72, state.get("Pid"), inode, entity, [cid])
-                self.evidence(73, {k: state[k] for k in ("StartedAt", "FinishedAt") if k in state}, inode, entity, [cid])
-            self.evidence(74, data, inode, entity, [cid])
 
     def collect_page_cache(self):
         if not self.superblocks and self.kernel.has_symbol("super_blocks"):
@@ -1653,11 +1443,6 @@ class Collector:
             record = {"task": row["address"], "pid": row["pid"], "comm": comm, "argv": args,
                       "parent": row.get("real_parent"), "ppid": ppid, "container_ids": list(row["container_ids"])}
             self.report["runtime_processes"].append(record)
-            entity = row["entity"]
-            self.evidence(75 if comm == "dockerd" else 76 if comm == "containerd" else 77 if comm.startswith("containerd-shim") else 78, record, task, entity, row["container_ids"])
-            for number, value in ((79, row["pid"]), (80, ppid), (81, comm),
-                                  (82, {"task": row["address"], "parent": row.get("real_parent")}), (83, args), (84, [a for a in args if a.startswith("/")])):
-                self.evidence(number, value, task, entity, row["container_ids"])
             if comm.startswith("containerd-shim"):
                 flags = {a: args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-id", "--id", "-namespace", "--namespace")}
                 cid = flags.get("-id", flags.get("--id"))
@@ -1665,8 +1450,6 @@ class Collector:
                 record.update(runtime_namespace=namespace, shim_id=cid if cid and CID.fullmatch(cid) else None)
                 if record["shim_id"]:
                     shims[address] = (cid, namespace)
-                    self.evidence(85, args, task, entity, [cid])
-                    self.evidence(86, cid, task, entity, [cid], "shim argv; Docker attribution additionally requires moby namespace or other Docker evidence")
         known = {cid for row in self.report["tasks"] for cid in row["container_ids"]}
         known.update(r["container_id"] for r in self.report["cached_files"] if not r.get("identity_conflict"))
         for record in self.report["runtime_processes"]:
@@ -1697,10 +1480,6 @@ class Collector:
                           "parent": row.get("real_parent"), "ppid": self.task_rows.get(row.get("real_parent"), {}).get("pid"),
                           "container_ids": row["container_ids"], "association": "shim ancestry candidate"}
                 self.report["runtime_processes"].append(record)
-                for number, value in ((78, record), (79, row["pid"]), (80, record["ppid"]), (81, row.get("comm")),
-                                      (82, {"task": row["address"], "parent": row.get("real_parent")}), (83, row["argv"]),
-                                      (84, [a for a in row["argv"] if a.startswith("/")])):
-                    self.evidence(number, value, task, row["entity"], row["container_ids"])
         self.report["runtime_process_coverage"] = {
             "completed_without_errors": len(self.report["errors"]) == process_error_start and self.report["coverage"]["tasks"]["completed_without_errors"],
             "scope": "reachable task inventory and selected runtime command lines; excludes heap scan"}
@@ -1715,7 +1494,6 @@ class Collector:
                 raise ValueError("Invalid container ID")
             return self.containers.setdefault(cid, {"id": cid, "tasks": [], "cgroups": [], "mounts": [], "shims": [],
                 "cached_files": [], "heap_candidates": [], "conflicts": [], "sources": []})
-        mount_ids = {}
         for row in self.report["mounts"]:
             ns = row.get("namespace")
             if ns and ns != self.host_ns.get("mnt", {}).get("address"):
@@ -1723,7 +1501,6 @@ class Collector:
                 ids = {cid for t in members for cid in t["container_ids"]}
                 row["namespace_container_candidates"] = sorted(ids)
                 row["container_ids"] = sorted(set(row.get("container_ids", [])) | ids)
-            mount_ids["mount:" + row["address"]] = row.get("container_ids", [])
         for field, rows, id_field in (("tasks", self.report["tasks"], "container_ids"),
                                      ("cgroups", self.report["cgroups"], "container_ids"),
                                      ("mounts", self.report["mounts"], "container_ids")):
@@ -1778,22 +1555,10 @@ class Collector:
                 "comparison": "observed task PID" if s["value"]["Pid"] > 0 else "N/A: runtime PID is zero/nonpositive"}
                 for s in states if type(s["value"].get("Pid")) is int]
             obj["association"] = "CONFLICT" if obj["conflicts"] else "TASK_LINKED_CANDIDATE" if leaders else "ARTIFACT_ONLY_CANDIDATE"
-            anchor = int(obj["tasks"][0], 16) if obj["tasks"] else self.address(self.init) if self.init is not None else 0
-            entity = "container:" + cid
-            self.evidence(100, {"id": cid, "sources": obj["sources"], "conflicts": obj["conflicts"]}, anchor, entity, [cid], "full-ID correlation")
-            if obj["pid_comparisons"]:
-                self.evidence(101, obj["pid_comparisons"], anchor, entity, [cid], "runtime PID versus observed task PID")
-            ancestry = [{"task": t["address"], "shim_id": t.get("shim_candidate"),
-                         "matches_container_id": t.get("shim_candidate") == cid} for t in leaders if t.get("shim_candidate")]
-            if ancestry:
-                self.evidence(102, ancestry, anchor, entity, [cid], "real_parent chain and shim argv")
-        entity_ids = {r["entity"]: r["container_ids"] for r in self.report["tasks"]}
-        entity_ids.update(mount_ids)
-        runtime_entities = {"task:" + r["task"]: r["container_ids"] for r in self.report["runtime_processes"] if r.get("docker_attribution")}
-        for e in self.report["evidence"]:
-            e["container_ids"] = sorted(set(e["container_ids"] + entity_ids.get(e["entity"], [])))
-            if e["stage"] == "runtime":
-                e["container_ids"] = sorted(set(e["container_ids"] + runtime_entities.get(e["entity"], [])))
+            obj["shim_ancestry"] = [
+                {"task": t["address"], "shim_id": t["shim_candidate"],
+                 "matches_container_id": t["shim_candidate"] == cid}
+                for t in leaders if t.get("shim_candidate")]
         self.report["containers"] = list(self.containers.values())
         self.report["correlation_policy"] = "Full IDs group evidence for display; duplicate/stale heap instances and conflicts remain separate observations. PID/ns/ancestry alone is not a Docker verdict."
 
@@ -1803,41 +1568,7 @@ class Collector:
             self.stage_run(stage, fn)
         self.stage = "correlation"
         self.correlate()
-        self.report["artifact_catalog"] = ARTIFACT_CATALOG
-        self.report["artifact_vector"] = artifact_vectors(self.report)
         return self.report
-
-
-def artifact_vectors(report):
-    """Per-container presence, not a state classifier or a truth label."""
-    vectors = {}
-    for container in report["containers"]:
-        cid = container["id"]
-        observed = {}
-        for index, evidence in enumerate(report["evidence"]):
-            if cid in evidence["container_ids"]:
-                observed.setdefault(evidence["artifact"], []).append(index)
-        vector = []
-        for number, name, stage in ARTIFACT_CATALOG:
-            refs = observed.get(number, [])
-            context_refs = [i for i, e in enumerate(report["evidence"]) if e["artifact"] == number] if number in (33, 75, 76, 87, 88, 89) else []
-            coverage = report["coverage"][stage]
-            if 75 <= number <= 86 or number == 102:
-                coverage = report.get("runtime_process_coverage", coverage)
-            if refs or context_refs:
-                status = "FOUND"
-            elif stage in ("tasks", "namespaces") and not container["tasks"]:
-                status = "N/A" if stage == "namespaces" else "NOT FOUND" if coverage["completed_without_errors"] else "PARTIAL"
-            else:
-                status = "NOT FOUND" if coverage["completed_without_errors"] else "PARTIAL"
-            vector.append({"artifact": number, "name": name, "status": status, "evidence_indices": refs,
-                           "context_evidence_indices": context_refs,
-                           "feature_value": {"presence": True if status == "FOUND" else False if status == "NOT FOUND" else None},
-                           "reason": "observed; raw values and addresses are referenced" if status == "FOUND" else "no attributed task for namespace analysis" if status == "N/A" else "no observation within completed search scope" if status == "NOT FOUND" else "search or interpretation incomplete; see stage errors",
-                           "relation": "container-linked" if refs else "global context; attribution not established" if context_refs else "not observed",
-                           "search_stage": stage, "stage_complete": coverage["completed_without_errors"]})
-        vectors[cid] = vector
-    return vectors
 
 
 def presentation(report):
@@ -1896,7 +1627,7 @@ def vertical_presentation(report):
 class Ps(interfaces.plugins.PluginInterface):
     """Inventory Docker processes and residual evidence as category/value blocks."""
     _required_framework_version = (2, 28, 0)
-    _version = (1, 2, 0)
+    _version = (1, 3, 0)
 
     @classmethod
     def get_requirements(cls):
