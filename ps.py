@@ -16,17 +16,17 @@ Usage (stock Volatility 3 >= 2.28.0; use a matching, schema-valid Linux ISF):
 Output uses category/value rows, with one block per process and separate
 runtime state fields. JSON/CSV renderers use the same two-column schema.
 A container with only residual evidence has no process PID. Full commands,
-threads, recovered cache pages, Go field evidence, and scan limits are kept
-in ps_evidence.json (schema 2). Research catalogs and observation vectors
-are not collected by this plugin. Configured Privileged is recovered Docker configuration;
+threads, recovered metadata, Go field evidence, and scan limits are kept
+in ps_evidence.json (schema 3). Research catalogs, raw page exports, and
+full runtime/traversal diagnostics are not collected by this plugin. Configured Privileged is recovered Docker configuration;
 effective capabilities are independently observed, never a privileged verdict.
-Overlay layer paths use verified ISF/live BTF types and retain their path scope.
-Task and thread lists are audited in both directions; damaged lists stay partial.
+Mount paths support identity extraction; overlay backing layers are not decoded.
+Task and thread lists are audited in both directions; only integrity summaries
+and reverse-recovery markers are exported, and damaged lists stay partial.
 Heap scanning supports verified little-endian Go 64-bit reflection layouts;
 other layouts and nonresident memory are explicitly partial/unsupported.
 """
 
-import base64
 import bisect
 import datetime
 import hashlib
@@ -214,7 +214,7 @@ class ProcessImage:
                 break
         # Nonresident pages are never zero filled or treated as searched content.
         if self.gaps:
-            collector.issue("process memory coverage", task, Incomplete("Nonresident/unreadable VMA ranges excluded; see runtime_address_spaces.gaps"))
+            collector.issue("process memory coverage", task, Incomplete("Nonresident/unreadable VMA ranges excluded; see runtime_scan_summary"))
 
     def vma(self, address):
         index = bisect.bisect_right(self.starts, address) - 1
@@ -287,10 +287,14 @@ def go_time(pm, address, fields):
 def collect_heap(collector, task):
     """Discover Go layouts in this dump, then validate Container/State candidates."""
     pm = ProcessImage(collector, task)
-    space = {"pid": int(task.pid), "task": hex(task.vol.offset), "layer": pm.layer.name,
-             "mm": hex(int(task.mm)), "pgd": hex(int(task.mm.pgd)), "vmas": pm.vmas,
-             "resident_bytes": pm.resident_bytes, "gaps": pm.gaps, "truncated": pm.truncated}
-    collector.report.setdefault("runtime_address_spaces", []).append(space)
+    summary = {"pid": int(task.pid), "task": hex(task.vol.offset), "layer": pm.layer.name,
+               "vma_count": len(pm.vmas), "resident_bytes": pm.resident_bytes,
+               "gap_count": len(pm.gaps),
+               "gap_bytes": sum(int(g["end"], 16) - int(g["start"], 16) for g in pm.gaps),
+               "truncated": pm.truncated, "layout_verified": False, "rejected_candidates": 0,
+               "scope": "bounded resident VMA scan; gap counts cover unmapped/unscanned ranges; read errors are recorded separately"}
+    collector.report.setdefault("runtime_scan_summary", []).append(summary)
+
     def discover(first_field, required):
         names, descriptors = set(), {}
         for va in pm.find(bytes([len(first_field)]) + first_field.encode(), writable=False):
@@ -364,13 +368,13 @@ def collect_heap(collector, task):
     time_fields = {pm.go_name(pm.num(arr + i * 24)): pm.num(arr + i * 24 + 16) for i in range(count)}
     if set(time_fields) != {"wall", "ext", "loc"} or set(time_fields.values()) != {0, 8, 16}:
         raise Unsupported("Unsupported Go time.Time members")
-    collector.report.setdefault("runtime_go_types", []).append({"pid": int(task.pid), "container": ct,
-        "state": st, "time": {"va": hex(time_type), "fields": time_fields}})
+    summary.update(layout_verified=True, layout_source={
+        "container_type": ct["va"], "state_type": st["va"], "time_type": hex(time_type)})
     ids = {cid for row in collector.report["cgroups"] for cid in row["container_ids"]}
     ids.update(row["container_id"] for row in collector.report["cached_files"])
     for _, raw in pm.chunks:
         ids.update(match[1].decode() for match in re.finditer(rb"/containers/([0-9a-f]{64})(?:[^0-9a-f]|$)", raw))
-    rejected, seen = [], set()
+    seen = set()
     for cid in sorted(ids):
         strings = set(pm.find(cid.encode(), writable=True))
         if not strings:
@@ -436,239 +440,8 @@ def collect_heap(collector, task):
                 rec["parse_status"] = "PARTIAL" if rec["parse_errors"] else "FOUND"
                 if rec["parse_errors"]:
                     collector.issue("Go candidate fields", task, Incomplete(str(rec["parse_errors"])))
-            except (ValueError, UnicodeError, struct.error) as exc:
-                if len(rejected) < LIMIT:
-                    rejected.append({"candidate": pm.loc(va), "reason": str(exc)})
-    collector.report.setdefault("runtime_rejected", []).append({"pid": int(task.pid), "candidates": rejected})
-
-
-def memory_string(layer, address, limit=4096):
-    """Read a bounded NUL-terminated string without padding missing pages."""
-    if not address:
-        return None
-    data = bytearray()
-    while len(data) < limit:
-        position = (address + len(data)) & layer.address_mask
-        size = min(64, 4096 - position % 4096, limit - len(data))
-        block = layer.read(position, size, pad=False)
-        if b"\0" in block:
-            data.extend(block.split(b"\0", 1)[0])
-            return data.decode("utf-8", errors="strict")
-        data.extend(block)
-    raise Incomplete("String exceeds bounded NUL-terminated read")
-
-
-class OverlayLayout:
-    """Describe only required fields, using the ISF or the live module BTF.
-
-    Live btf.types already uses the running kernel's relocated base type IDs;
-    raw split/module BTF IDs must not be interpreted against an arbitrary ISF.
-    No guessed offsets or global symbol-table changes are used.
-    """
-    NAMES = ("ovl_fs", "ovl_layer", "ovl_config")
-    TYPE_LIMIT = 1000000
-
-    def __init__(self, collector, sb):
-        self.c, self.k, self.layer = collector, collector.kernel, collector.layer
-        self.pointer_size = self.k.get_type("pointer").size
-        self.byteorder = self.k.get_type("unsigned int").vol.data_format[1]
-        self.structures, self.records = {}, {}
-        self.source = {"kind": "ISF", "structures": self.structures}
-        if all(self.k.has_type(n) for n in self.NAMES):
-            for name in self.NAMES:
-                template = self.k.get_type(name)
-                self.structures[name] = {"size": template.size, "fields": {
-                    field: {"offset": template.relative_child_offset(field), **self.native_type(template.child_template(field))}
-                    for field in self.needed_fields(name) if template.has_member(field)}}
-        else:
-            self.btf = self.find_btf(sb)
-            self.source.update(kind="LIVE_BTF", btf=hex(self.c.address(self.btf)),
-                               name=utility.array_to_string(self.btf.name),
-                               base_btf=hex(int(self.btf.base_btf)), start_id=int(self.btf.start_id))
-            start, count = int(self.btf.start_id), int(self.btf.nr_types)
-            self.validate_btf(self.btf)
-            for tid in range(max(1, start), start + count):
-                record = self.record(tid)
-                if record["kind"] == 4 and record["name"] in self.NAMES:
-                    name = record["name"]
-                    if name in self.structures:
-                        raise Unsupported("Ambiguous overlay struct name in BTF: " + name)
-                    fields = {}
-                    for member in range(record["vlen"]):
-                        off, subtype, bit_offset = self.words(record["address"] + 12 + 12 * member, 3)
-                        field = self.btf_string(off)
-                        if field not in self.needed_fields(name):
-                            continue
-                        if (record["kflag"] and bit_offset >> 24) or bit_offset % 8:
-                            raise Unsupported("Required overlay member is a bitfield")
-                        fields[field] = {"offset": bit_offset // 8, **self.btf_type(subtype)}
-                    self.structures[name] = {"size": record["size"], "type_id": tid, "fields": fields}
-            if any(n not in self.structures for n in self.NAMES):
-                raise Unsupported("Required overlay structs absent from live BTF")
-        for name, desc in self.structures.items():
-            if not 0 < desc["size"] <= 1048576:
-                raise Unsupported("Invalid overlay struct size: " + name)
-            for field in desc["fields"].values():
-                if field["offset"] < 0 or field["offset"] + field["size"] > desc["size"]:
-                    raise Unsupported("Overlay member outside its containing struct")
-
-    @staticmethod
-    def needed_fields(name):
-        return {"ovl_fs": ("numlayer", "numdatalayer", "layers", "workbasedir", "workdir", "config"),
-                "ovl_layer": ("mnt", "idx"),
-                "ovl_config": ("upperdir", "workdir", "lowerdirs", "lowerdir")}[name]
-
-    def native_type(self, template, depth=0):
-        if depth > 16:
-            raise Unsupported("ISF pointer/type depth exceeded")
-        cls = template.vol.object_class
-        if issubclass(cls, objects.Pointer):
-            return {"kind": "pointer", "size": template.size,
-                    "target": self.native_type(template.vol.subtype, depth + 1)}
-        if issubclass(cls, objects.Integer):
-            return {"kind": "int", "size": template.size, "name": template.vol.type_name.split("!")[-1]}
-        if issubclass(cls, objects.StructType):
-            return {"kind": "struct", "size": template.size, "name": template.vol.type_name.split("!")[-1]}
-        raise Unsupported("Unsupported required overlay ISF field type")
-
-    def find_btf(self, sb):
-        owner = sb.s_type.owner
-        wanted = utility.array_to_string(owner.name) if owner else "vmlinux"
-        if not owner and self.k.has_symbol("btf_vmlinux"):
-            pointer = self.c.symbol("btf_vmlinux", "pointer")
-            if pointer:
-                return self.c.obj("btf", int(pointer))
-        if not self.k.has_symbol("btf_idr") or not self.k.has_type("btf"):
-            raise Unsupported("Overlay ISF types and live BTF registry unavailable")
-        root = self.c.symbol("btf_idr", "idr").idr_rt
-        if not root.has_member("xa_head"):
-            raise Unsupported("Live BTF discovery requires an XArray IDR layout")
-        # Bounded XArray walk: do not silently skip unreadable registry nodes.
-        pending, seen, matches = [(int(root.xa_head), None)], set(), []
-        slots = self.k.get_type("xa_node").child_template("slots").count
-        if slots < 2 or slots > 256 or slots & (slots - 1):
-            raise Unsupported("Invalid XArray slot count")
-        shift_step = slots.bit_length() - 1
-        while pending:
-            raw, parent_shift = pending.pop()
-            address = raw & self.layer.address_mask
-            if not address:
-                continue
-            if address & 3 == 2:
-                address &= ~3
-                if address < 4096 or address in seen or len(seen) >= 4096:
-                    raise Incomplete("Invalid/cyclic/over-limit BTF registry")
-                seen.add(address)
-                node = self.c.obj("xa_node", address)
-                shift = int(node.shift)
-                if shift % shift_step or shift >= self.pointer_size * 8 or (parent_shift is not None and shift != parent_shift - shift_step):
-                    raise Incomplete("Invalid BTF registry XArray shift")
-                pending.extend((int(node.slots[i]), shift) for i in range(slots))
-            elif not address & 3:
-                btf = self.c.obj("btf", address)
-                if bool(btf.kernel_btf) and utility.array_to_string(btf.name) == wanted:
-                    matches.append(btf)
-        if len(matches) != 1:
-            raise Unsupported("Expected one owner-matched live BTF, found {} for {}".format(len(matches), wanted))
-        return matches[0]
-
-    def validate_btf(self, btf):
-        if int(btf.hdr.magic) != 0xEB9F or int(btf.hdr.version) != 1:
-            raise Unsupported("Invalid BTF header")
-        if not 0 < int(btf.nr_types) <= self.TYPE_LIMIT or not 0 < int(btf.hdr.str_len) <= 32 * 1024 * 1024:
-            raise Unsupported("BTF metadata exceeds bounds")
-        if not 24 <= int(btf.hdr.hdr_len) <= 4096 or not 0 < int(btf.hdr.type_len) <= 64 * 1024 * 1024:
-            raise Unsupported("Invalid BTF type section")
-
-    def base_for(self, value, field):
-        btf, seen = self.btf, set()
-        while value < int(btf.member(field)):
-            address = self.c.address(btf)
-            if address in seen or len(seen) >= 16 or not btf.base_btf:
-                raise Unsupported("Invalid BTF base chain")
-            seen.add(address)
-            btf = btf.base_btf.dereference()
-        self.validate_btf(btf)
-        return btf
-
-    def words(self, address, count):
-        data = self.layer.read(address & self.layer.address_mask, 4 * count, pad=False)
-        return [int.from_bytes(data[i:i + 4], self.byteorder) for i in range(0, len(data), 4)]
-
-    def btf_string(self, offset):
-        btf = self.base_for(offset, "start_str_off")
-        offset -= int(btf.start_str_off)
-        if not 0 <= offset < int(btf.hdr.str_len):
-            raise Unsupported("BTF string offset out of bounds")
-        return memory_string(self.layer, int(btf.strings) + offset, min(4096, int(btf.hdr.str_len) - offset))
-
-    def record(self, tid):
-        if tid not in self.records:
-            btf = self.base_for(tid, "start_id")
-            index = tid - int(btf.start_id)
-            if tid == 0 or not 0 <= index < int(btf.nr_types):
-                raise Unsupported("BTF type ID out of bounds")
-            data = self.layer.read((int(btf.types) + index * self.pointer_size) & self.layer.address_mask, self.pointer_size, pad=False)
-            address = int.from_bytes(data, self.byteorder) & self.layer.address_mask
-            start = (int(btf.data) + int(btf.hdr.hdr_len) + int(btf.hdr.type_off)) & self.layer.address_mask
-            if not start <= address <= start + int(btf.hdr.type_len) - 12:
-                raise Unsupported("BTF type pointer outside type section")
-            name, info, size = self.words(address, 3)
-            vlen, kind = info & 0xffff, (info >> 24) & 31
-            extra = 12 * vlen if kind in (4, 5) else 4 if kind == 1 else 0
-            if address + 12 + extra > start + int(btf.hdr.type_len):
-                raise Unsupported("BTF type record extends outside section")
-            self.records[tid] = {"name": self.btf_string(name), "kind": kind, "vlen": vlen,
-                "kflag": bool(info >> 31), "size": size, "address": address}
-        return self.records[tid]
-
-    def btf_type(self, tid, depth=0):
-        if depth > 16:
-            raise Unsupported("BTF modifier/pointer depth exceeded")
-        t = self.record(tid)
-        if t["kind"] in (8, 9, 10, 11, 18):
-            return self.btf_type(t["size"], depth + 1)
-        if t["kind"] == 2:
-            return {"kind": "pointer", "size": self.pointer_size, "target": self.btf_type(t["size"], depth + 1)}
-        if t["kind"] == 1:
-            encoding = self.words(t["address"] + 12, 1)[0]
-            if (encoding >> 16) & 255 or encoding & 255 != t["size"] * 8:
-                raise Unsupported("Non-regular integer in overlay layout")
-            return {"kind": "int", "size": t["size"], "name": t["name"]}
-        if t["kind"] == 4:
-            return {"kind": "struct", "size": t["size"], "name": t["name"]}
-        raise Unsupported("Required overlay field has unsupported BTF kind {}".format(t["kind"]))
-
-    def field(self, name, field, kind, target=None):
-        desc = self.structures[name]["fields"].get(field)
-        if desc is None or desc["kind"] != kind:
-            raise Unsupported("Unsupported overlay layout: {}.{} requires {}".format(name, field, kind))
-        if kind == "pointer" and (desc["size"] != self.pointer_size or
-                (target and (desc["target"]["kind"] != "struct" or desc["target"]["name"] != target))):
-            raise Unsupported("Overlay pointer target mismatch")
-        return desc
-
-    def value(self, address, name, field, kind="int", target=None):
-        desc = self.field(name, field, kind, target)
-        if desc["size"] not in (1, 2, 4, 8):
-            raise Unsupported("Invalid overlay scalar width")
-        return int.from_bytes(self.layer.read((address + desc["offset"]) & self.layer.address_mask, desc["size"], pad=False), self.byteorder)
-
-    def string_pointer(self, address, name, field, index=None):
-        desc = self.field(name, field, "pointer")
-        target = desc["target"]
-        pointer = self.value(address, name, field, "pointer")
-        if index is not None:
-            if target["kind"] != "pointer" or target["size"] != self.pointer_size:
-                raise Unsupported("Overlay lowerdirs requires char **")
-            target = target["target"]
-            if not pointer:
-                raise Incomplete("Null overlay lowerdirs array")
-            pointer = int.from_bytes(self.layer.read((pointer + index * self.pointer_size) & self.layer.address_mask,
-                self.pointer_size, pad=False), self.byteorder)
-        if target["kind"] != "int" or target["size"] != 1:
-            raise Unsupported("Overlay path requires a character pointer")
-        return memory_string(self.layer, pointer)
+            except (ValueError, UnicodeError, struct.error):
+                summary["rejected_candidates"] += 1
 
 
 def audit_task_list(head, read_link, limit=LIMIT):
@@ -731,8 +504,8 @@ class Collector:
         self.kernel = context.modules[kernel_name]
         self.layer = context.layers[self.kernel.layer_name]
         self.stage = "tasks"
-        self.report = {"schema_version": 2, "method": "Docker process inventory with independent residual discovery",
-                       "provenance": {"plugin_version": "1.3.0", "volatility_version": constants.PACKAGE_VERSION,
+        self.report = {"schema_version": 3, "method": "Docker process inventory with independent residual discovery",
+                       "provenance": {"plugin_version": "1.4.0", "volatility_version": constants.PACKAGE_VERSION,
                            "collection_started_utc": datetime.datetime.now(UTC).isoformat(),
                            "kernel_module": kernel_name, "kernel_layer": self.kernel.layer_name,
                            "isf_url": context.symbol_space[self.kernel.symbol_table_name].config.get("isf_url"),
@@ -757,10 +530,8 @@ class Collector:
         self.host_ns = {}
         self.init = None
         self.boot = None
-        self.task_discovery = {}
+        self.backward_recovered_tasks = set()
         self.report["task_list_integrity"] = []
-        self.overlay_cache = {}
-        self.overlay_layout = None
 
     def process_start(self, task):
         if self.boot is None:
@@ -960,7 +731,16 @@ class Collector:
         audit = audit_task_list(self.address(head) & mask,
             lambda address, field: int(self.obj("list_head", address).member(field)) & mask)
         audit.update(member=member, kind=kind)
-        self.report["task_list_integrity"].append(audit)
+        issue_counts = {}
+        for issue in audit["issues"]:
+            issue_counts[issue["kind"]] = issue_counts.get(issue["kind"], 0) + 1
+        self.report["task_list_integrity"].append({
+            "head": audit["head"], "member": member, "kind": kind, "status": audit["status"],
+            "directions": {direction: {"count": result["count"], "closed": result["closed"]}
+                           for direction, result in audit["directions"].items()},
+            "forward_only_count": len(audit["forward_only"]),
+            "backward_only_count": len(audit["backward_only"]),
+            "issue_counts": issue_counts})
         if audit["status"] != "CONSISTENT":
             vollog.warning("ps: %s list integrity mismatch at %s: forward=%d, backward=%d, "
                 "backward-only=%d; recovered union remains PARTIAL", kind, audit["head"],
@@ -973,7 +753,7 @@ class Collector:
                     len(audit["backward_only"]))))
         forward = audit["directions"]["forward"]["nodes"]
         backward = audit["directions"]["backward"]["nodes"]
-        sets = {"forward": set(forward), "backward": set(backward)}
+        backward_only = set(audit["backward_only"])
         for address in dict.fromkeys(forward + backward):
             task = self.obj("task_struct", (address - offset) & mask)
             def validate():
@@ -983,10 +763,8 @@ class Collector:
                 return True
             if not self.read("reachable task validation", task, validate, False):
                 continue
-            self.task_discovery.setdefault(self.address(task), []).append({
-                "list_head": audit["head"], "member": member, "kind": kind,
-                "directions": [d for d, nodes in sets.items() if address in nodes],
-                "list_status": audit["status"]})
+            if address in backward_only:
+                self.backward_recovered_tasks.add(self.address(task))
             yield task
 
     def collect_tasks(self):
@@ -1009,7 +787,7 @@ class Collector:
         for address, task in self.tasks.items():
             row = {"address": hex(address), "location": self.location(task),
                    "namespaces": {}, "container_ids": [],
-                   "discovery": self.task_discovery.get(address, [])}
+                   "recovered_from_backward": address in self.backward_recovered_tasks}
             self.report["tasks"].append(row)
             self.task_rows[address] = row
             # Only fields used by process display, identity, or ancestry.
@@ -1087,125 +865,6 @@ class Collector:
             row["task_members"] = [t["address"] for t in self.report["tasks"]
                                    if row["address"] in t.get("cgroups", [])]
 
-    def backing_path(self, dentry, sb):
-        """Path relative to the backing superblock root, not a host-absolute path."""
-        parts, seen = [], set()
-        current = dentry
-        while True:
-            address = self.address(current)
-            if address in seen or len(seen) >= LIMIT:
-                raise Incomplete("Backing dentry parent cycle/budget")
-            seen.add(address)
-            if int(current.d_sb) != self.address(sb):
-                raise Incomplete("Backing dentry superblock mismatch")
-            if address == int(sb.s_root):
-                return "/" + "/".join(reversed(parts))
-            if not current.d_parent or int(current.d_parent) == address:
-                raise Incomplete("Backing dentry disconnected from superblock root")
-            name = current.d_name.name_as_str()
-            if not name or name in (".", "..") or "/" in name:
-                raise Incomplete("Invalid backing dentry name")
-            parts.append(name)
-            current = current.d_parent.dereference()
-
-    def overlay_info(self, sb):
-        address = self.address(sb)
-        if address in self.overlay_cache:
-            return self.overlay_cache[address]
-        result = {"superblock": hex(address), "scope": "OVERLAY_SUPERBLOCK_LAYERS",
-                  "status": "UNRESOLVED", "layers": [], "workdirs": []}
-        self.overlay_cache[address] = result
-        first_error = len(self.report["errors"])
-        def decode():
-            if self.overlay_layout is None:
-                self.overlay_layout = OverlayLayout(self, sb)
-                self.report["overlay_type_source"] = self.overlay_layout.source
-            layout = self.overlay_layout
-            ofs = int(sb.s_fs_info)
-            if not ofs:
-                raise Incomplete("Null overlay s_fs_info")
-            result["fs_info"] = hex(ofs & self.layer.address_mask)
-            result["type_source"] = layout.source["kind"]
-            count = layout.value(ofs, "ovl_fs", "numlayer")
-            data_count = layout.value(ofs, "ovl_fs", "numdatalayer") if "numdatalayer" in layout.structures["ovl_fs"]["fields"] else 0
-            if not 1 <= count <= 4096 or not 0 <= data_count < count:
-                raise Incomplete("Overlay layer counts outside bounds")
-            result.update(numlayer=count, numdatalayer=data_count)
-            layers = layout.value(ofs, "ovl_fs", "layers", "pointer", "ovl_layer")
-            if not layers:
-                raise Incomplete("Null overlay layers array")
-            config_desc = layout.field("ovl_fs", "config", "struct")
-            if config_desc["name"] != "ovl_config" or config_desc["size"] != layout.structures["ovl_config"]["size"]:
-                raise Unsupported("Overlay configuration layout mismatch")
-            config = ofs + config_desc["offset"]
-            upper_sb = None
-            for index in range(count):
-                record = {"index": index, "role": "upper" if index == 0 else
-                          "lower_data" if index >= count - data_count else "lower",
-                          "status": "UNRESOLVED", "path_scope": "BACKING_SUPERBLOCK_ROOT"}
-                result["layers"].append(record)
-                layer_address = layers + index * layout.structures["ovl_layer"]["size"]
-                record["layer_address"] = hex(layer_address & self.layer.address_mask)
-                before = len(self.report["errors"])
-                def backing():
-                    if layout.value(layer_address, "ovl_layer", "idx") != index:
-                        raise Incomplete("Overlay layer index mismatch")
-                    ptr = layout.value(layer_address, "ovl_layer", "mnt", "pointer", "vfsmount")
-                    if not ptr and index == 0:
-                        record["status"] = "ABSENT"  # Valid lower-only/read-only overlay.
-                        return None
-                    if not ptr:
-                        raise Incomplete("Null lower layer mount")
-                    mount = self.obj("vfsmount", ptr)
-                    root, backing_sb = mount.mnt_root.dereference(), mount.mnt_sb.dereference()
-                    record.update(mount=hex(self.address(mount)), root_dentry=hex(self.address(root)),
-                                  backing_superblock=hex(self.address(backing_sb)),
-                                  path=self.backing_path(root, backing_sb), status="RESOLVED")
-                    return backing_sb
-                backing_sb = self.read("overlay backing layer {}".format(index), layer_address, backing)
-                if index == 0:
-                    upper_sb = backing_sb
-                    record["configured_path"] = self.read("overlay upperdir", config,
-                        lambda: layout.string_pointer(config, "ovl_config", "upperdir"))
-                elif "lowerdirs" in layout.structures["ovl_config"]["fields"]:
-                    record["configured_path"] = self.read("overlay lowerdir {}".format(index), config,
-                        lambda: layout.string_pointer(config, "ovl_config", "lowerdirs", index))
-                # Older colon-separated lowerdir strings are retained as a raw
-                # option below: escaped ':' must not be guessed into layer IDs.
-                if len(self.report["errors"]) > before:
-                    record["status"] = "PARTIAL" if record.get("path") else "UNRESOLVED"
-            if "lowerdirs" in layout.structures["ovl_config"]["fields"]:
-                # Linux reserves index 0 for the original colon-separated option;
-                # per-layer strings have the same index as ofs.layers[].
-                result["lowerdir_option"] = self.read("overlay raw lowerdir option", config,
-                    lambda: layout.string_pointer(config, "ovl_config", "lowerdirs", 0))
-            if "lowerdir" in layout.structures["ovl_config"]["fields"]:
-                result["lowerdir_option"] = self.read("overlay lowerdir option", config,
-                    lambda: layout.string_pointer(config, "ovl_config", "lowerdir"))
-            result["configured_workdir"] = self.read("overlay workdir option", config,
-                lambda: layout.string_pointer(config, "ovl_config", "workdir"))
-            for field in ("workbasedir", "workdir"):
-                def work():
-                    ptr = layout.value(ofs, "ovl_fs", field, "pointer", "dentry")
-                    if not ptr:
-                        if upper_sb is not None and not (int(sb.s_flags) & 1):  # SB_RDONLY
-                            raise Incomplete("Missing work directory on a writable upper layer")
-                        result["workdirs"].append({"role": field, "status": "ABSENT"})
-                        return
-                    if upper_sb is None:
-                        raise Incomplete("Work directory without a verified upper superblock")
-                    root = self.obj("dentry", ptr)
-                    result["workdirs"].append({"role": field, "dentry": hex(self.address(root)),
-                        "backing_superblock": hex(self.address(upper_sb)),
-                        "path_scope": "BACKING_SUPERBLOCK_ROOT", "path": self.backing_path(root, upper_sb)})
-                self.read("overlay " + field, ofs, work)
-            result["status"] = "RESOLVED"
-        self.read("overlay layout and layers", sb, decode)
-        result["error_indices"] = list(range(first_error, len(self.report["errors"])))
-        if result["error_indices"]:
-            result["status"] = "PARTIAL" if any(l.get("path") for l in result["layers"]) else "UNRESOLVED"
-        return result
-
     def mount_record(self, mount, task=None):
         address = self.address(mount)
         if address in self.mounts:
@@ -1236,14 +895,6 @@ class Collector:
                     return "/" + "/".join(reversed(parts))
                 current = current.d_parent.dereference()
         row["root_path"] = self.read("mount root dentry path", root, root_path)
-        row["layer_paths"] = [p for p in (row["root_path"], row["host_path"]) if p and re.search(r"/(?:overlay2/[^/]+|snapshots/[0-9]+)(?:/|$)", p)]
-        row["layer_resolution"] = "PATH_OBSERVED" if row["layer_paths"] else "UNRESOLVED" if "overlay" in row["fstype"] else "N/A"
-        if row["fstype"] == "overlay":
-            row["overlay"] = self.overlay_info(sb)
-            recovered = [item["path"] for item in row["overlay"]["layers"] if item.get("path")]
-            row["layer_paths"] = sorted(set(row["layer_paths"] + recovered))
-            row["layer_resolution"] = ("BACKING_PATHS_RESOLVED" if row["overlay"]["status"] == "RESOLVED"
-                                       else row["overlay"]["status"])
         row["container_ids"] = sorted({cid for path in (row["host_path"], row["path"], row["root_path"]) if path
             for cid in re.findall(r"/containers/([0-9a-f]{64})(?=/|$)", path)})
         row["location"] = self.location(mount)
@@ -1349,8 +1000,7 @@ class Collector:
                         raise ValueError("Conflicting cache pages at one file offset")
                     pieces[offset] = raw
                     row["pages"].append({"file_offset": offset, "page": hex(page.vol.offset),
-                        "length": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
-                        "base64": base64.b64encode(raw).decode()})
+                        "length": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
                 self.read("cached page", page, content)
         self.read("inode pages", inode, recover)
         prefix = bytearray()
@@ -1627,7 +1277,7 @@ def vertical_presentation(report):
 class Ps(interfaces.plugins.PluginInterface):
     """Inventory Docker processes and residual evidence as category/value blocks."""
     _required_framework_version = (2, 28, 0)
-    _version = (1, 3, 0)
+    _version = (1, 4, 0)
 
     @classmethod
     def get_requirements(cls):
