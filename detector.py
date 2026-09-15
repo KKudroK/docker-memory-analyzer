@@ -27,7 +27,7 @@ from volatility3.framework.configuration import requirements
 
 
 vollog = logging.getLogger(__name__)
-VERSION = (1, 0, 0)
+VERSION = (1, 0, 1)
 DOCKER_SCOPE = re.compile(r"^docker-([0-9a-f]{64})\.scope$")
 BRIDGE_NAME = re.compile(r"^br-[0-9a-f]{12}$")
 READ_ERRORS = (exceptions.VolatilityException, AttributeError, ValueError,
@@ -393,17 +393,36 @@ class Collector:
             self.read("cgroup.default", css, default_group)
         if css.has_member("subsys"):
             supported = True
-            array = css.subsys
-            if not isinstance(array, objects.Array) or not 0 <= array.vol.count <= 256:
-                raise Unsupported("css_set.subsys is not a bounded array")
-            for index in range(array.vol.count):
-                def state_group():
-                    state = array[index]
-                    if state and state.cgroup:
-                        groups[int(state.cgroup)] = state.cgroup.dereference()
-                self.read("cgroup.subsys", css, state_group)
+            def subsystem_groups():
+                array = css.subsys
+                if not isinstance(array, objects.Array) or not 0 <= array.vol.count <= 256:
+                    raise Unsupported("css_set.subsys is not a bounded array")
+                for index in range(array.vol.count):
+                    def state_group():
+                        state = array[index]
+                        if state and state.cgroup:
+                            groups[int(state.cgroup)] = state.cgroup.dereference()
+                    self.read("cgroup.subsys", css, state_group)
+            self.read("cgroup.subsystems", css, subsystem_groups)
+        # A named v1 hierarchy can have no controllers, so it need not appear
+        # in subsys[]. The links enumerate membership in those hierarchies too.
+        if css.has_member("cgrp_links"):
+            supported = True
+            def linked_groups():
+                for link in self.walk(css.cgrp_links, "cgrp_cset_link", "cgrp_link"):
+                    def linked_group():
+                        if int(link.cset) != int(css.vol.offset):
+                            raise Incomplete("Cgroup link belongs to another css_set")
+                        if not link.cgrp:
+                            raise Incomplete("NULL cgroup in css_set membership link")
+                        groups[int(link.cgrp)] = link.cgrp.dereference()
+                    self.read("cgroup.link", link, linked_group)
+            self.read("cgroup.links", css, linked_groups)
+        elif supported:
+            self.issue("cgroup.links", css, Unsupported(
+                "css_set.cgrp_links is not described; named v1 membership may be missing"))
         if not supported:
-            raise Unsupported("Neither cgroup v1 subsystem array nor v2 default group is described")
+            raise Unsupported("No supported css_set membership layout is described")
         return groups
 
     def collect_cgroups(self):
@@ -445,6 +464,11 @@ class Collector:
             self.read("task.cgroups", task, membership)
 
     def mount_points(self, namespace):
+        expected = (self.read("mounts.count", namespace, lambda: int(namespace.nr_mounts))
+                    if namespace.has_member("nr_mounts") else None)
+        expected_root = (self.read("mounts.root", namespace, lambda: int(namespace.root))
+                         if namespace.has_member("root") else None)
+        observed = set()
         if namespace.has_member("mounts") and namespace.mounts.has_member("rb_node"):
             root = namespace.mounts.rb_node
             offset = self.kernel.get_type("mount").relative_child_offset("mnt_node")
@@ -468,6 +492,7 @@ class Collector:
                 valid = self.read("mounts.owner", mount,
                                   lambda: int(mount.mnt_ns) == int(namespace.vol.offset))
                 if valid:
+                    observed.add(int(mount.vol.offset))
                     yield mount
                 elif valid is False:
                     self.issue("mounts.owner", mount, Incomplete("Mount belongs to another namespace"))
@@ -477,9 +502,22 @@ class Collector:
                 if mount.has_member("mnt_ns") and int(mount.mnt_ns) != int(namespace.vol.offset):
                     self.issue("mounts.owner", mount, Incomplete("Mount belongs to another namespace"))
                     continue
+                observed.add(int(mount.vol.offset))
                 yield mount
         else:
             raise Unsupported("Mount namespace has neither supported RB tree nor list")
+        # A NULL/truncated tree can terminate normally despite missing mounts.
+        # Cross-check available namespace metadata before declaring completion.
+        if expected is not None and expected != len(observed):
+            self.issue("mounts.count", namespace, Incomplete(
+                f"Namespace declares {expected} mounts, observed {len(observed)}"))
+        if expected_root is not None:
+            if expected_root and expected_root not in observed:
+                self.issue("mounts.root", namespace, Incomplete(
+                    "Namespace root mount is absent from the traversal"))
+            elif not expected_root and observed:
+                self.issue("mounts.root", namespace, Incomplete(
+                    "Namespace has mounts but a NULL root mount"))
 
     def mount_path(self, mount):
         """Bounded namespace-root path, independent of mount hash tables."""
@@ -521,7 +559,19 @@ class Collector:
                 for mount in self.mount_points(ns["object"]):
                     def fs_type():
                         vf = mount.mnt if mount.has_member("mnt") else mount
-                        return self.string(vf.mnt_sb.s_type.name, 256)
+                        sb = vf.mnt_sb
+                        name = self.string(sb.s_type.name, 256)
+                        if name in ("fuse", "fuseblk"):
+                            # /proc/mounts joins s_type->name and s_subtype;
+                            # the kernel type name itself is only "fuse".
+                            def subtype():
+                                if not sb.has_member("s_subtype"):
+                                    raise Unsupported("FUSE superblock subtype is not described")
+                                return self.string(sb.s_subtype, 256) if sb.s_subtype else ""
+                            suffix = self.read("mounts.fs_subtype", mount, subtype)
+                            if suffix:
+                                name += "." + suffix
+                        return name
                     fstype = self.read("mounts.fs_type", mount, fs_type)
                     row = {"address": hex(int(mount.vol.offset)), "namespace": ns["address"],
                            "namespace_inode": ns["inode"], "fstype": fstype,
