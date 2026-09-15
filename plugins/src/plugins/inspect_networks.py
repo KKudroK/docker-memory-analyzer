@@ -2,8 +2,42 @@
 # Standalone deployment: this file + stock Volatility 3 + matching kernel ISF.
 
 # Source section: identity
+# ============================================================================== #
+# Source section: identity
+# ============================================================================== #
 """Runtime argv evidence supplements cgroups without treating ancestry as proof."""
 import re
+
+def identity_cgroup_candidates(paths):
+    """Recognize runtime naming grammars, not arbitrary 64-hex path components.
+
+    Names remain runtime-path evidence, not proof of a reachable Docker store.
+    Preserve raw paths separately so nonstandard names remain inspectable.
+    """
+    result = set()
+    for path in paths:
+        parts = path.strip('/').split('/')
+        for index, part in enumerate(parts):
+            scope = re.fullmatch('(?:docker|cri-containerd|crio)-([0-9a-f]{64})\\.scope', part)
+            if scope:
+                result.add(scope.group(1))
+            elif index and parts[index - 1] == 'docker' and re.fullmatch('[0-9a-f]{64}', part):
+                result.add(part)
+    return sorted(result)
+
+def identity_parent_address(task):
+    return hex(int(task.real_parent))
+
+def identity_runtime_argv(c, task):
+    if not task.mm:
+        return []
+    start, end = (int(task.mm.arg_start), int(task.mm.arg_end))
+    if not 0 <= end - start <= 65536:
+        raise ValueError('runtime argv length out of bounds')
+    name = task.add_process_layer()
+    if name is None:
+        raise ValueError('runtime process layer unavailable')
+    return c.context.layers[name].read(start, end - start).decode('utf-8', errors='replace').split('\x00')
 
 def identity_collect(c, records):
     by_address = {r['address']: r for r in records}
@@ -12,10 +46,7 @@ def identity_collect(c, records):
         record = by_address.get(hex(task.vol.offset))
         if record is None:
             continue
-
-        def parent():
-            return hex(int(task.real_parent))
-        record['parent'] = c.read('task.parent', task, parent)
+        record['parent'] = c.read('task.parent', task, identity_parent_address, args=(task,))
         comm = record['comm']
         if record['pid'] != record['tgid']:
             continue
@@ -23,18 +54,7 @@ def identity_collect(c, records):
             continue
         if c.identity_mode == 'cgroup' and comm.startswith('containerd-shim'):
             continue
-
-        def argv():
-            if not task.mm:
-                return []
-            start, end = (int(task.mm.arg_start), int(task.mm.arg_end))
-            if not 0 <= end - start <= 65536:
-                raise ValueError('runtime argv length out of bounds')
-            name = task.add_process_layer()
-            if name is None:
-                raise ValueError('runtime process layer unavailable')
-            return c.context.layers[name].read(start, end - start).decode('utf-8', errors='replace').split('\x00')
-        args = c.read('identity.runtime_argv', task, lambda: c.measure('identity.shim_argv', argv), [])
+        args = c.read('identity.runtime_argv', task, c.measure, [], args=('identity.shim_argv', identity_runtime_argv, c, task))
         if comm.startswith('containerd-shim'):
             ids = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg in ('-id', '--id') and re.fullmatch('[0-9a-f]{64}', args[i + 1])]
             if ids:
@@ -44,7 +64,7 @@ def identity_collect(c, records):
             flags = ('-host-ip', '-host-port', '-container-ip', '-container-port', '-proto')
             values = {arg[1:]: args[i + 1] for i, arg in enumerate(args[:-1]) if arg in flags}
             if values:
-                published.append({'pid': record['pid'], 'task': record['address'], 'namespace': record.get('namespace'), 'mapping': values, 'source': 'docker-proxy argv', 'confidence': 'runtime_configuration', 'limitation': 'not proof of a matching NAT rule or successful forwarding'})
+                published.append({'pid': record['pid'], 'task': record['address'], 'namespace': record.get('namespace'), 'mapping': values})
     if c.identity_mode == 'cgroup':
         for ns in c.nets.values():
             ns['container_candidates'] = sorted({cid for r in records if r.get('namespace') == ns['address'] for cid in r['container_candidates']})
@@ -72,93 +92,116 @@ def identity_collect(c, records):
     return published
 
 # Source section: topology
-"""Direct adjacency and separately labelled private-data peer candidates."""
+# ============================================================================== #
+# Source section: topology
+# ============================================================================== #
+"""Symbol-described device pointers and validated backlinks only."""
 from volatility3.framework import objects
+
+def topology_private_address(c, dev):
+    """Require a symbol-described private region; never infer alignment."""
+    if not dev.has_member('priv'):
+        raise NotImplementedError('net_device.priv absent; private offset not inferred')
+    c.count('compatibility', 'netdev_symbol_priv')
+    value = dev.priv
+    address = value.vol.offset if isinstance(value, objects.Array) else int(value)
+    if not address:
+        raise ValueError('NULL net_device private region')
+    return (address, 'symbol_priv')
+
+def topology_bridge_port(c, dev, target, edges):
+    port = c.obj('net_bridge_port', int(dev.rx_handler_data))
+    if not port.br or int(port.dev) != dev.vol.offset or int(port.br.dev) != target:
+        raise ValueError('bridge port backlink mismatch')
+    row = {'kind': 'bridge_port', 'source': hex(dev.vol.offset), 'target': hex(target), 'port_no': int(port.port_no), 'state': int(port.state)}
+    c.bridge_objects[target] = int(port.br)
+    edges.append(row)
+
+def topology_adjacent_entry(c, dev, row, adj, edges):
+    target = int(adj.dev)
+    if not target:
+        raise ValueError('NULL upper adjacency device')
+    edges.append({'kind': 'upper', 'source': row['address'], 'target': hex(target), 'master': bool(adj.master)})
+    other = c.devices.get(target)
+    if other and other[1].get('kind') == 'bridge' and c.kernel.has_type('net_bridge_port') and dev.has_member('rx_handler_data') and dev.rx_handler_data:
+        c.read('topology.bridge_port', dev, topology_bridge_port, args=(c, dev, target, edges))
+
+def topology_adjacent(c, dev, row, edges, unsupported):
+    if not dev.has_member('adj_list'):
+        unsupported.append({'feature': 'upper_adjacency', 'interface': row['address'], 'reason': 'net_device.adj_list absent'})
+        return
+    for adj in c.walk(dev.adj_list.upper, 'netdev_adjacent', 'list'):
+        c.read('topology.upper.entry', adj, topology_adjacent_entry, args=(c, dev, row, adj, edges))
+
+def topology_veth_peer(c, dev, row, edges, unsupported):
+    if not dev.has_member('priv') or not c.kernel.has_type('veth_priv'):
+        unsupported.append({'feature': 'veth_peer', 'interface': row['address'], 'reason': 'symbol-described private region or veth_priv absent; no inference'})
+        return
+    address, layout = topology_private_address(c, dev)
+    priv = c.obj('veth_priv', address)
+    target = int(priv.peer) & c.layer.address_mask
+    other = c.devices.get(target)
+    if target == dev.vol.offset or not other or other[1].get('kind') != 'veth':
+        raise ValueError('typed veth peer is not a distinct discovered veth')
+    back_addr, _ = topology_private_address(c, other[0])
+    if int(c.obj('veth_priv', back_addr).peer) & c.layer.address_mask != dev.vol.offset:
+        raise ValueError('typed veth peer backlink mismatch')
+    edges.append({'kind': 'veth_peer', 'source': row['address'], 'target': hex(target)})
 
 def topology_collect(c):
     edges, unsupported = ([], [])
+    c.bridge_objects = {}
     for dev, row in c.devices.values():
-
-        def adjacent():
-            if not dev.has_member('adj_list'):
-                unsupported.append({'feature': 'upper_adjacency', 'interface': row['address'], 'reason': 'net_device.adj_list absent'})
-                return
-            for adj in c.walk(dev.adj_list.upper, 'netdev_adjacent', 'list'):
-                target = int(adj.dev)
-                edges.append({'kind': 'upper', 'source': row['address'], 'target': hex(target), 'master': bool(adj.master), 'evidence': hex(adj.vol.offset), 'confidence': 'direct_pointer'})
-                other = c.devices.get(target)
-                if other and other[1].get('kind') == 'bridge' and c.kernel.has_type('net_bridge_port') and dev.has_member('rx_handler_data') and dev.rx_handler_data:
-                    port = c.obj('net_bridge_port', int(dev.rx_handler_data))
-                    if int(port.dev) != dev.vol.offset or int(port.br.dev) != target:
-                        raise ValueError('bridge port backlink mismatch')
-                    edges.append({'kind': 'bridge_port', 'source': row['address'], 'target': hex(target), 'port_no': int(port.port_no), 'state': int(port.state), 'evidence': hex(port.vol.offset), 'confidence': 'validated_backlinks'})
-        c.read('topology.upper', dev, adjacent)
+        c.read('topology.upper', dev, topology_adjacent, args=(c, dev, row, edges, unsupported))
         if row.get('kind') == 'veth':
-
-            def peer():
-                if not dev.has_member('priv'):
-                    unsupported.append({'feature': 'veth_peer', 'interface': row['address'], 'reason': 'no symbol-described private pointer; inline alignment not assumed'})
-                    return
-                private_address = dev.priv.vol.offset if isinstance(dev.priv, objects.Array) else int(dev.priv)
-                if not c.kernel.has_type('veth_priv'):
-                    unsupported.append({'feature': 'typed_veth_peer', 'interface': row['address'], 'reason': 'veth_priv absent; reciprocal private-data references are candidates, not typed peer proof'})
-                    if not isinstance(dev.priv, objects.Array) or not dev.has_member('priv_len'):
-                        return
-                    size = int(dev.priv_len)
-                    if not 0 <= size <= 65536:
-                        raise ValueError('invalid netdev private length')
-                    width = c.kernel.get_type('pointer').size
-                    matches = []
-                    for offset in range(0, size - width + 1, width):
-                        target = int(c.obj('pointer', private_address + offset)) & c.layer.address_mask
-                        other = c.devices.get(target)
-                        if not other or target == dev.vol.offset or other[1].get('kind') != 'veth':
-                            continue
-                        peer_dev = other[0]
-                        if not peer_dev.has_member('priv') or not isinstance(peer_dev.priv, objects.Array):
-                            continue
-                        if not peer_dev.has_member('priv_len') or offset + width > int(peer_dev.priv_len):
-                            continue
-                        back = int(c.obj('pointer', peer_dev.priv.vol.offset + offset)) & c.layer.address_mask
-                        if back == dev.vol.offset:
-                            matches.append((target, offset))
-                    for target, offset in matches:
-                        edges.append({'kind': 'veth_peer_candidate', 'source': row['address'], 'target': hex(target), 'evidence': hex(private_address + offset), 'private_relative_offset': offset, 'confidence': 'reciprocal_private_reference' if len(matches) == 1 else 'ambiguous', 'limitation': 'not a symbol-typed veth_priv.peer field'})
-                    return
-                priv = c.obj('veth_priv', private_address)
-                edges.append({'kind': 'veth_peer', 'source': row['address'], 'target': hex(int(priv.peer)), 'evidence': hex(priv.vol.offset), 'confidence': 'direct_pointer'})
-            c.read('topology.veth', dev, peer)
+            c.read('topology.veth', dev, topology_veth_peer, args=(c, dev, row, edges, unsupported))
     return (edges, unsupported)
+
+def topology_fdb_entry(c, bridge, interface, entry, layout, rows):
+    destination = None
+    if entry.dst:
+        port = entry.dst.dereference()
+        if int(port.br) != bridge.vol.offset or not port.dev:
+            raise ValueError('FDB destination bridge backlink mismatch')
+        destination = hex(int(port.dev))
+    rows.append({'address': hex(entry.vol.offset), 'namespace': interface['namespace'], 'bridge': interface['address'], 'interface': destination, 'mac': ':'.join((f'{b:02x}' for b in c.layer.read(entry.key.addr.vol.offset, 6))), 'vlan': int(entry.key.vlan_id), 'flags': int(entry.flags)})
+
+def topology_scan_bridge_fdb(c, dev, interface, unsupported, rows):
+    if not c.kernel.has_type('net_bridge') or not c.kernel.has_type('net_bridge_fdb_entry'):
+        unsupported.append({'feature': 'bridge_fdb', 'interface': interface['address'], 'reason': 'symbol-described private region or bridge types absent; no inference'})
+        return
+    if dev.vol.offset in getattr(c, 'bridge_objects', {}):
+        address = c.bridge_objects[dev.vol.offset]
+        layout = 'validated_net_bridge_port.br'
+    elif dev.has_member('priv'):
+        address, layout = topology_private_address(c, dev)
+    else:
+        unsupported.append({'feature': 'bridge_fdb', 'interface': interface['address'], 'reason': 'no typed bridge port backlink or symbol-described private region'})
+        return
+    bridge = c.obj('net_bridge', address)
+    if int(bridge.dev) != dev.vol.offset:
+        raise ValueError('bridge private dev backlink mismatch')
+    for entry in c.hlist(bridge.fdb_list, 'net_bridge_fdb_entry', 'fdb_node'):
+        c.read('bridge.fdb.entry', entry, topology_fdb_entry, args=(c, bridge, interface, entry, layout, rows))
 
 def topology_bridge_fdb(c, unsupported):
     rows = []
     for dev, interface in c.devices.values():
-        if interface.get('kind') != 'bridge':
-            continue
-
-        def scan():
-            if not dev.has_member('priv') or not isinstance(dev.priv, objects.Array):
-                unsupported.append({'feature': 'bridge_fdb', 'interface': interface['address'], 'reason': 'no symbol-described inline private storage'})
-                return
-            bridge = c.obj('net_bridge', dev.priv.vol.offset)
-            if int(bridge.dev) != dev.vol.offset:
-                raise ValueError('bridge private dev backlink mismatch')
-            for entry in c.hlist(bridge.fdb_list, 'net_bridge_fdb_entry', 'fdb_node'):
-
-                def record():
-                    rows.append({'address': hex(entry.vol.offset), 'namespace': interface['namespace'], 'bridge': interface['address'], 'interface': hex(int(entry.dst.dev)) if entry.dst else None, 'mac': ':'.join((f'{b:02x}' for b in c.layer.read(entry.key.addr.vol.offset, 6))), 'vlan': int(entry.key.vlan_id), 'flags': int(entry.flags), 'source': 'net_device.priv -> net_bridge.fdb_list -> net_bridge_fdb_entry', 'confidence': 'validated_bridge_backlink'})
-                c.read('bridge.fdb.entry', entry, record)
-        c.read('bridge.fdb', dev, scan)
+        if interface.get('kind') == 'bridge':
+            c.read('bridge.fdb', dev, topology_scan_bridge_fdb, args=(c, dev, interface, unsupported, rows))
     return rows
 
 # Source section: sockets
-"""FD sockets identified with each socket's own network namespace."""
+# ============================================================================== #
+# Source section: sockets
+# ============================================================================== #
+"""FD ownership and bounded reciprocal UNIX peer discovery."""
 import socket
 from volatility3.framework.objects import utility
 from volatility3.framework.symbols.linux import network
+from volatility3.framework.symbols import linux
 
 def sockets_fd_table(files, limit):
-    """Select symbol-described layouts and validate bounds before allocation."""
     if files.has_member('fdt'):
         if not files.fdt:
             raise ValueError('NULL fdtable')
@@ -174,82 +217,153 @@ def sockets_fd_table(files, limit):
         raise ValueError('NULL fd pointer with nonempty fdtable')
     return (table, count)
 
-def sockets_collect(c):
+def sockets_file_dentry(filp):
+    if filp.has_member('f_path'):
+        return filp.get_dentry()
+    if filp.has_member('f_dentry'):
+        return filp.f_dentry
+    raise NotImplementedError('file dentry layout unavailable')
+
+def sockets_read_sock(c, sk, source):
+    """Parse a socket independently from the FD(s) that reference it."""
+    common = sk.member('__sk_common')
+    ns = c.net_pointer(common.skc_net)
+    row = {'socket': hex(sk.vol.offset), 'namespace': hex(int(ns)), 'family': int(common.skc_family), 'receive_queue_packets': int(sk.sk_receive_queue.qlen), 'state': int(common.skc_state), 'socket_type': int(sk.sk_type), 'protocol_number': int(sk.sk_protocol)}
+    if row['family'] in (2, 10):
+        inet = sk.cast('inet_sock')
+        row.update(protocol=str(inet.get_protocol()), source_port=int(inet.get_src_port()), destination_port=int(inet.get_dst_port()))
+        if row['family'] == 10:
+            row['source_ip'] = socket.inet_ntop(socket.AF_INET6, c.layer.read(common.skc_v6_rcv_saddr.vol.offset, 16))
+            row['destination_ip'] = socket.inet_ntop(socket.AF_INET6, c.layer.read(common.skc_v6_daddr.vol.offset, 16))
+        else:
+            row['source_ip'] = str(inet.get_src_addr())
+            row['destination_ip'] = str(inet.get_dst_addr())
+    elif row['family'] == 1:
+        unix = sk.cast('unix_sock')
+        row['path'] = None
+        if unix.addr:
+            length = int(unix.addr.len)
+            path_offset = c.kernel.get_type('sockaddr_un').relative_child_offset('sun_path')
+            if not path_offset <= length <= c.kernel.get_type('sockaddr_un').size:
+                raise ValueError('invalid sockaddr_un length')
+            raw = c.layer.read(unix.addr.name.vol.offset + path_offset, length - path_offset)
+            row['path_bytes_hex'] = raw.hex()
+            row['abstract'] = raw.startswith(b'\x00')
+            row['path'] = '@' + raw[1:].decode('utf-8', errors='backslashreplace') if row['abstract'] else raw.rstrip(b'\x00').decode('utf-8', errors='backslashreplace')
+        row['peer'] = hex(int(unix.peer))
+        if sk.sk_socket:
+            row['state_name'] = unix.get_state()
+    return row
+
+def sockets_merge_holders(rows):
+    unique = {}
+    for row in rows:
+        holder = {key: row[key] for key in ('pid', 'fd', 'file')}
+        if row['socket'] not in unique:
+            unique[row['socket']] = dict({key: value for key, value in row.items() if key not in ('pid', 'fd', 'file')}, holders=[])
+        if holder not in unique[row['socket']]['holders']:
+            unique[row['socket']]['holders'].append(holder)
+    return unique
+
+def sockets_record_cached_holders(errors, indices, pid):
+    """A failed immutable FD slot is scanned once; all affected tasks are recorded."""
+    for index in indices:
+        affected = errors[index].setdefault('affected_holders', [])
+        holder = {'pid': pid, 'fd': errors[index].get('fd')}
+        if holder not in affected:
+            affected.append(holder)
+
+def sockets_expand_unix_peers(c, unique, selected_pids):
+    """One hop only, with family and reciprocal backlink validation."""
+    seeds = [row for row in unique.values() if row['family'] == 1 and any((h['pid'] in selected_pids for h in row['holders']))]
+    for row in seeds:
+        peer = row.get('peer')
+        if peer in (None, '0x0', row['socket']) or peer in unique:
+            continue
+
+        def read_peer():
+            sk = c.obj('sock', int(peer, 16))
+            result = sockets_read_sock(c, sk, 'unix_sock.peer')
+            if result['family'] != 1 or result.get('peer') != row['socket']:
+                raise ValueError('UNIX peer family/backlink mismatch')
+            result.update(holders=[], confidence='reciprocal_kernel_peer', discovery='unix_peer')
+            unique[result['socket']] = result
+        c.read('socket.unix_peer', peer, read_peer)
+
+def sockets_collect(c, task_records=None):
     network.NetSymbols.apply(c.context.symbol_space[c.kernel.symbol_table_name])
+    socket_fops = c.kernel.object_from_symbol('socket_file_ops').vol.offset
     rows = []
     files_cache = {}
-    socket_fops = c.kernel.object_from_symbol('socket_file_ops').vol.offset
-    inode_offset = c.kernel.get_type('socket_alloc').relative_child_offset('vfs_inode')
+    file_cache = {}
     for task in c.tasks:
 
         def task_fds():
             if not task.files:
                 return
             files_key = int(task.files)
+            pid = int(task.pid)
             if files_key in files_cache:
-                rows.extend((dict(row, pid=int(task.pid)) for row in files_cache[files_key]))
+                cached, indices = files_cache[files_key]
+                rows.extend((dict(row, pid=pid) for row in cached))
+                sockets_record_cached_holders(c.errors, indices, pid)
+                c.count('cache', 'fdtable_hits')
                 return
             start_row = len(rows)
+            indices = []
             fdt, count = sockets_fd_table(task.files.dereference(), c.limit)
-            if not count:
-                files_cache[files_key] = []
-                return
-            fds = utility.array_of_pointers(fdt.fd.dereference(), count, c.kernel.symbol_table_name + '!file', c.context)
+            fds = utility.array_of_pointers(fdt.fd.dereference(), count, c.kernel.symbol_table_name + '!file', c.context) if count else []
             for fd in range(count):
 
                 def entry():
                     filp = fds[fd]
-                    if not filp or int(filp.f_op) != socket_fops:
+                    if not filp:
                         return
-                    inode = filp.f_path.dentry.d_inode
-                    alloc = c.obj('socket_alloc', int(inode) - inode_offset)
+                    address = int(filp)
+                    if address in file_cache:
+                        result = file_cache[address]
+                        if result is not None:
+                            rows.append(dict(result, pid=pid, fd=fd, file=hex(address)))
+                        return
+                    if int(filp.f_op) != socket_fops:
+                        file_cache[address] = None
+                        return
+                    dentry = sockets_file_dentry(filp)
+                    inode = dentry.d_inode
+                    if not inode:
+                        raise ValueError(f'socket file {hex(address)} has NULL d_inode')
+                    alloc = linux.LinuxUtilities.container_of(int(inode), 'socket_alloc', 'vfs_inode', c.kernel)
+                    if alloc is None:
+                        if inode:
+                            offset = c.kernel.get_type('socket_alloc').relative_child_offset('vfs_inode')
+                            c.layer.read(int(inode) - offset, 1)
+                        raise ValueError('socket_alloc container_of unavailable')
                     if not alloc.socket.sk:
                         return
                     sk = alloc.socket.sk.dereference()
-                    common = sk.member('__sk_common')
-                    ns = common.skc_net.net
-                    row = {'pid': int(task.pid), 'fd': fd, 'file': hex(int(filp)), 'socket': hex(sk.vol.offset), 'namespace': hex(int(ns)), 'family': int(common.skc_family), 'source': 'task.files.fdt.fd -> socket_alloc.socket.sk', 'receive_queue_packets': int(sk.sk_receive_queue.qlen), 'state': int(common.skc_state)}
-                    row['confidence'] = 'fd_reachable_socket_object'
-                    row['socket_type'] = int(sk.sk_type)
-                    row['protocol_number'] = int(sk.sk_protocol)
-                    if row['family'] in (2, 10):
-                        inet = sk.cast('inet_sock')
-                        row['protocol'] = str(inet.get_protocol())
-                        row['source_port'] = int(inet.get_src_port())
-                        row['destination_port'] = int(inet.get_dst_port())
-                        if row['family'] == 10:
-                            row['source_ip'] = socket.inet_ntop(socket.AF_INET6, c.layer.read(common.skc_v6_rcv_saddr.vol.offset, 16))
-                            row['destination_ip'] = socket.inet_ntop(socket.AF_INET6, c.layer.read(common.skc_v6_daddr.vol.offset, 16))
-                        else:
-                            row['source_ip'] = str(inet.get_src_addr())
-                            row['destination_ip'] = str(inet.get_dst_addr())
-                    elif row['family'] == 1:
-                        unix = sk.cast('unix_sock')
-                        row['path'] = None
-                        if unix.addr:
-                            length = int(unix.addr.len)
-                            path_offset = c.kernel.get_type('sockaddr_un').relative_child_offset('sun_path')
-                            if not path_offset <= length <= c.kernel.get_type('sockaddr_un').size:
-                                raise ValueError('invalid sockaddr_un length')
-                            raw = c.layer.read(unix.addr.name.vol.offset + path_offset, length - path_offset)
-                            row['path_bytes_hex'] = raw.hex()
-                            row['abstract'] = raw.startswith(b'\x00')
-                            row['path'] = '@' + raw[1:].decode('utf-8', errors='backslashreplace') if row['abstract'] else raw.rstrip(b'\x00').decode('utf-8', errors='backslashreplace')
-                        row['peer'] = hex(int(unix.peer))
-                    rows.append(row)
+                    if sk.sk_socket and int(sk.sk_socket) != alloc.socket.vol.offset:
+                        raise ValueError('socket.sk -> sk_socket backlink mismatch')
+                    result = sockets_read_sock(c, sk, 'task.files -> fd -> file -> socket_alloc.socket.sk')
+                    result.update(confidence='fd_reachable_socket_object', discovery='fd')
+                    file_cache[address] = result
+                    rows.append(dict(result, pid=pid, fd=fd, file=hex(address)))
+                before = len(c.errors)
                 c.read('socket.fd', task, entry)
-            files_cache[files_key] = rows[start_row:]
+                for index in range(before, len(c.errors)):
+                    c.errors[index].update(pid=pid, fd=fd, files_struct=hex(files_key))
+                    indices.append(index)
+            files_cache[files_key] = (rows[start_row:], indices)
+            sockets_record_cached_holders(c.errors, indices, pid)
         c.read('socket.task', task, task_fds)
-    unique = {}
-    for row in rows:
-        owner = {key: row[key] for key in ('pid', 'fd', 'file')}
-        if row['socket'] not in unique:
-            unique[row['socket']] = dict({key: value for key, value in row.items() if key not in ('pid', 'fd', 'file')}, holders=[])
-        if owner not in unique[row['socket']]['holders']:
-            unique[row['socket']]['holders'].append(owner)
+    unique = sockets_merge_holders(rows)
+    selected_pids = {t['pid'] for t in task_records or [] if len(t.get('container_candidates', [])) == 1 and (not t.get('identity_conflict'))}
+    sockets_expand_unix_peers(c, unique, selected_pids)
     return list(unique.values())
 
 # Source section: routes
+# ============================================================================== #
+# Source section: routes
+# ============================================================================== #
 """Symbol-driven IPv4 trie and IPv6 FIB traversal.
 
 Hash-size adapters follow include/net/{ip_fib,ip6_fib}.h: presence of the
@@ -266,6 +380,9 @@ def routes_nexthop(c, common):
         gateway = socket.inet_ntop(socket.AF_INET if family == 2 else socket.AF_INET6, c.layer.read(common.nhc_gw.vol.offset, 4 if family == 2 else 16))
     return {'interface': hex(int(common.nhc_dev)), 'ifindex': int(common.nhc_oif), 'gateway': gateway, 'gateway_family': family, 'flags': int(common.nhc_flags)}
 
+def routes_dereference_child(ptr):
+    return ptr.dereference() if ptr else None
+
 def routes_ipv4(c, ns, table, rows):
     from volatility3.framework import objects
     data = int(table.tb_data) if isinstance(table.tb_data, objects.Pointer) else table.tb_data.vol.offset
@@ -273,65 +390,92 @@ def routes_ipv4(c, ns, table, rows):
     pending, seen = ([root], set())
     while pending:
         node = pending.pop()
-        if node.vol.offset in seen or len(seen) >= c.limit:
-            raise ValueError('IPv4 trie cycle or limit')
-        seen.add(node.vol.offset)
-        bits, pos = (int(node.bits), int(node.pos))
-        if bits or pos:
-            count = 1 if pos == 32 else 1 << bits
-            if count > c.limit:
-                raise ValueError('IPv4 trie fanout limit')
-            children = utility.array_of_pointers(node.tnode, count, c.kernel.symbol_table_name + '!key_vector', c.context)
-            pending.extend((p.dereference() for p in children if p))
+        if node.vol.offset in seen:
+            c.issue('route.ipv4.node', node, ValueError('IPv4 trie cycle or duplicate child'))
             continue
-        for alias in c.hlist(node.leaf, 'fib_alias', 'fa_list'):
+        if len(seen) >= c.limit:
+            c.issue('route.ipv4.node', node, ValueError('IPv4 trie limit'))
+            break
+        seen.add(node.vol.offset)
+        c.read('route.ipv4.node', node, routes_ipv4_node, args=(c, ns, table, node, pending, rows))
 
-            def entry():
-                info = alias.fa_info.dereference()
-                prefix = 32 - int(alias.fa_slen)
-                cidr = str(ipaddress.ip_network((int(node.key), prefix), strict=False))
-                row = {'address': hex(alias.vol.offset), 'namespace': ns['address'], 'family': 4, 'table': int(alias.tb_id) if alias.has_member('tb_id') else int(table.tb_id), 'destination': cidr, 'priority': int(info.fib_priority), 'protocol': int(info.fib_protocol), 'scope': int(info.fib_scope), 'type': int(alias.fa_type), 'nexthops': [], 'source': 'net.ipv4.fib_main/fib_default -> trie -> fib_alias -> fib_info', 'confidence': 'direct_pointer'}
-                rows.append(row)
-                if info.has_member('nh') and info.nh:
-                    row['unresolved_nexthop_object'] = hex(int(info.nh))
-                else:
-                    for nh in c.array(info.fib_nh.vol.offset, 'fib_nh', int(info.fib_nhs)):
-                        row['nexthops'].append(routes_nexthop(c, nh.nh_common))
-            c.read('route.ipv4.entry', alias, entry)
+def routes_ipv4_node(c, ns, table, node, pending, rows):
+    bits, pos = (int(node.bits), int(node.pos))
+    if not 0 <= bits <= 32 or not 0 <= pos <= 32 or bits + pos > 32:
+        raise ValueError('IPv4 trie bit range invalid')
+    if bits or pos:
+        count = 1 if pos == 32 else 1 << bits
+        if count > c.limit:
+            raise ValueError('IPv4 trie fanout limit')
+        children = utility.array_of_pointers(node.tnode, count, c.kernel.symbol_table_name + '!key_vector', c.context)
+        for ptr in children:
+            child = c.read('route.ipv4.child', node, routes_dereference_child, args=(ptr,))
+            if child is not None:
+                pending.append(child)
+        return
+    for alias in c.hlist(node.leaf, 'fib_alias', 'fa_list'):
+
+        def entry():
+            info = alias.fa_info.dereference()
+            prefix = 32 - int(alias.fa_slen)
+            cidr = str(ipaddress.ip_network((int(node.key), prefix), strict=False))
+            row = {'address': hex(alias.vol.offset), 'namespace': ns['address'], 'family': 4, 'table': int(alias.tb_id) if alias.has_member('tb_id') else int(table.tb_id), 'destination': cidr, 'priority': int(info.fib_priority), 'protocol': int(info.fib_protocol), 'scope': int(info.fib_scope), 'type': int(alias.fa_type), 'nexthops': []}
+            rows.append(row)
+            if info.has_member('nh') and info.nh:
+                pass
+            else:
+                for nh in c.array(info.fib_nh.vol.offset, 'fib_nh', int(info.fib_nhs)):
+                    row['nexthops'].append(routes_nexthop(c, nh.nh_common))
+        c.read('route.ipv4.entry', alias, entry)
 
 def routes_ipv6(c, ns, table, rows):
     pending, seen, infos = ([table.tb6_root], set(), set())
     while pending:
         node = pending.pop()
-        if node.vol.offset in seen or len(seen) >= c.limit:
-            raise ValueError('IPv6 tree cycle or limit')
+        if node.vol.offset in seen:
+            c.issue('route.ipv6.node', node, ValueError('IPv6 tree cycle or duplicate child'))
+            continue
+        if len(seen) >= c.limit:
+            c.issue('route.ipv6.node', node, ValueError('IPv6 tree limit'))
+            break
         seen.add(node.vol.offset)
         for field in ('left', 'right', 'subtree'):
-            if node.has_member(field) and node.member(field):
-                pending.append(node.member(field).dereference())
-        ptr, chain = (node.leaf, set())
-        while ptr:
-            if int(ptr) in chain or len(chain) >= c.limit:
-                raise ValueError('IPv6 route chain cycle or limit')
-            chain.add(int(ptr))
-            info = ptr.dereference()
-            ptr = info.fib6_next
-            if info.vol.offset in infos:
-                continue
-            infos.add(info.vol.offset)
-            if int(info.fib6_table) != table.vol.offset:
-                continue
+            c.read('route.ipv6.child.' + field, node, routes_ipv6_child, args=(node, field, pending))
+        c.read('route.ipv6.chain', node, routes_ipv6_chain, args=(c, ns, table, node, infos, rows))
 
-            def entry():
-                ip = socket.inet_ntop(socket.AF_INET6, c.layer.read(info.fib6_dst.addr.vol.offset, 16))
-                row = {'address': hex(info.vol.offset), 'namespace': ns['address'], 'family': 6, 'table': int(table.tb6_id), 'destination': str(ipaddress.ip_network(f'{ip}/{int(info.fib6_dst.plen)}', strict=False)), 'priority': int(info.fib6_metric), 'protocol': int(info.fib6_protocol), 'flags': int(info.fib6_flags), 'nexthops': [], 'source': 'net.ipv6.fib6_*_tbl -> fib6_node -> fib6_info', 'confidence': 'direct_pointer'}
-                rows.append(row)
-                if info.has_member('nh') and info.nh:
-                    row['unresolved_nexthop_object'] = hex(int(info.nh))
-                else:
-                    nh = c.obj('fib6_nh', info.fib6_nh.vol.offset)
-                    row['nexthops'].append(routes_nexthop(c, nh.nh_common))
-            c.read('route.ipv6.entry', info, entry)
+def routes_ipv6_child(node, field, pending):
+    if node.has_member(field):
+        ptr = node.member(field)
+        if ptr:
+            pending.append(ptr.dereference())
+
+def routes_ipv6_chain(c, ns, table, node, infos, rows):
+    ptr, chain = (node.leaf, set())
+    while ptr:
+        address = int(ptr)
+        if address in chain:
+            raise ValueError('IPv6 route chain cycle')
+        if address in infos:
+            return
+        if len(infos) >= c.limit:
+            raise ValueError('IPv6 route info limit')
+        chain.add(address)
+        infos.add(address)
+        info = ptr.dereference()
+        c.read('route.ipv6.entry', info, routes_ipv6_entry, args=(c, ns, table, info, rows))
+        ptr = info.fib6_next
+
+def routes_ipv6_entry(c, ns, table, info, rows):
+    if int(info.fib6_table) != table.vol.offset:
+        return
+    ip = socket.inet_ntop(socket.AF_INET6, c.layer.read(info.fib6_dst.addr.vol.offset, 16))
+    row = {'address': hex(info.vol.offset), 'namespace': ns['address'], 'family': 6, 'table': int(table.tb6_id), 'destination': str(ipaddress.ip_network(f'{ip}/{int(info.fib6_dst.plen)}', strict=False)), 'priority': int(info.fib6_metric), 'protocol': int(info.fib6_protocol), 'flags': int(info.fib6_flags), 'nexthops': []}
+    rows.append(row)
+    if info.has_member('nh') and info.nh:
+        pass
+    else:
+        nh = c.obj('fib6_nh', info.fib6_nh.vol.offset)
+        row['nexthops'].append(routes_nexthop(c, nh.nh_common))
 
 def routes_collect(c, unsupported):
     rows = []
@@ -379,7 +523,7 @@ def routes_rules(c):
                 if not block.has_member(field) or not block.member(field):
                     return
                 for rule in c.walk(block.member(field).rules_list, 'fib_rule', 'list'):
-                    row = {'address': hex(rule.vol.offset), 'namespace': ns['address'], 'family': family, 'source': 'net -> fib_rules_ops.rules_list -> fib_rule', 'confidence': 'direct_pointer', 'limitation': 'inventory, not a policy routing evaluator'}
+                    row = {'address': hex(rule.vol.offset), 'namespace': ns['address'], 'family': family}
                     rows.append(row)
                     for name in ('pref', 'table', 'action', 'flags', 'mark', 'mark_mask', 'iifindex', 'oifindex', 'l3mdev', 'ip_proto', 'suppress_prefixlen'):
                         if rule.has_member(name):
@@ -402,6 +546,9 @@ def routes_rules(c):
     return rows
 
 # Source section: neighbors
+# ============================================================================== #
+# Source section: neighbors
+# ============================================================================== #
 """ARP/NDP entries, including failed/incomplete states, not just MAC hits."""
 import socket
 
@@ -419,11 +566,33 @@ def neighbors_collect(c, unsupported):
             shift = int(nht.hash_shift)
             if not 0 <= shift <= 20:
                 raise ValueError('invalid neighbor hash_shift')
-            heads = c.array(int(nht.hash_heads), 'hlist_head', 1 << shift)
+            if nht.has_member('hash_buckets'):
+                heads = c.array(int(nht.hash_buckets), 'pointer', 1 << shift)
+                layout = 'pointer_next'
+            elif nht.has_member('hash_heads') and c.kernel.get_type('neighbour').has_member('hash'):
+                heads = c.array(int(nht.hash_heads), 'hlist_head', 1 << shift)
+                layout = 'hlist'
+            else:
+                unsupported.append({'feature': name, 'reason': 'unrecognized symbol-described neighbor hash layout'})
+                return
+            c.count('compatibility', 'neighbor_' + layout)
+
+            def entries(head):
+                if layout == 'hlist':
+                    yield from c.hlist(head, 'neighbour', 'hash')
+                    return
+                pointer, seen = (int(head), set())
+                while pointer:
+                    if pointer in seen or len(seen) >= c.limit:
+                        raise ValueError('neighbor next cycle/budget')
+                    seen.add(pointer)
+                    n = c.obj('neighbour', pointer)
+                    yield n
+                    pointer = int(n.next)
             for head in heads:
 
                 def bucket():
-                    for n in c.hlist(head, 'neighbour', 'hash'):
+                    for n in entries(head):
 
                         def entry():
                             dev = n.dev.dereference()
@@ -433,13 +602,16 @@ def neighbors_collect(c, unsupported):
                             addr_len = int(dev.addr_len)
                             if not 0 <= addr_len <= 32:
                                 raise ValueError('invalid MAC length')
-                            rows.append({'address': hex(n.vol.offset), 'namespace': hex(int(dev.nd_net.net)), 'interface': hex(int(n.dev)), 'ifindex': int(dev.ifindex), 'family': family, 'ip': socket.inet_ntop(socket.AF_INET if family == 2 else socket.AF_INET6, c.layer.read(n.primary_key.vol.offset, size)), 'mac': ':'.join((f'{b:02x}' for b in c.layer.read(n.ha.vol.offset, addr_len))), 'nud_state': int(n.nud_state), 'dead': int(n.dead), 'source': name + '.nht.hash_heads', 'confidence': 'direct_pointer'})
+                            rows.append({'address': hex(n.vol.offset), 'namespace': hex(c.net_pointer(dev.nd_net)), 'interface': hex(int(n.dev)), 'ifindex': int(dev.ifindex), 'family': family, 'ip': socket.inet_ntop(socket.AF_INET if family == 2 else socket.AF_INET6, c.layer.read(n.primary_key.vol.offset, size)), 'mac': ':'.join((f'{b:02x}' for b in c.layer.read(n.ha.vol.offset, addr_len))), 'nud_state': int(n.nud_state), 'dead': int(n.dead)})
                         c.read('neighbor.entry', n, entry)
                 c.read('neighbor.bucket', head, bucket)
         c.read('neighbor.table', name, table)
     return rows
 
 # Source section: conntrack
+# ============================================================================== #
+# Source section: conntrack
+# ============================================================================== #
 """Confirmed conntrack tuples (observed flows, not firewall configuration)."""
 import socket
 from volatility3.framework.objects import utility
@@ -510,13 +682,16 @@ def conntrack_collect(c, unsupported):
 
                     def record():
                         status = int(ct.status)
-                        rows.append({'address': hex(ct.vol.offset), 'namespace': hex(int(ct.ct_net.net)), 'original': conntrack_tuple_data(c, ct.tuplehash[0].tuple), 'reply': conntrack_tuple_data(c, ct.tuplehash[1].tuple), 'status': status, 'snat': bool(status & 1 << 4), 'dnat': bool(status & 1 << 5), 'source': 'nf_conntrack_hash -> tuplehash -> nf_conn', 'confidence': 'hashed_flow_object', 'limitation': 'flow state; does not enumerate configured NAT rules'})
+                        rows.append({'address': hex(ct.vol.offset), 'namespace': hex(c.net_pointer(ct.ct_net)), 'original': conntrack_tuple_data(c, ct.tuplehash[0].tuple), 'reply': conntrack_tuple_data(c, ct.tuplehash[1].tuple), 'status': status, 'snat': bool(status & 1 << 4), 'dnat': bool(status & 1 << 5)})
                     c.read('conntrack.entry', ct, record)
             c.read('conntrack.bucket', head, bucket)
     c.read('conntrack.hash', found, scan)
     return rows
 
 # Source section: multicast
+# ============================================================================== #
+# Source section: multicast
+# ============================================================================== #
 """Interface IPv4 IGMP and IPv6 MLD memberships (not multicast routes)."""
 import socket
 
@@ -537,83 +712,93 @@ def multicast_collect(c):
                     seen.add(int(ptr))
                     entry = ptr.dereference()
                     value = entry.multiaddr if family == 4 else entry.mca_addr
-                    rows.append({'address': hex(entry.vol.offset), 'namespace': interface['namespace'], 'interface': interface['address'], 'family': family, 'group': socket.inet_ntop(socket.AF_INET if family == 4 else socket.AF_INET6, c.layer.read(value.vol.offset, 4 if family == 4 else 16)), 'users': int(entry.users if family == 4 else entry.mca_users), 'source': 'net_device.ip_ptr/ip6_ptr.mc_list', 'confidence': 'direct_pointer'})
+                    rows.append({'address': hex(entry.vol.offset), 'namespace': interface['namespace'], 'interface': interface['address'], 'family': family, 'group': socket.inet_ntop(socket.AF_INET if family == 4 else socket.AF_INET6, c.layer.read(value.vol.offset, 4 if family == 4 else 16)), 'users': int(entry.users if family == 4 else entry.mca_users)})
                     ptr = entry.next
             c.read('multicast.list', dev, scan)
     return rows
 
-# Source section: presentation
-"""One ip-address/netstat-style table with independent interface and socket rows."""
+# Source section: context
+# ============================================================================== #
+# Source section: context
+# ============================================================================== #
+"""Observed ID references, FD holders and direct kernel object relations only."""
 
-def presentation_endpoint(ip, port):
-    if not ip:
-        return '-'
-    return f'[{ip}]:{port}' if ':' in ip else f'{ip}:{port}'
+def context_task_ids(task):
+    values = sorted(set(task.get('container_candidates', [])))
+    return values if len(values) == 1 and (not task.get('identity_conflict')) else []
 
-def presentation_table(report, include_host=False):
-    columns = ['Container', 'PID', 'NetNS', 'Interface', 'MAC', 'Address', 'Host link', 'Protocol', 'Local', 'Remote', 'State']
-    nets = {n['address']: n for n in report['namespaces']}
-    devs = {d['address']: d for d in report['interfaces']}
+def context_build(report):
     tasks = {t['pid']: t for t in report['tasks']}
+    nets = {n['address']: n for n in report['namespaces']}
     sockets = {s['socket']: s for s in report['sockets']}
-    selected = {a for a, n in nets.items() if include_host or n['container_candidates']}
+    contexts = {}
+    for task in report['tasks']:
+        for cid in context_task_ids(task):
+            item = contexts.setdefault(cid, {'id': cid, 'pids': [], 'tasks': [], 'namespaces': [], 'cgroup_paths': [], 'identity_sources': [], 'socket_ids': [], 'generation': [], 'warnings': []})
+            item['pids'].append(task['tgid'])
+            item['tasks'].append(task['address'])
+            if task.get('namespace'):
+                item['namespaces'].append(task['namespace'])
+            item['cgroup_paths'].extend(task.get('cgroup_paths', []))
+            item['identity_sources'].append(task.get('identity_evidence', 'unknown'))
+            if task['pid'] == task['tgid']:
+                item['generation'].append({k: task.get(k) for k in ('pid', 'address', 'comm', 'start_time', 'start_boottime', 'namespaces')})
+    for item in contexts.values():
+        for key in ('pids', 'tasks', 'namespaces', 'cgroup_paths', 'identity_sources'):
+            item[key] = sorted(set(item[key]))
+        if any((nets.get(n, {}).get('is_initial') for n in item['namespaces'])):
+            item['warnings'].append('host_network_namespace_shared')
+        if len(item['namespaces']) > 1:
+            item['warnings'].append('tasks_span_multiple_network_namespaces')
+    ownership = {}
+    for sid, sock in sockets.items():
+        holders = []
+        for h in sock['holders']:
+            t = tasks.get(h['pid'], {})
+            holders.append(dict(h, tgid=t.get('tgid', h['pid']), container_ids=context_task_ids(t), task_namespace=t.get('namespace'), identity_conflict=t.get('identity_conflict', False)))
+        cids = sorted({cid for h in holders for cid in h['container_ids']})
+        ownership[sid] = {'container_ids': cids, 'holders': holders}
+        for cid in cids:
+            contexts[cid]['socket_ids'].append(sid)
+            if any((h['container_ids'] == [cid] and h['task_namespace'] != sock['namespace'] for h in holders)):
+                contexts[cid]['warnings'].append('socket_namespace_differs_from_holder')
+    relations = []
 
-    def ids(values):
-        return ','.join((c[:12] for c in sorted(set(values)))) or '-'
-
-    def name(address):
-        return devs.get(address, {}).get('name', address or '-')
-
-    def hostlink(device):
-        links = []
-        for edge in report['links']:
-            if edge['source'] != device or edge['kind'] not in ('veth_peer', 'veth_peer_candidate'):
-                continue
-            bridges = [b for b in report['links'] if b['source'] == edge['target'] and b['kind'] == 'bridge_port']
-            label = name(edge['target'])
-            if bridges:
-                label += ' -> ' + ','.join((name(b['target']) for b in bridges))
-            if edge['kind'].endswith('candidate'):
-                label += ' [candidate]'
-            links.append(label)
-        return '; '.join(links) or '-'
-    states = {1: 'ESTABLISHED', 2: 'SYN_SENT', 3: 'SYN_RECV', 4: 'FIN_WAIT1', 5: 'FIN_WAIT2', 6: 'TIME_WAIT', 7: 'CLOSE', 8: 'CLOSE_WAIT', 9: 'LAST_ACK', 10: 'LISTEN', 11: 'CLOSING'}
-    rows = []
-    for ns in sorted(selected, key=lambda a: (str(nets[a].get('inode')), a)):
-        net = nets[ns]
-        inode = net.get('inode')
-        pids = sorted({tasks[p]['tgid'] for p in net['pids'] if p in tasks})
-        for device in sorted((d for d in devs.values() if d['namespace'] == ns), key=lambda d: (d['ifindex'], d['address'])):
-            addresses = sorted({a['cidr'] for a in device['addresses']})
-            for address in addresses or ['-']:
-                rows.append([ids(net['container_candidates']), ','.join(map(str, pids)) or '-', inode, device['name'], device.get('mac'), address, hostlink(device['address']), '-', '-', '-', '-'])
-        for sock in sorted((s for s in sockets.values() if s['namespace'] == ns), key=lambda s: (s['family'], s.get('protocol', ''), s.get('source_port', 0), s['socket'])):
-            if sock['family'] not in (1, 2, 10):
-                continue
-            protocol = sock.get('protocol', 'UNIX')
-            local = presentation_endpoint(sock.get('source_ip'), sock.get('source_port'))
-            remote = presentation_endpoint(sock.get('destination_ip'), sock.get('destination_port'))
-            state = states.get(sock['state'], str(sock['state']))
-            if sock['family'] == 1:
-                local = sock.get('path') or '(unnamed)'
-                peer = sock.get('peer', '0x0')
-                remote = '-' if peer == '0x0' else sockets.get(peer, {}).get('path') or '(unresolved peer)'
-                if sock.get('socket_type') == 2:
-                    state = 'UNCONN' if sock['state'] == 7 else state
-            elif protocol == 'UDP' and sock['state'] == 7:
-                state = 'UNCONN'
-            owners = {(tasks.get(h['pid'], {}).get('tgid', h['pid']), ids(tasks.get(h['pid'], {}).get('container_candidates', []))) for h in sock['holders']}
-            for pid, container in sorted(owners):
-                rows.append([container, pid, inode, '-', '-', '-', '-', protocol, local, remote, state])
-    return ([(c, str) for c in columns], [tuple(('-' if v is None else str(v).replace('\n', '\\n').replace('\t', '\\t') for v in row)) for row in rows])
+    def relation(kind, left, right, evidence, confidence, limitation):
+        a, b = (ownership[left], ownership[right])
+        if not a['container_ids'] and (not b['container_ids']):
+            return
+        relations.append({'kind': kind, 'left_socket': left, 'right_socket': right, 'left_containers': a['container_ids'], 'right_containers': b['container_ids'], 'left_holders': a['holders'], 'right_holders': b['holders'], 'confidence': confidence, 'limitation': limitation})
+    for sid, sock in sockets.items():
+        peer = sock.get('peer')
+        if sock['family'] == 1 and peer in sockets and (sid < peer) and (sockets[peer]['family'] == 1) and (sockets[peer].get('peer') == sid):
+            relation('unix_peer', sid, peer, [sid, peer], 'reciprocal_kernel_peer', 'current peer relation; not a history of messages or their contents')
+    structural = []
+    for address, ns in nets.items():
+        if address in (None, '', '0x0', 0):
+            continue
+        members = sorted((cid for cid, item in contexts.items() if address in item['namespaces']))
+        if len(members) > 1:
+            structural.append({'kind': 'shared_netns', 'members': members})
+    for sid, owner in ownership.items():
+        if len(owner['container_ids']) > 1:
+            structural.append({'kind': 'shared_socket', 'members': owner['container_ids']})
+    for item in contexts.values():
+        item['warnings'] = sorted(set(item['warnings']))
+        item['socket_ids'] = sorted(set(item['socket_ids']))
+    return {'containers': [contexts[k] for k in sorted(contexts)], 'socket_ownership': ownership, 'relations': relations, 'structural_relations': structural, 'unresolved_tasks': [t['address'] for t in report['tasks'] if t.get('container_candidates') and (not context_task_ids(t))], 'scope': 'ID references from cgroup paths or shim ancestry; not verified Docker inventory', 'relation_policy': 'only reciprocal UNIX peer or shared kernel object; no endpoint correlation'}
 
 # Source section: collector
+# ============================================================================== #
+# Source section: collector
+# ============================================================================== #
 """Kernel objects are identities; IP prefixes and names are attributes only."""
 import ipaddress
 import re
 import socket
 import time
 from volatility3.framework.objects import utility
+from volatility3.plugins.linux import pslist
 
 class Collector:
 
@@ -642,10 +827,10 @@ class Collector:
         bucket = self.metrics.setdefault(section, {})
         bucket[key] = bucket.get(key, 0) + amount
 
-    def measure(self, name, fn):
+    def measure(self, name, fn, *args):
         started = time.perf_counter_ns()
         try:
-            return fn()
+            return fn(*args)
         finally:
             self.count('timings_ns', name, time.perf_counter_ns() - started)
             self.count('calls', name)
@@ -653,9 +838,9 @@ class Collector:
     def issue(self, stage, obj, exc):
         self.errors.append({'stage': stage, 'address': hex(obj.vol.offset) if hasattr(obj, 'vol') else str(obj), 'error': type(exc).__name__, 'detail': str(exc)})
 
-    def read(self, stage, obj, fn, default=None):
+    def read(self, stage, obj, fn, default=None, *, args=()):
         try:
-            return fn()
+            return fn(*args)
         except Exception as exc:
             self.issue(stage, obj, exc)
             return default
@@ -688,6 +873,12 @@ class Collector:
 
     def cstring(self, ptr):
         return utility.pointer_to_string(ptr, count=4096) if ptr else ''
+
+    def net_pointer(self, value):
+        """Stock net_device extension pattern: possible_net_t or old net*."""
+        wrapped = value.has_member('net')
+        self.count('compatibility', 'possible_net_t' if wrapped else 'direct_net_pointer')
+        return int(value.net) if wrapped else int(value)
 
     def hlist(self, head, typename, member):
         offset = self.kernel.get_type(typename).relative_child_offset(member)
@@ -779,39 +970,39 @@ class Collector:
                 return '/' + '/'.join((p for p in reversed(parts) if p))
             node = parent.dereference()
 
-    def collect_tasks(self):
-        init = self.kernel.object_from_symbol('init_task')
-
-        def scan():
-            for task in self.walk(init.tasks, 'task_struct', 'tasks'):
+    def append_tasks(self, iterator, seen):
+        """Consume a stock task iterator with a bounded output and address deduplication."""
+        for count, task in enumerate(iterator):
+            if count >= self.limit:
+                raise ValueError('task iterator output budget exceeded')
+            self.count('objects_visited', 'stock_task_iterator')
+            address = int(task.vol.offset)
+            if address not in seen:
+                seen.add(address)
                 self.tasks.append(task)
-        self.read('tasks.list', init, scan)
-        seen = {t.vol.offset for t in self.tasks}
-        for leader in list(self.tasks):
 
-            def threads():
-                if leader.has_member('thread_node') and leader.signal.has_member('thread_head'):
-                    head, member = (leader.signal.thread_head, 'thread_node')
-                elif leader.has_member('thread_group'):
-                    head, member = (leader.thread_group, 'thread_group')
-                else:
-                    raise NotImplementedError('thread list layout unavailable')
-                for task in self.walk(head, 'task_struct', member):
-                    if task.vol.offset not in seen:
-                        seen.add(task.vol.offset)
-                        self.tasks.append(task)
-            self.read('tasks.threads', leader, threads)
+    def discover_tasks(self):
+        """Reuse stock process discovery; isolate each leader's thread enumeration."""
+        self.tasks = []
+        seen = set()
+        leaders = pslist.PsList.list_tasks(self.context, self.kernel.name, include_threads=False)
+        self.read('tasks.list', 'PsList.list_tasks', self.append_tasks, args=(leaders, seen))
+        for leader in list(self.tasks):
+            self.read('tasks.threads', leader, self.append_thread_tasks, args=(leader, seen))
+
+    def append_thread_tasks(self, leader, seen):
+        self.append_tasks(leader.get_threads(), seen)
+
+    def collect_tasks(self):
+        self.discover_tasks()
         records = []
         for task in self.tasks:
-            record = self.read('task.identity', task, lambda: {'address': hex(task.vol.offset), 'pid': int(task.pid), 'tgid': int(task.tgid), 'comm': utility.array_to_string(task.comm), 'container_candidates': [], 'source': 'init_task.tasks + task thread lists', 'confidence': 'reachable_task_object'})
+            record = self.read('task.identity', task, lambda: {'address': hex(task.vol.offset), 'pid': int(task.pid), 'tgid': int(task.tgid), 'comm': utility.array_to_string(task.comm), 'container_candidates': []})
             if record is None:
                 continue
             paths = self.read('task.cgroups', task, lambda: self.measure('identity.cgroup_paths', lambda: self.cgroups(task)), []) if self.identity_mode in ('combined', 'cgroup') else []
             record['cgroup_paths'] = paths
-            for path in paths:
-                for cid in re.findall('(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])', path):
-                    if cid not in record['container_candidates']:
-                        record['container_candidates'].append(cid)
+            record['container_candidates'] = identity_cgroup_candidates(paths)
             record['identity_evidence'] = 'cgroup_path_candidate' if record['container_candidates'] else 'unresolved'
             proxy = self.read('task.nsproxy', task, lambda: task.nsproxy.dereference() if task.nsproxy else None)
             if proxy is not None:
@@ -821,6 +1012,23 @@ class Collector:
                     ns['pids'].append(record['pid'])
                     ns['container_candidates'] = sorted(set(ns['container_candidates'] + record['container_candidates']))
                     record['namespace'] = ns['address']
+            for field in ('start_time', 'start_boottime'):
+                if task.has_member(field):
+                    record[field] = self.read('task.' + field, task, lambda f=field: int(task.member(f)))
+            record['namespaces'] = {}
+            if proxy is not None:
+                for field in ('mnt_ns', 'uts_ns', 'ipc_ns', 'pid_ns_for_children', 'cgroup_ns', 'time_ns'):
+                    if not proxy.has_member(field):
+                        continue
+
+                    def ns_info(f=field):
+                        ptr = proxy.member(f)
+                        if not ptr:
+                            return None
+                        obj = ptr.dereference()
+                        inode = int(obj.ns.inum) if obj.has_member('ns') else int(obj.proc_inum) if obj.has_member('proc_inum') else None
+                        return {'address': hex(int(ptr)), 'inode': inode}
+                    record['namespaces'][field] = self.read('task.namespace.' + field, task, ns_info)
             records.append(record)
         return records
 
@@ -838,8 +1046,8 @@ class Collector:
         return {'address': hex(ifa.vol.offset), 'family': family, 'ip': ip, 'prefix': prefix, 'cidr': cidr, 'subnet': str(ipaddress.ip_network(cidr, strict=False)), 'flags': flags, 'scope': scope}
 
     def interface(self, net, dev):
-        row = {'address': hex(dev.vol.offset), 'namespace': net['address'], 'namespace_inode': net['inode'], 'container_candidates': net['container_candidates'], 'pids': net['pids'], 'name': utility.array_to_string(dev.name), 'ifindex': int(dev.ifindex), 'addresses': [], 'source': 'kernel.net.dev_base_head', 'confidence': 'direct_object_membership'}
-        row['device_namespace'] = self.read('interface.nd_net', dev, lambda: hex(int(dev.nd_net.net)))
+        row = {'address': hex(dev.vol.offset), 'namespace': net['address'], 'namespace_inode': net['inode'], 'container_candidates': net['container_candidates'], 'pids': net['pids'], 'name': utility.array_to_string(dev.name), 'ifindex': int(dev.ifindex), 'addresses': []}
+        row['device_namespace'] = self.read('interface.nd_net', dev, lambda: hex(self.net_pointer(dev.nd_net)))
         if row['device_namespace'] is not None and row['device_namespace'] != net['address']:
             row['confidence'] = 'conflicting_namespace_pointers'
             self.issue('interface.namespace_conflict', dev, ValueError('dev_base_head and nd_net disagree'))
@@ -902,7 +1110,7 @@ class Collector:
                 self.namespace(net, 'net_namespace_list')
         self.measure('discovery.namespaces', lambda: self.read('net.list', 'net_namespace_list', namespaces))
         interfaces = []
-        for net in self.nets.values():
+        for net in list(self.nets.values()) if any((enabled(name) for name in ('interfaces', 'topology', 'bridge_fdb'))) else []:
 
             def devices():
                 for dev in self.walk(net['object'].dev_base_head, 'net_device', 'dev_list'):
@@ -910,8 +1118,8 @@ class Collector:
                     if value:
                         interfaces.append(value)
             self.measure('network.interfaces', lambda: self.read('net.devices', net['object'], devices))
-        edges, unsupported = self.measure('network.topology', lambda: topology_collect(self))
-        socket_rows = self.measure('network.sockets', lambda: self.read('socket.collect', 'kernel', lambda: sockets_collect(self), [])) if enabled('sockets') else []
+        edges, unsupported = self.measure('network.topology', lambda: topology_collect(self)) if enabled('topology') or enabled('bridge_fdb') else ([], [])
+        socket_rows = self.measure('network.sockets', lambda: self.read('socket.collect', 'kernel', lambda: sockets_collect(self, tasks), [])) if enabled('sockets') else []
         route_rows = self.measure('network.routes', lambda: self.read('route.collect', 'kernel', lambda: routes_collect(self, unsupported), [])) if enabled('routes') else []
         neighbor_rows = self.measure('network.neighbors', lambda: self.read('neighbor.collect', 'kernel', lambda: neighbors_collect(self, unsupported), [])) if enabled('neighbors') else []
         flow_rows = self.measure('network.conntrack', lambda: self.read('conntrack.collect', 'kernel', lambda: conntrack_collect(self, unsupported), [])) if enabled('conntrack') else []
@@ -922,38 +1130,284 @@ class Collector:
         for ns in self.nets.values():
             ns['is_initial'] = ns['address'] == self.init_net_address
             ns['membership'] = 'host_shared_candidate' if ns['is_initial'] and ns['container_candidates'] else 'identified_candidates' if ns['container_candidates'] else 'unattributed'
-        return {'schema_version': 1, 'tasks': tasks, 'links': edges, 'unsupported': unsupported, 'sockets': socket_rows, 'metadata': {'kernel_symbol_table': self.kernel.symbol_table_name, 'kernel_layer': self.kernel.layer_name, 'requested_features': sorted(features) if features is not None else ['all_supported'], 'kernel_virtual_offset': hex(self.kernel.offset), 'traversal_limit': self.limit, 'traversal_limit_semantics': 'corruption safety budget; normal termination uses head/null/root and cycle detection', 'identity_mode': self.identity_mode, 'cgroup_cache': self.cgroup_cache_enabled, 'metrics': self.metrics, 'identity_policy': 'object address within this snapshot; namespace inode and ifindex are attributes', 'snapshot_limit': 'a live-acquired dump may contain temporal smearing; successful parsing is not exhaustive coverage'}, 'routes': route_rows, 'neighbors': neighbor_rows, 'published_ports': published, 'conntrack': flow_rows, 'multicast': multicast_rows, 'rules': rule_rows, 'bridge_fdb': fdb_rows, 'namespaces': [{k: v for k, v in ns.items() if k != 'object'} for ns in self.nets.values()], 'interfaces': interfaces, 'errors': self.errors, 'summary': {'tasks': len(tasks), 'namespaces': len(self.nets), 'interfaces': len(interfaces), 'addresses': sum((len(i['addresses']) for i in interfaces)), 'sockets': len(socket_rows), 'links': len(edges), 'routes': len(route_rows), 'rules': len(rule_rows), 'neighbors': len(neighbor_rows), 'conntrack': len(flow_rows), 'multicast': len(multicast_rows), 'bridge_fdb': len(fdb_rows), 'published_ports': len(published), 'errors': len(self.errors)}}
+        report = {'schema_version': 3, 'tasks': tasks, 'links': edges, 'unsupported': unsupported, 'sockets': socket_rows, 'metadata': {'kernel_symbol_table': self.kernel.symbol_table_name, 'kernel_layer': self.kernel.layer_name, 'requested_features': sorted(features) if features is not None else ['all_supported'], 'kernel_virtual_offset': hex(self.kernel.offset), 'traversal_limit': self.limit, 'traversal_limit_semantics': 'corruption safety budget; normal termination uses head/null/root and cycle detection', 'identity_mode': self.identity_mode, 'cgroup_cache': self.cgroup_cache_enabled, 'metrics': self.metrics, 'identity_policy': 'object address within this snapshot; namespace inode and ifindex are attributes', 'snapshot_limit': 'a live-acquired dump may contain temporal smearing; successful parsing is not exhaustive coverage'}, 'routes': route_rows, 'neighbors': neighbor_rows, 'published_ports': published, 'conntrack': flow_rows, 'multicast': multicast_rows, 'rules': rule_rows, 'bridge_fdb': fdb_rows, 'namespaces': [{k: v for k, v in ns.items() if k != 'object'} for ns in self.nets.values()], 'interfaces': interfaces, 'errors': self.errors, 'summary': {'tasks': len(tasks), 'namespaces': len(self.nets), 'interfaces': len(interfaces), 'addresses': sum((len(i['addresses']) for i in interfaces)), 'sockets': len(socket_rows), 'links': len(edges), 'routes': len(route_rows), 'rules': len(rule_rows), 'neighbors': len(neighbor_rows), 'conntrack': len(flow_rows), 'multicast': len(multicast_rows), 'bridge_fdb': len(fdb_rows), 'published_ports': len(published), 'errors': len(self.errors)}}
+        report['container_context'] = self.measure('context.build', lambda: context_build(report))
+        report['summary']['containers'] = len(report['container_context']['containers'])
+        report['summary']['relations'] = len(report['container_context']['relations'])
+        report['summary']['structural_relations'] = len(report['container_context']['structural_relations'])
+        return report
 
 # Source section: plugin
-"""Container attachment reconstruction with opt-in detailed evidence."""
+# ============================================================================== #
+# Source section: plugin
+# ============================================================================== #
+"""Typed socket/holder records; rendering belongs to the selected CLI renderer."""
 import json
 import logging
 from volatility3.framework import interfaces, renderers
+from volatility3.framework.renderers import format_hints
 from volatility3.framework.configuration import requirements
 from volatility3.framework.symbols.linux import network
+from volatility3.framework.symbols import linux
+from volatility3.plugins.linux import pslist
 vollog = logging.getLogger(__name__)
+
+def plugin_value_or_absent(value, converter=None):
+    if value is None:
+        return renderers.NotAvailableValue()
+    return converter(value) if converter else value
+
+def plugin_address_value(value):
+    if value in (None, '', '0x0', 0):
+        return renderers.NotAvailableValue()
+    return format_hints.Hex(int(value, 16) if isinstance(value, str) else int(value))
+
+def plugin_namespace_inode(nets, address):
+    net = nets.get(address)
+    if net is None:
+        return renderers.NotAvailableValue()
+    if net.get('inode') is None:
+        return renderers.UnreadableValue()
+    return int(net['inode'])
 
 class InspectNetworks(interfaces.plugins.PluginInterface):
     _required_framework_version = (2, 22, 0)
-    _version = (3, 0, 0)
+    _version = (9, 0, 0)
 
     @classmethod
     def get_requirements(cls):
-        return [requirements.ModuleRequirement(name='kernel', description='Linux kernel', architectures=['Intel32', 'Intel64']), requirements.VersionRequirement(name='net_symbols', component=network.NetSymbols, version=(1, 0, 0)), requirements.IntRequirement(name='limit', description='Corruption safety budget per traversal', default=100000, optional=True), requirements.StringRequirement(name='identity-mode', description='Container identity strategy: combined, cgroup, or shim', default='combined', optional=True), requirements.BooleanRequirement(name='disable-cgroup-cache', description='Benchmark-only: recompute cgroup paths for every task/thread', default=False, optional=True), requirements.BooleanRequirement(name='identity-only', description='Benchmark-only: skip socket and optional network collectors', default=False, optional=True), requirements.BooleanRequirement(name='include-host', description='Include host/unattributed namespaces', default=False, optional=True), requirements.BooleanRequirement(name='containers-only', description='Compatibility alias for default scope', default=False, optional=True), requirements.BooleanRequirement(name='dump-evidence', description='Collect all supported evidence and save JSON', default=False, optional=True), requirements.BooleanRequirement(name='dump-metrics', description='Save traversal/timing metrics without enabling optional evidence collectors', default=False, optional=True)]
+        return [
+            requirements.ModuleRequirement(name='kernel', description='Linux kernel', architectures=['Intel32', 'Intel64']),
+            requirements.VersionRequirement(name='net_symbols', component=network.NetSymbols, version=(1, 0, 0)),
+            requirements.VersionRequirement(name='linuxutils', component=linux.LinuxUtilities, version=(2, 0, 0)),
+            requirements.VersionRequirement(name='pslist', component=pslist.PsList, version=(4, 0, 0)),
+            requirements.IntRequirement(name='limit', description='Corruption safety budget per traversal', default=100000, optional=True),
+            requirements.ListRequirement(name='container', description='Filter by unambiguous observed ID reference(s) or prefix(es); not Docker inventory', element_type=str, optional=True),
+            requirements.StringRequirement(name='identity-mode', description='ID reference sources: combined, cgroup, or shim', default='combined', optional=True),
+            requirements.BooleanRequirement(name='disable-cgroup-cache', description='Benchmark-only: recompute cgroup paths for every task/thread', default=False, optional=True),
+            requirements.StringRequirement(name='view', description='Output view to render', default='sockets', optional=True)
+        ]
 
     def run(self):
-        features = set() if self.config['identity-only'] else None if self.config['dump-evidence'] else {'sockets'}
-        report = Collector(self.context, self.config['kernel'], self.config['limit'], identity_mode=self.config['identity-mode'], cgroup_cache=not self.config['disable-cgroup-cache']).collect(features=features)
-        if self.config['dump-evidence']:
-            with self.open('network_evidence.json') as handle:
-                handle.write(json.dumps(report, indent=2, ensure_ascii=False).encode('utf-8'))
-        if self.config['dump-metrics']:
-            payload = {'metadata': report['metadata'], 'summary': report['summary'], 'container_candidates': sorted({cid for task in report['tasks'] for cid in task['container_candidates']}), 'identity_assignments': [{'pid': task['pid'], 'tgid': task['tgid'], 'container_candidates': task['container_candidates'], 'evidence': task.get('identity_evidence'), 'conflict': task.get('identity_conflict', False)} for task in report['tasks'] if task['container_candidates']], 'errors': report['errors']}
-            with self.open('network_metrics.json') as handle:
-                handle.write(json.dumps(payload, indent=2, ensure_ascii=False).encode('utf-8'))
-        if report['errors']:
-            vollog.warning('%d parsing errors: partial result. Use --dump-evidence for error details.', len(report['errors']))
-        if not any((n['container_candidates'] for n in report['namespaces'])) and (not self.config['include-host']):
-            vollog.warning('No attributed container namespaces. Use --include-host to inspect unattributed namespaces.')
-        columns, rows = presentation_table(report, self.config['include-host'] and (not self.config['containers-only']))
-        return renderers.TreeGrid(columns, ((0, row) for row in rows))
+        view = self.config.get('view', 'sockets')
+        features_map = {
+            'sockets': {'sockets'},
+            'relations': {'sockets'},
+            'topology': {'topology'},
+            'fdb': {'topology', 'bridge_fdb'},
+            'routes': {'routes', 'interfaces'},
+            'neighbors': {'neighbors', 'interfaces'}
+        }
+        features = features_map.get(view, {'sockets'})
+        report = Collector(self.context, self.config['kernel'], self.config['limit'], identity_mode=self.config.get('identity-mode', 'combined'), cgroup_cache=not self.config.get('disable-cgroup-cache', False)).collect(features=features)
+        self._log_diagnostics(report)
+        
+        if view == 'relations':
+            return renderers.TreeGrid(plugin_relation_columns(), plugin_relation_rows(report, self.config.get('container')))
+        
+        columns_map = {
+            'sockets': self._columns_sockets,
+            'topology': self._columns_topology,
+            'fdb': self._columns_fdb,
+            'routes': self._columns_routes,
+            'neighbors': self._columns_neighbors
+        }
+        generator_map = {
+            'sockets': self._generator_sockets,
+            'topology': self._generator_topology,
+            'fdb': self._generator_fdb,
+            'routes': self._generator_routes,
+            'neighbors': self._generator_neighbors
+        }
+        return renderers.TreeGrid(columns_map[view](), generator_map[view](report))
+
+    def _log_diagnostics(self, report):
+        for error in report.get('errors', []):
+            vollog.warning('Parse error stage=%s object=%s type=%s detail=%s affected_holders=%s', error['stage'], error['address'], error['error'], error['detail'], error.get('affected_holders', []))
+        for item in report.get('unsupported', []):
+            vollog.debug('Unsupported feature=%s object=%s reason=%s', item['feature'], item.get('interface', item.get('namespace', '')), item['reason'])
+        for address in report['container_context'].get('unresolved_tasks', []):
+            vollog.warning('Conflicting or multiple ID references for task %s; ID not assigned', address)
+
+    @staticmethod
+    def _columns_sockets():
+        return [('Container ID', str), ('NetNS', int), ('Proto', str), ('PID', int), ('Process', str), ('FD', int), ('Local', str), ('Remote', str), ('State', str)]
+
+    def _generator_sockets(self, report):
+        tasks = {task['pid']: task for task in report['tasks']}
+        nets = {net['address']: net for net in report['namespaces']}
+        eligible = {pid: plugin_container_member_id(task) for pid, task in tasks.items()}
+        known = {cid for cid in eligible.values() if cid}
+        selected, labels = plugin_select_containers(known, self.config.get('container'))
+        seen = set()
+        for sock in report['sockets']:
+            for holder in sock['holders']:
+                cid = eligible.get(holder['pid'])
+                if cid is None or cid not in selected:
+                    continue
+                task = tasks[holder['pid']]
+                key = (cid, task['tgid'], holder['fd'], holder.get('file'), sock['socket'])
+                if key in seen:
+                    continue
+                seen.add(key)
+                proto, state = plugin_socket_labels(sock)
+                yield (0, (labels[cid], plugin_namespace_inode(nets, sock['namespace']), proto, task['tgid'], task['comm'], holder['fd'], plugin_socket_endpoint(sock, 'source'), plugin_socket_endpoint(sock, 'destination'), state))
+
+
+    @staticmethod
+    def _columns_topology():
+        return [('NetNS', int), ('Interface', str), ('Peer/Bridge', str)]
+
+    def _generator_topology(self, report):
+        interfaces = {i['address']: i['name'] for i in report.get('interfaces', [])}
+        ns_map = {ns['address']: ns.get('inode', 0) for ns in report.get('namespaces', [])}
+        iface_ns = {i['address']: ns_map.get(str(i.get('namespace')), 0) for i in report.get('interfaces', [])}
+        
+        edges = report.get('links', [])
+        grouped = {}
+        for edge in edges:
+            key = (str(edge.get('source')), str(edge.get('target')))
+            grouped[key] = True  # We just want unique source-target pairs
+        
+        for (src_addr, tgt_addr) in grouped.keys():
+            source_name = interfaces.get(src_addr, src_addr)
+            target_name = interfaces.get(tgt_addr, tgt_addr)
+            ns_inode = iface_ns.get(src_addr, 0)
+            
+            yield (0, (ns_inode, source_name, target_name))
+
+    @staticmethod
+    def _columns_fdb():
+        return [('Bridge', str), ('NetNS', int), ('Port', str), ('MAC Address', str), ('VLAN', int), ('Is Local', str)]
+
+    def _generator_fdb(self, report):
+        interfaces = {i['address']: i['name'] for i in report.get('interfaces', [])}
+        ns_map = {ns['address']: ns.get('inode', 0) for ns in report.get('namespaces', [])}
+        
+        fdb = report.get('bridge_fdb', [])
+        for entry in fdb:
+            bridge_name = interfaces.get(str(entry.get('bridge')), str(entry.get('bridge')))
+            port_addr = str(entry.get('interface'))
+            port_name = interfaces.get(port_addr, port_addr) if port_addr != 'None' else 'None'
+            
+            ns_val = str(entry.get('namespace'))
+            ns_inode = ns_map.get(ns_val, int(ns_val, 16) if ns_val.startswith('0x') else 0)
+            
+            yield (0, (bridge_name, ns_inode, port_name, str(entry.get('mac')), int(entry.get('vlan', 0)), str(entry.get('flags', 0))))
+
+    @staticmethod
+    def _columns_routes():
+        return [('NetNS', int), ('Family', int), ('Destination', str), ('Gateway', str), ('Interface', str)]
+
+    def _generator_routes(self, report):
+        interfaces = {i['address']: i['name'] for i in report.get('interfaces', [])}
+        ns_map = {ns['address']: ns.get('inode', 0) for ns in report.get('namespaces', [])}
+        
+        routes = report.get('routes', [])
+        for route in routes:
+            ns_val = str(route.get('namespace'))
+            ns_inode = ns_map.get(ns_val, int(ns_val, 16) if ns_val.startswith('0x') else 0)
+            
+            gw = ""
+            iface = ""
+            if route.get('nexthops'):
+                gw = str(route['nexthops'][0].get('gateway') or '')
+                iface_val = str(route['nexthops'][0].get('interface'))
+                iface = interfaces.get(iface_val, iface_val)
+            
+            yield (0, (ns_inode, route.get('family'), str(route.get('destination')), gw, iface))
+
+    @staticmethod
+    def _columns_neighbors():
+        return [('NetNS', int), ('Interface', str), ('IP Address', str), ('MAC Address', str), ('State', str)]
+
+    def _generator_neighbors(self, report):
+        interfaces = {i['address']: i['name'] for i in report.get('interfaces', [])}
+        ns_map = {ns['address']: ns.get('inode', 0) for ns in report.get('namespaces', [])}
+        
+        neighbors = report.get('neighbors', [])
+        for nb in neighbors:
+            ns_val = str(nb.get('namespace'))
+            ns_inode = ns_map.get(ns_val, int(ns_val, 16) if ns_val.startswith('0x') else 0)
+            
+            iface_val = str(nb.get('interface'))
+            iface = interfaces.get(iface_val, iface_val)
+            
+            yield (0, (ns_inode, iface, str(nb.get('ip')), str(nb.get('mac')), str(nb.get('nud_state'))))
+
+def plugin_container_member_id(task):
+    ids = identity_cgroup_candidates(task.get('cgroup_paths', []))
+    if len(ids) != 1 or task.get('identity_conflict'):
+        return None
+    assigned = context_task_ids(task)
+    if assigned and assigned != ids:
+        return None
+    return ids[0]
+
+def plugin_select_containers(known, prefixes):
+    selected = set(known)
+    if prefixes:
+        selected = set()
+        for prefix in prefixes:
+            matches = {cid for cid in known if cid.startswith(prefix.lower())}
+            if len(matches) != 1:
+                raise ValueError(f'Container prefix {prefix!r} matched {len(matches)} IDs; use a longer/existing ID')
+            selected.update(matches)
+    labels = {}
+    for cid in known:
+        length = 12
+        while any((other != cid and other[:length] == cid[:length] for other in known)):
+            length += 1
+        labels[cid] = cid[:length]
+    return (selected, labels)
+
+def plugin_relation_columns():
+    return [('Relation', str), ('Container ID', str), ('Object', format_hints.Hex), ('Peer Container', str), ('Peer Object', format_hints.Hex), ('Evidence', str)]
+
+def plugin_relation_rows(report, prefixes=None):
+    tasks = []
+    for task in report['tasks']:
+        cid = plugin_container_member_id(task)
+        if cid:
+            tasks.append(dict(task, container_candidates=[cid], identity_conflict=False))
+    pids = {task['pid'] for task in tasks}
+    sockets = [dict(sock, holders=[h for h in sock['holders'] if h['pid'] in pids]) for sock in report['sockets']]
+    model = context_build(dict(report, tasks=tasks, sockets=sockets))
+    known = {item['id'] for item in model['containers']}
+    selected, labels = plugin_select_containers(known, prefixes)
+    for item in model['structural_relations']:
+        for cid in item['members']:
+            if cid in selected:
+                yield (0, (item['kind'], labels[cid], plugin_address_value(item['evidence'][0]), renderers.NotApplicableValue(), renderers.NotApplicableValue(), item['confidence']))
+    for item in model['relations']:
+        for left in item['left_containers'] or [None]:
+            for right in item['right_containers'] or [None]:
+                if left not in selected and right not in selected:
+                    continue
+                yield (0, (item['kind'], plugin_value_or_absent(labels.get(left)), plugin_address_value(item['left_socket']), plugin_value_or_absent(labels.get(right)), plugin_address_value(item['right_socket']), item['confidence']))
+
+def plugin_socket_endpoint(sock, side):
+    if sock['family'] == 1:
+        if side == 'destination':
+            return renderers.NotApplicableValue()
+        path = sock.get('path')
+        return plugin_value_or_absent(path, lambda value: value.encode('unicode_escape').decode('ascii'))
+    if sock['family'] not in (2, 10):
+        return renderers.NotApplicableValue()
+    ip, port = (sock.get(side + '_ip'), sock.get(side + '_port'))
+    if ip is None or port is None:
+        return renderers.NotAvailableValue()
+    return f'[{ip}]:{port}' if sock['family'] == 10 else f'{ip}:{port}'
+
+def plugin_socket_labels(sock):
+    family, protocol = (sock['family'], sock.get('protocol_number'))
+    if family == 1:
+        return ('UNIX', plugin_value_or_absent(sock.get('state_name'), str))
+    if family in (2, 10):
+        label = {6: 'TCP', 17: 'UDP'}.get(protocol, str(sock.get('protocol', protocol)))
+        if family == 10:
+            label += 'v6'
+        states = {1: 'ESTABLISHED', 2: 'SYN_SENT', 3: 'SYN_RECV', 4: 'FIN_WAIT1', 5: 'FIN_WAIT2', 6: 'TIME_WAIT', 7: 'CLOSE', 8: 'CLOSE_WAIT', 9: 'LAST_ACK', 10: 'LISTEN', 11: 'CLOSING', 12: 'NEW_SYN_RECV'}
+        state = sock.get('state')
+        return (label, states.get(state, str(state)) if protocol == 6 and state is not None else plugin_value_or_absent(state, str))
+    return (f'AF_{family}/PROTO_{protocol}', plugin_value_or_absent(sock.get('state'), str))

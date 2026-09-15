@@ -1,32 +1,81 @@
-# InspectNetworks 고도화 플러그인
+# InspectNetworks 고도화 플러그인 (Volatility 3)
 
-cgroup/프로세스에서 얻은 컨테이너 후보를 network namespace와 연결하여 인터페이스·주소·소켓을 표로 출력합니다. Docker MAC 접두사에 의존하지 않으며 보조 IPv4, IPv6와 스레드의 공유 소켓을 처리합니다.
+Docker 및 커널 네트워크 네임스페이스의 메모리 구조체를 전수 조사하여, 컨테이너 네트워크 상태와 토폴로지를 분석하는 Volatility 3 플러그인입니다. 기존의 단일 통합 뷰를 개선하여, 분석가가 필요로 하는 L2/L3/L4 계층별 네트워크 정보를 지정하여 출력할 수 있도록 고도화되었습니다.
 
-저장소 루트에서:
+## 설치 및 요구사항
 
+배포에는 **`src/plugins/inspect_networks.py`** 파일 하나만 필요합니다. `vol.py`가 위치한 디렉터리의 플러그인 폴더에 복사하거나, `-p` 옵션으로 경로를 지정하여 실행합니다.
+
+## 사용법
+
+기본 명령어 구조:
 ```powershell
-vol -q -p volatility_docker/src/plugins -s symbols -f dumps/sample.lime inspect_networks.InspectNetworks
+vol -q -p <플러그인_경로> -f <메모리덤프.lime> -s <심볼_경로> inspect_networks.InspectNetworks --view <옵션>
 ```
 
-실행 환경에 `vol`이 없으면 같은 버전의 `python path/to/vol.py`로 바꿉니다. 해당 덤프의 스택 설정이 있다면 플러그인 이름 앞에 `-c stack_config.json`을 추가합니다. 다른 덤프의 레이어/KASLR 설정을 재사용하지 마세요.
+## 제공되는 뷰(View) 옵션
 
-배포에는 **[src/plugins/inspect_networks.py](src/plugins/inspect_networks.py) 하나**만 필요합니다. `network_analysis` 폴더를 Volatility에 복사하거나 기본 플러그인/Linux symbol extension을 덮어쓸 필요가 없습니다.
+`--view` 인자를 통해 다음 5가지 네트워크 포렌식 뷰를 선택할 수 있습니다.
 
-S01 실제 결과 중 인터페이스 필드 발췌(일부 열):
+### 1. sockets (기본값)
+특정 프로세스(컨테이너)가 네트워크와 통신하기 위해 열어둔 소켓 정보를 보여줍니다.
+- **의미**: 포트 바인딩(LISTEN) 및 연결된 세션(ESTABLISHED) 상태를 확인하여 컨테이너 간 통신 내역과 악성 백도어 연결 여부를 조사할 수 있습니다.
+- **실행 예시**:
+  ```powershell
+  vol ... inspect_networks.InspectNetworks --view sockets
+  ```
+  ```text
+    | Container ID |      NetNS | Proto |  PID | Process | FD |               Local |              Remote |       State
+  * | 71d3f56e75a4 | 4026532261 |   TCP | 2834 | python3 |  3 |        0.0.0.0:8080 |           0.0.0.0:0 |      LISTEN
+  * | 71d3f56e75a4 | 4026532261 |   TCP | 2834 | python3 |  4 |   172.30.81.10:8080 |  172.30.81.20:51001 | ESTABLISHED
+  ```
 
-```text
-Container     PID   NetNS       Interface  MAC                Address
-91d9b1be475e  3925  4026532729  eth0       02:42:ac:1e:00:0a  172.30.10.10/16
-91d9b1be475e  3925  4026532729  eth0       02:42:ac:1e:00:0a  172.30.20.20/16
-```
+### 2. topology
+컨테이너의 가상 네트워크(veth)가 호스트의 가상 스위치(bridge)에 어떻게 연결되어 있는지 물리/논리적 링크 관계를 보여줍니다.
+- **의미**: L2 계층의 연결 관계를 통해 같은 서브넷(브리지)에 묶인 컨테이너들을 식별합니다.
+- **실행 예시**:
+  ```powershell
+  vol ... inspect_networks.InspectNetworks --view topology
+  ```
+  ```text
+    |      NetNS |   Interface | Peer/Bridge
+  * | 4026531840 | veth0bd20e6 |    br-dma81
+  * | 4026531840 | veth41b7deb |    br-dma82
+  ```
 
-실제 표에는 Host link, Protocol/Local/Remote/State도 있습니다. IPv6와 소켓은 별도 행으로 표시하며 `candidate` 연결은 확정된 peer 관계가 아닙니다.
+### 3. fdb (Forwarding Database)
+가상 스위치(bridge)가 수집한 MAC 주소 포워딩 테이블입니다.
+- **의미**: 브리지가 트래픽을 넘겨주기 위해 학습한 포트별 MAC 주소 테이블로, 스위칭 내역 및 목적지를 확인합니다.
+- **실행 예시**:
+  ```powershell
+  vol ... inspect_networks.InspectNetworks --view fdb
+  ```
+  ```text
+    |   Bridge |      NetNS |        Port |       MAC Address | VLAN | Is Local
+  * | br-dma81 | 4026531840 | vethd1e8e44 | 6a:74:a7:4e:5e:b5 |    1 |        3
+  ```
 
-`--include-host`로 호스트·미식별 namespace를 포함합니다. 상세 증거가 필요할 때만:
+### 4. routes
+커널의 L3 패킷 전달 방향(라우팅 테이블)을 출력합니다.
+- **의미**: 컨테이너나 호스트가 패킷을 전송할 때 거쳐가는 게이트웨이 및 출력 인터페이스를 확인하여, 트래픽 유출 경로를 추적합니다.
+- **실행 예시**:
+  ```powershell
+  vol ... inspect_networks.InspectNetworks --view routes
+  ```
+  ```text
+    |      NetNS | Family |                   Destination |     Gateway |   Interface
+  * | 4026532261 |      4 |                     0.0.0.0/0 | 172.30.81.1 |        eth0
+  * | 4026531840 |      4 |                     0.0.0.0/0 |    10.0.2.2 |        ens3
+  ```
 
-```powershell
-mkdir outputs/network
-vol -q -p volatility_docker/src/plugins -s symbols -o outputs/network -f dumps/sample.lime inspect_networks.InspectNetworks --dump-evidence
-```
-
-`network_evidence.json`에 추가 수집 데이터, 출처, 오류와 미지원 경로를 기록합니다.
+### 5. neighbors
+가상 장비들에 기록된 이웃 탐색 테이블(ARP / NDP 캐시)입니다.
+- **의미**: 통신했던 이웃 노드의 IP와 MAC 주소 맵핑 기록을 통해, 도달 가능성이 검증된 실제 통신 상대방을 입증합니다.
+- **실행 예시**:
+  ```powershell
+  vol ... inspect_networks.InspectNetworks --view neighbors
+  ```
+  ```text
+    |      NetNS |   Interface |                IP Address |       MAC Address | State
+  * | 4026532261 |        eth0 |              172.30.81.20 | 02:ab:cd:81:00:20 |     2
+  ```
