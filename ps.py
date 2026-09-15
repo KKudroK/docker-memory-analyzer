@@ -1,33 +1,18 @@
-"""Docker process and residual-artifact inventory for stock Volatility 3.
+"""Task-linked Docker container summaries for stock Volatility 3 >= 2.28.0.
 
-Deploy this file in a plugin directory and run ``ps.Ps --ps``. No files in
-Volatility's installation are replaced. Independent discovery paths run
-regardless of whether a container task was found. ps_evidence.json keeps
-process and container records, source addresses, conflicts, and scan coverage.
+Run ``vol ... -p ./plugins -o ./results ps.Ps --ps``. Each full container ID
+has one category/value block. A representative is chosen from an observed
+namespace init or attributed direct shim child; ambiguous cases remain unknown.
+Only that representative's start time, effective UID and capability are read.
+Configured Privileged comes from matching cached hostconfig.json, never a
+PID 1 capability comparison. Cache freshness cannot be established from presence.
 
-Runtime heap results are structurally validated candidates, not proof that a
-ContainerStore/GC root still owns the object. Docker lifecycle labels are not
-inferred from scheduler or cgroup flags. Bounds are reported as partial scans.
-
-Usage (stock Volatility 3 >= 2.28.0; use a matching, schema-valid Linux ISF):
-    vol --offline -p /path/to/plugins -s /path/to/symbols -f memory.lime \
-        -o /path/to/results ps.Ps --ps
-
-Output uses category/value rows, with one block per process and separate
-runtime state fields. JSON/CSV renderers use the same two-column schema.
-A container with only residual evidence has no process PID. Full commands,
-threads, recovered metadata, Go field evidence, and scan limits are kept
-in ps_evidence.json (schema 3). Research catalogs, raw page exports, and
-full runtime/traversal diagnostics are not collected by this plugin. Configured Privileged is recovered Docker configuration;
-effective capabilities are independently observed, never a privileged verdict.
-Mount paths support identity extraction; overlay backing layers are not decoded.
-Task and thread lists are audited in both directions; only integrity summaries
-and reverse-recovery markers are exported, and damaged lists stay partial.
-Heap scanning supports verified little-endian Go 64-bit reflection layouts;
-other layouts and nonresident memory are explicitly partial/unsupported.
+The reachable leader list is audited in both directions. Identity uses task
+cgroups, shim arguments/direct children and conditional standard bind mounts.
+Settings recovery uses host-mounted roots and filters to task-linked IDs. It
+keeps only the Privileged value and validation evidence, not general settings.
+The output has no lifecycle classifier. ps_evidence.json uses schema 4.
 """
-
-import bisect
 import datetime
 import hashlib
 import json
@@ -44,14 +29,20 @@ from volatility3.framework.symbols import linux
 vollog = logging.getLogger(__name__)
 LIMIT = 100000
 FILE_LIMIT = 16 * 1024 * 1024
-HEAP_LIMIT = 512 * 1024 * 1024
 CID = re.compile(r"[0-9a-f]{64}\Z")
 CGROUP_ID = re.compile(r"/(?:docker/|docker-)([0-9a-f]{64})(?:\.scope)?(?=/|$)")
-FILE_ID = re.compile(r"(?:^|/)containers/([0-9a-f]{64})/(config\.v2\.json|hostconfig\.json)\Z")
+BIND_ID = re.compile(r"(?:^|/)containers/([0-9a-f]{64})/(hosts|hostname|resolv\.conf)\Z")
+SETTINGS_FILE = re.compile(r"(?:^|/)containers/([0-9a-f]{64})/hostconfig\.json\Z")
+SETTINGS_DIR = re.compile(r"(?:^|/)containers/([0-9a-f]{64})(?=/|$)")
 UTC = datetime.timezone.utc
-STAGES = ("tasks", "namespaces", "cgroups", "mounts", "page_cache", "runtime")
-RUNTIME_STATE_FIELDS = ("Running", "Paused", "Restarting", "Dead", "RemovalInProgress",
-                        "Pid", "ExitCode", "StartedAt", "FinishedAt")
+STAGES = ("tasks", "identity", "selection", "details", "settings")
+STAGE_SCOPES = {
+    "tasks": "reachable process leaders and task-linked cgroups/PID namespaces",
+    "identity": "shim arguments/direct children and conditional non-host namespace bind mounts",
+    "selection": "one candidate per ID observed on a process leader",
+    "details": "selected representative start time and credentials only",
+    "settings": "Privileged from hostconfig.json for task-linked IDs; host-mounted roots only",
+}
 
 
 class Unsupported(ValueError):
@@ -153,297 +144,6 @@ def capability_mask(value):
     return int(value.member(name))
 
 
-class ProcessImage:
-    """Bounded resident VMA inventory backed by stock Volatility layers."""
-    def __init__(self, collector, task):
-        self.collector, self.context = collector, collector.context
-        if collector.kernel.get_type("pointer").size != 8:
-            raise Unsupported("Go reflection decoder currently supports little-endian 64-bit processes")
-        name = task.add_process_layer()
-        if name is None or not task.mm:
-            raise Incomplete("No dockerd process layer")
-        self.layer = self.context.layers[name]
-        self.vmas, self.chunks, self.gaps = [], [], []
-        for obj in collector.bounded(task.mm.get_vma_iter()):
-            start, end, flags = int(obj.vm_start), int(obj.vm_end), int(obj.vm_flags)
-            if not 0 < start < end or int(obj.vm_mm) != int(task.mm):
-                raise ValueError("Invalid VMA bounds/mm backlink")
-            self.vmas.append({"address": hex(obj.vol.offset), "start": start, "end": end,
-                              "flags": flags, "file_va": hex(int(obj.vm_file))})
-        self.vmas.sort(key=lambda v: v["start"])
-        if any(a["end"] > b["start"] for a, b in zip(self.vmas, self.vmas[1:])):
-            raise ValueError("Overlapping VMAs")
-        if len(self.vmas) != int(task.mm.map_count):
-            collector.issue("VMA inventory", task.mm, Incomplete("VMA count differs from mm.map_count"))
-        self.starts = [v["start"] for v in self.vmas]
-        self.resident_bytes = 0
-        self.truncated = False
-        for v in self.vmas:
-            if not v["flags"] & 1:
-                continue
-            position, chunk_start, chunk = v["start"], None, bytearray()
-            for va, length, pa, _, physical in self.layer.mapping(v["start"], v["end"] - v["start"], ignore_errors=True):
-                if va != position:
-                    self.gaps.append({"start": hex(position), "end": hex(va)})
-                    if chunk:
-                        self.chunks.append((chunk_start, bytes(chunk)))
-                    chunk_start, chunk = None, bytearray()
-                if self.resident_bytes + length > HEAP_LIMIT:
-                    self.truncated = True
-                    break
-                try:
-                    raw = self.context.layers[physical].read(pa, length)
-                except exceptions.InvalidAddressException as exc:
-                    collector.issue("resident process range", va, exc)
-                    if chunk:
-                        self.chunks.append((chunk_start, bytes(chunk)))
-                    chunk_start, chunk = None, bytearray()
-                    position = va + length
-                    continue
-                if chunk_start is None:
-                    chunk_start = va
-                chunk.extend(raw)
-                self.resident_bytes += len(raw)
-                position = va + length
-            if chunk:
-                self.chunks.append((chunk_start, bytes(chunk)))
-            if position < v["end"]:
-                self.gaps.append({"start": hex(position), "end": hex(v["end"])})
-            if self.truncated:
-                collector.issue("process memory scan", task, Incomplete("Resident-memory scan budget exceeded"))
-                break
-        # Nonresident pages are never zero filled or treated as searched content.
-        if self.gaps:
-            collector.issue("process memory coverage", task, Incomplete("Nonresident/unreadable VMA ranges excluded; see runtime_scan_summary"))
-
-    def vma(self, address):
-        index = bisect.bisect_right(self.starts, address) - 1
-        return self.vmas[index] if index >= 0 and address < self.vmas[index]["end"] else None
-
-    def read(self, address, size):
-        if not 0 <= size <= FILE_LIMIT:
-            raise ValueError("Process read exceeds bounds")
-        try:
-            return self.layer.read(address, size)
-        except exceptions.InvalidAddressException as exc:
-            raise Incomplete(str(exc)) from exc
-
-    def num(self, address, size=8, signed=False):
-        return int.from_bytes(self.read(address, size), "little", signed=signed)
-
-    def loc(self, address):
-        result = {"va": hex(address), "layer": self.layer.name}
-        try:
-            _, _, pa, _, name = next(self.layer.mapping(address, 1))
-            result.update(mapped_layer=name, mapped_offset=hex(pa))
-        except (exceptions.InvalidAddressException, StopIteration):
-            pass
-        return result
-
-    def find(self, needle, writable=None):
-        count = 0
-        for start, raw in self.chunks:
-            vma = self.vma(start)
-            if writable is not None and bool(vma["flags"] & 2) != writable:
-                continue
-            pos = raw.find(needle)
-            while pos != -1:
-                if count >= LIMIT:
-                    raise Incomplete("Pattern candidate budget exceeded")
-                yield start + pos
-                count += 1
-                pos = raw.find(needle, pos + 1)
-
-    def go_name(self, address):
-        length = shift = 0
-        for index in range(1, 9):
-            char = self.num(address + index, 1)
-            length |= (char & 127) << shift
-            if char < 128:
-                if not 0 < length <= 65536:
-                    raise ValueError("Go name length outside bounds")
-                return self.read(address + index + 1, length).decode()
-            shift += 7
-        raise Unsupported("Unsupported Go name encoding")
-
-    def go_string(self, address, maximum=65536):
-        pointer, length = struct.unpack("<QQ", self.read(address, 16))
-        if length > maximum or length and not self.vma(pointer):
-            raise ValueError("Invalid Go string")
-        return self.read(pointer, length).decode() if length else ""
-
-
-def go_time(pm, address, fields):
-    wall, ext = pm.num(address + fields["wall"]), pm.num(address + fields["ext"], signed=True)
-    nanos, monotonic = wall & ((1 << 30) - 1), bool(wall >> 63)
-    seconds = ((wall >> 30) & ((1 << 33) - 1)) + 59453308800 if monotonic else ext
-    epoch = seconds - 62135596800
-    return {**pm.loc(address), "wall": hex(wall), "ext": ext,
-            "loc": hex(pm.num(address + fields["loc"])), "has_monotonic": monotonic,
-            "unix_seconds": epoch, "nanoseconds": nanos, "unset": wall == 0 and ext == 0,
-            "utc": utc(epoch, nanos)}
-
-
-def collect_heap(collector, task):
-    """Discover Go layouts in this dump, then validate Container/State candidates."""
-    pm = ProcessImage(collector, task)
-    summary = {"pid": int(task.pid), "task": hex(task.vol.offset), "layer": pm.layer.name,
-               "vma_count": len(pm.vmas), "resident_bytes": pm.resident_bytes,
-               "gap_count": len(pm.gaps),
-               "gap_bytes": sum(int(g["end"], 16) - int(g["start"], 16) for g in pm.gaps),
-               "truncated": pm.truncated, "layout_verified": False, "rejected_candidates": 0,
-               "scope": "bounded resident VMA scan; gap counts cover unmapped/unscanned ranges; read errors are recorded separately"}
-    collector.report.setdefault("runtime_scan_summary", []).append(summary)
-
-    def discover(first_field, required):
-        names, descriptors = set(), {}
-        for va in pm.find(bytes([len(first_field)]) + first_field.encode(), writable=False):
-            try:
-                if pm.go_name(va - 1) == first_field:
-                    names.add(va - 1)
-            except (ValueError, UnicodeError):
-                continue
-        for name in sorted(names):
-            for arr in pm.find(struct.pack("<Q", name), writable=False):
-                if arr % 8:
-                    continue
-                for ref in pm.find(struct.pack("<Q", arr), writable=False):
-                    desc = ref - 56
-                    try:
-                        size, kind = pm.num(desc), pm.num(desc + 23, 1) & 31
-                        count, capacity = pm.num(ref + 8), pm.num(ref + 16)
-                        if kind != 25 or not 1 <= count <= 128 or capacity != count or not 1 <= size <= 65536:
-                            continue
-                        fields = {}
-                        for index in range(count):
-                            n, t, offset = struct.unpack("<QQQ", pm.read(arr + index * 24, 24))
-                            field_name, width, field_kind = pm.go_name(n), pm.num(t), pm.num(t + 23, 1) & 31
-                            if offset + width > size or not 0 < field_kind <= 26 or field_name in fields:
-                                raise ValueError("Go field constraints")
-                            fields[field_name] = {"offset": offset, "type_va": hex(t), "size": width,
-                                                  "kind": field_kind, "record_va": hex(arr + index * 24)}
-                        if required.issubset(fields):
-                            descriptors[desc] = {**pm.loc(desc), "size": size, "fields": fields,
-                                "type_name_offset": pm.num(desc + 40, 4, signed=True), "tflag": pm.num(desc + 20, 1)}
-                    except (ValueError, UnicodeError, struct.error):
-                        continue
-        return list(descriptors.values())
-
-    states = discover("Mutex", {"Running", "Paused", "Restarting", "RemovalInProgress", "Dead", "Pid", "ExitCode", "StartedAt", "FinishedAt"})
-    containers = discover("StreamConfig", {"State", "Root", "ID", "Name", "HasBeenStartedBefore"})
-    if len(states) != 1 or len(containers) != 1:
-        raise Unsupported(f"Go Container/State layout unverified or ambiguous: {len(containers)}/{len(states)} descriptors")
-    st, ct = states[0], containers[0]
-    bases = []
-    for name, descriptor in (("container.State", st), ("container.Container", ct)):
-        candidates = set()
-        for rawname in (name, "*" + name):
-            for va in pm.find(bytes([len(rawname)]) + rawname.encode(), writable=False):
-                try:
-                    if pm.go_name(va - 1) == rawname:
-                        candidates.add(va - 1 - descriptor["type_name_offset"])
-                except (ValueError, UnicodeError):
-                    continue
-        bases.append(candidates)
-    common = bases[0] & bases[1]
-    if len(common) != 1:
-        raise Unsupported("Go type-name base cannot be uniquely verified")
-    base = common.pop()
-    for desc in (ct, st):
-        desc["types_base_va"] = hex(base)
-        desc["encoded_type_name"] = pm.go_name(base + desc["type_name_offset"])
-    sf, cf = st["fields"], ct["fields"]
-    pointer_type = int(cf["State"]["type_va"], 16)
-    if cf["State"]["kind"] != 22 or pm.num(pointer_type + 48) != int(st["va"], 16):
-        raise Unsupported("Container.State does not point to the discovered State type")
-    for name in ("ID", "Root", "Name"):
-        if cf[name]["kind"] != 24 or cf[name]["size"] != 16:
-            raise Unsupported("Container identity is not a Go string")
-    time_type = int(sf["StartedAt"]["type_va"], 16)
-    if time_type != int(sf["FinishedAt"]["type_va"], 16) or pm.num(time_type) != 24 or pm.num(time_type + 23, 1) & 31 != 25:
-        raise Unsupported("Unsupported Go time.Time fields")
-    arr, count = pm.num(time_type + 56), pm.num(time_type + 64)
-    if count != 3:
-        raise Unsupported("Unsupported Go time.Time layout")
-    time_fields = {pm.go_name(pm.num(arr + i * 24)): pm.num(arr + i * 24 + 16) for i in range(count)}
-    if set(time_fields) != {"wall", "ext", "loc"} or set(time_fields.values()) != {0, 8, 16}:
-        raise Unsupported("Unsupported Go time.Time members")
-    summary.update(layout_verified=True, layout_source={
-        "container_type": ct["va"], "state_type": st["va"], "time_type": hex(time_type)})
-    ids = {cid for row in collector.report["cgroups"] for cid in row["container_ids"]}
-    ids.update(row["container_id"] for row in collector.report["cached_files"])
-    for _, raw in pm.chunks:
-        ids.update(match[1].decode() for match in re.finditer(rb"/containers/([0-9a-f]{64})(?:[^0-9a-f]|$)", raw))
-    seen = set()
-    for cid in sorted(ids):
-        strings = set(pm.find(cid.encode(), writable=True))
-        if not strings:
-            continue
-        for length_va in pm.find(struct.pack("<Q", 64), writable=True):
-            header = length_va - 8
-            if header % 8:
-                continue
-            try:
-                if pm.num(header) not in strings:
-                    continue
-            except ValueError:
-                continue
-            va = header - cf["ID"]["offset"]
-            if va in seen:
-                continue
-            seen.add(va)
-            try:
-                vma = pm.vma(va)
-                if not vma or not vma["flags"] & 2 or vma["file_va"] != "0x0":
-                    continue
-                root, name = pm.go_string(va + cf["Root"]["offset"]), pm.go_string(va + cf["Name"]["offset"], 256)
-                if not root.startswith("/") or not root.endswith("/containers/" + cid) or not name.startswith("/"):
-                    continue
-                state = pm.num(va + cf["State"]["offset"])
-                rec = {"process_pid": int(task.pid), "container_id": cid, "container": pm.loc(va),
-                       "name": name, "root": root, "state": {}, "field_evidence": {},
-                       "parse_errors": [], "attribution": "structurally validated candidate; GC/ContainerStore reachability unverified"}
-                collector.report["runtime_heap"].append(rec)
-                if not pm.vma(state) or not pm.vma(state)["flags"] & 2:
-                    rec["parse_errors"].append({"field": "State", "reason": "Outside writable VMA"})
-                else:
-                    rec["state_object"] = pm.loc(state)
-                    def scalar(address, fields, field, owner):
-                        desc = fields[field]
-                        if desc["kind"] not in (1, 2, 3, 4, 5, 6) or desc["size"] not in (1, 2, 4, 8):
-                            raise Unsupported("Unexpected Go scalar type")
-                        if field not in ("Pid", "ExitCode") and (desc["kind"], desc["size"]) != (1, 1):
-                            raise Unsupported("State flag is not a Go bool")
-                        pos = address + desc["offset"]
-                        raw = pm.read(pos, desc["size"])
-                        value = int.from_bytes(raw, "little", signed=desc["kind"] != 1)
-                        rec["field_evidence"][owner + "." + field] = {**pm.loc(pos), "raw_hex": raw.hex(), "value": value}
-                        if desc["kind"] == 1:
-                            if value not in (0, 1):
-                                raise ValueError("Nonboolean Go field")
-                            return bool(value)
-                        return value
-                    for field in ("Running", "Paused", "Restarting", "RemovalInProgress", "Dead", "Pid", "ExitCode"):
-                        if field not in sf:
-                            continue
-                        try:
-                            rec["state"][field] = scalar(state, sf, field, "State")
-                        except ValueError as exc:
-                            rec["parse_errors"].append({"field": field, "reason": str(exc)})
-                    for field in ("StartedAt", "FinishedAt"):
-                        try:
-                            observed = go_time(pm, state + sf[field]["offset"], time_fields)
-                            rec["field_evidence"]["State." + field] = observed
-                            rec["state"][field] = observed["utc"]
-                        except (ValueError, OverflowError) as exc:
-                            rec["parse_errors"].append({"field": field, "reason": str(exc)})
-                rec["parse_status"] = "PARTIAL" if rec["parse_errors"] else "FOUND"
-                if rec["parse_errors"]:
-                    collector.issue("Go candidate fields", task, Incomplete(str(rec["parse_errors"])))
-            except (ValueError, UnicodeError, struct.error):
-                summary["rejected_candidates"] += 1
-
-
 def audit_task_list(head, read_link, limit=LIMIT):
     """Audit both directions independently, retaining reachable nodes on failure.
 
@@ -498,40 +198,74 @@ def audit_task_list(head, read_link, limit=LIMIT):
     return result
 
 
+def select_representative(rows, cid):
+    """Choose an evidenced container init; PID ordering is never a criterion."""
+    eligible = [r for r in rows if r.get("container_ids") == [cid]
+                and not r.get("identity_conflicts")]
+    chains = [r for r in eligible if r.get("pid_chain")]
+    depth = min((len(r["pid_chain"]) - 1 for r in chains), default=None)
+    inits = [r for r in chains if depth and len(r["pid_chain"]) - 1 == depth
+             and r["pid_chain"][-1]["nr"] == 1]
+    direct = [r for r in eligible if r.get("direct_shim", {}).get("container_id") == cid]
+    selected, method = None, None
+    if len(inits) == 1:
+        selected, method = inits[0], "PID_NAMESPACE_INIT"
+    elif len(direct) == 1 and (not inits or direct[0] in inits):
+        selected, method = direct[0], "SHIM_DIRECT_CHILD"
+    candidates = inits or direct
+    status = "SELECTED" if selected else "AMBIGUOUS" if len(candidates) > 1 else "UNRESOLVED"
+    return selected, {"status": status, "method": method,
+        "candidate_tasks": [r["address"] for r in candidates],
+        "observed_min_pid_namespace_depth": depth,
+        "reason": "unique evidenced representative" if selected else
+                  "no unique namespace init or attributed direct shim child"}
+
+
+def shim_arguments(args):
+    """Parse the supported separate-value flags; reject conflicting identities."""
+    ids, namespaces = set(), set()
+    for index, arg in enumerate(args):
+        if arg not in ("-id", "--id", "-namespace", "--namespace"):
+            continue
+        if index + 1 == len(args) or args[index + 1].startswith("-"):
+            raise ValueError("Shim flag has no value")
+        (ids if arg in ("-id", "--id") else namespaces).add(args[index + 1])
+    if len(ids) != 1 or len(namespaces) > 1:
+        raise ValueError("Missing or conflicting shim ID/namespace flags")
+    cid = next(iter(ids))
+    if not CID.fullmatch(cid):
+        raise ValueError("Invalid shim container ID")
+    return cid, next(iter(namespaces), None)
+
+
 class Collector:
     def __init__(self, context, kernel_name):
         self.context = context
         self.kernel = context.modules[kernel_name]
         self.layer = context.layers[self.kernel.layer_name]
         self.stage = "tasks"
-        self.report = {"schema_version": 3, "method": "Docker process inventory with independent residual discovery",
-                       "provenance": {"plugin_version": "1.4.0", "volatility_version": constants.PACKAGE_VERSION,
-                           "collection_started_utc": datetime.datetime.now(UTC).isoformat(),
-                           "kernel_module": kernel_name, "kernel_layer": self.kernel.layer_name,
-                           "isf_url": context.symbol_space[self.kernel.symbol_table_name].config.get("isf_url"),
-                           "input_layers": [{"name": name, "location": context.layers[name].config.get("location")}
-                                            for name in context.layers if context.layers[name].config.get("location")]},
-                       "coverage": {}, "errors": [], "tasks": [],
-                       "namespaces": [], "cgroups": [], "mounts": [], "cached_files": [],
-                       "runtime_processes": [], "runtime_heap": [], "containers": [],
-                       "limits": {"objects_per_traversal": LIMIT, "metadata_file_bytes": FILE_LIMIT,
-                                  "resident_heap_bytes_per_daemon": HEAP_LIMIT},
-                       "limitations": ["Reachable objects only; absence is scoped to completed traversals.",
-                           "Live acquisition may smear objects across time.",
-                           "Cache and heap observations can be stale; no lifecycle classifier is applied.",
-                           "Namespace sharing or ancestry alone does not establish Docker identity."]}
-        self.tasks = {}
-        self.task_rows = {}
-        self.namespaces = {}
-        self.cgroups = {}
-        self.mounts = {}
-        self.superblocks = {}
-        self.containers = {}
-        self.host_ns = {}
-        self.init = None
-        self.boot = None
+        self.report = {"schema_version": 4, "method": "One summary per task-linked Docker container",
+            "provenance": {"plugin_version": "1.5.1", "volatility_version": constants.PACKAGE_VERSION,
+                "collection_started_utc": datetime.datetime.now(UTC).isoformat(),
+                "kernel_module": kernel_name, "kernel_layer": self.kernel.layer_name,
+                "isf_url": context.symbol_space[self.kernel.symbol_table_name].config.get("isf_url"),
+                "input_layers": [{"name": n, "location": context.layers[n].config.get("location")}
+                    for n in context.layers if context.layers[n].config.get("location")]},
+            "coverage": {}, "errors": [], "tasks": [], "cgroups": [], "namespaces": [],
+            "shims": [], "mounts": [], "cached_settings": [], "containers": [],
+            "task_list_integrity": [],
+            "limits": {"objects_per_traversal": LIMIT, "settings_file_bytes": FILE_LIMIT},
+            "scope": "Reachable process leaders; cgroup IDs and limited identity fallback; representative credentials and cached Privileged only",
+            "limitations": ["A task-linked candidate does not establish Docker lifecycle state.",
+                "A damaged task list remains partial after reverse recovery.",
+                "Missing or ambiguous representative evidence is not replaced with the lowest PID.",
+                "Cached hostconfig values may be stale; missing data is unknown.",
+                "Shim comm/argument forms and Docker path patterns have a bounded supported scope."]}
+        self.tasks, self.task_rows, self.namespaces, self.cgroups, self.containers = {}, {}, {}, {}, {}
         self.backward_recovered_tasks = set()
-        self.report["task_list_integrity"] = []
+        self.skipped = {}
+        self.init, self.boot = None, None
+
 
     def process_start(self, task):
         if self.boot is None:
@@ -555,8 +289,10 @@ class Collector:
             raise Unsupported("Process start time has no verified clock conversion")
         return value.astimezone(UTC).isoformat()
 
+
     def address(self, obj):
         return int(obj.vol.offset) if hasattr(obj, "vol") else int(obj)
+
 
     def location(self, obj):
         address = self.address(obj)
@@ -568,6 +304,7 @@ class Collector:
             pass
         return result
 
+
     def issue(self, operation, obj, exc):
         try:
             address = hex(self.address(obj))
@@ -578,6 +315,7 @@ class Collector:
                                      "address": address, "kind": kind,
                                      "exception": type(exc).__name__, "detail": str(exc)})
 
+
     def read(self, operation, obj, function, default=None):
         try:
             return function()
@@ -586,28 +324,19 @@ class Collector:
             self.issue(operation, obj, exc)
             return default
 
+
     def obj(self, name, address):
         return self.kernel.object(name, offset=int(address), absolute=True)
+
 
     def symbol(self, name, typename):
         sym = self.kernel.get_symbol(name)
         return self.kernel.object(typename, offset=sym.address, absolute=False)
 
+
     def string(self, ptr):
         return utility.pointer_to_string(ptr, 4096) if ptr else ""
 
-    def walk(self, head, typename, member, hlist=False):
-        offset = self.kernel.get_type(typename).relative_child_offset(member)
-        end = 0 if hlist else self.address(head)
-        link = int(head.first if hlist else head.next)
-        seen = set()
-        while link != end:
-            if not link or link in seen or len(seen) >= LIMIT:
-                raise Incomplete("Null/cyclic/over-limit linked list")
-            seen.add(link)
-            node = self.obj(typename, link - offset)
-            yield node
-            link = int(node.member(member).next)
 
     def bounded(self, iterator):
         for index, value in enumerate(iterator):
@@ -615,26 +344,6 @@ class Collector:
                 raise Incomplete("Traversal budget exceeded")
             yield value
 
-    def stage_run(self, name, function):
-        self.stage = name
-        errors = len(self.report["errors"])
-        started = time.perf_counter()
-        vollog.info("ps: collecting %s", name)
-        self.read(name, name, function)
-        # Count native records, independently of optional/research serialization.
-        fields = {"tasks": ("tasks",), "namespaces": ("namespaces",),
-                  "cgroups": ("cgroups",), "mounts": ("mounts",),
-                  "page_cache": ("cached_files",),
-                  "runtime": ("runtime_processes", "runtime_heap")}[name]
-        count = sum(len(self.report[field]) for field in fields)
-        if name == "namespaces":
-            count = sum(row["kind"] == "mnt" for row in self.report["namespaces"])
-        issues = self.report["errors"][errors:]
-        self.report["coverage"][name] = {"status": "PARTIAL" if issues else "FOUND" if count else "NOT FOUND",
-            "completed_without_errors": not issues, "records": count, "record_collections": list(fields),
-            "scope": "mount namespaces only" if name == "namespaces" else "reachable objects within configured traversal limits",
-            "errors": len(issues),
-            "elapsed_seconds": round(time.perf_counter() - started, 3)}
 
     def namespace(self, ptr, kind, entity=None):
         if not ptr:
@@ -651,6 +360,7 @@ class Collector:
         if entity and entity not in row["tasks"]:
             row["tasks"].append(entity)
         return {"address": row["address"], "inum": row["inum"]}
+
 
     def pid_chain(self, task):
         if task.has_member("thread_pid"):
@@ -674,6 +384,7 @@ class Collector:
                            "address": hex(upid.vol.offset)})
         return result
 
+
     def task_cgroups(self, task):
         if not task.has_member("cgroups"):
             raise Unsupported("task.cgroups absent")
@@ -689,19 +400,6 @@ class Collector:
                     groups[int(ptr.cgroup)] = ptr.cgroup.dereference()
         return [self.cgroup(group, "task") for group in groups.values()]
 
-    def cgroup(self, group, source):
-        address = self.address(group)
-        if address in self.cgroups:
-            row = self.cgroups[address][1]
-            if source not in row["sources"]:
-                row["sources"].append(source)
-            return row
-        path, trace = self.cgroup_path(group)
-        ids = sorted(set(CGROUP_ID.findall(path)))
-        row = {"address": hex(address), "path": path, "parent_trace": trace, "container_ids": ids, "sources": [source]}
-        self.cgroups[address] = (group, row)
-        self.report["cgroups"].append(row)
-        return row
 
     def cgroup_path(self, group):
         node = group.kn.dereference() if group.has_member("kn") and group.kn else group
@@ -724,6 +422,7 @@ class Collector:
             trace.append({"location": self.location(node), "name": parts[-1], "parent": hex(int(parent)) if parent else "0x0"})
             node = parent.dereference() if parent else None
         return "/" + "/".join(p for p in reversed(parts) if p), trace
+
 
     def task_list(self, head, member, kind):
         mask = self.layer.address_mask
@@ -767,192 +466,376 @@ class Collector:
                 self.backward_recovered_tasks.add(self.address(task))
             yield task
 
+
+    def argv(self, task):
+        if not task.mm:
+            return []
+        start, end = int(task.mm.arg_start), int(task.mm.arg_end)
+        if not 0 <= end - start <= FILE_LIMIT:
+            raise Incomplete("Command line length outside budget")
+        layer_name = task.add_process_layer()
+        if layer_name is None:
+            raise Incomplete("No process address space")
+        return self.context.layers[layer_name].read(start, end - start).decode("utf-8", errors="replace").rstrip("\0").split("\0")
+
+
+    def stage_run(self, name, function):
+        self.stage = name
+        errors, started = len(self.report["errors"]), time.perf_counter()
+        vollog.info("ps: collecting %s", name)
+        self.read(name, name, function)
+        fields = {"tasks": ("tasks",), "identity": ("shims", "mounts"),
+                  "selection": ("containers",), "details": (), "settings": ("cached_settings",)}[name]
+        count = sum(len(self.report[f]) for f in fields) if fields else sum(
+            bool(c.get("representative")) for c in self.report["containers"])
+        issues = self.report["errors"][errors:]
+        status = "PARTIAL" if issues else "SKIPPED" if name in self.skipped else "FOUND" if count else "NOT FOUND"
+        self.report["coverage"][name] = {"status": status, "records": count,
+            "record_collections": list(fields), "errors": len(issues),
+            "completed_without_errors": not issues,
+            "scope": self.skipped.get(name, STAGE_SCOPES[name]),
+            "elapsed_seconds": round(time.perf_counter() - started, 3)}
+
+
+    def cgroup(self, group, source):
+        address = self.address(group)
+        if address not in self.cgroups:
+            path, _ = self.cgroup_path(group)
+            row = {"address": hex(address), "path": path,
+                   "container_ids": sorted(set(CGROUP_ID.findall(path))), "location": self.location(group)}
+            self.cgroups[address] = (group, row)
+            self.report["cgroups"].append(row)
+        return self.cgroups[address][1]
+
+
     def collect_tasks(self):
         self.init = self.symbol("init_task", "task_struct")
         def leaders():
             for task in self.task_list(self.init.tasks, "tasks", "process_leaders"):
-                self.tasks[self.address(task)] = task
-        self.read("task list", self.init, leaders)
-        for task in list(self.tasks.values()):
-            def threads():
-                if task.has_member("thread_node") and task.signal and task.signal.has_member("thread_head"):
-                    head, member = task.signal.thread_head, "thread_node"
-                elif task.has_member("thread_group"):
-                    head, member = task.thread_group, "thread_group"
-                else:
-                    raise Unsupported("Thread list layout unavailable")
-                for thread in self.task_list(head, member, "threads"):
-                    self.tasks[self.address(thread)] = thread
-            self.read("thread list", task, threads)
+                if int(task.pid) == int(task.tgid):
+                    self.tasks[self.address(task)] = task
+        self.read("process leader list", self.init, leaders)
         for address, task in self.tasks.items():
-            row = {"address": hex(address), "location": self.location(task),
-                   "namespaces": {}, "container_ids": [],
-                   "recovered_from_backward": address in self.backward_recovered_tasks}
+            row = {"address": hex(address), "location": self.location(task), "container_ids": [],
+                "identity_sources": [], "identity_conflicts": [], "namespaces": {},
+                "recovered_from_backward": address in self.backward_recovered_tasks}
             self.report["tasks"].append(row)
             self.task_rows[address] = row
-            # Only fields used by process display, identity, or ancestry.
             for field in ("pid", "tgid", "real_parent"):
                 row[field] = self.read("task." + field, task, lambda f=field: int(task.member(f)))
             row["comm"] = self.read("task.comm", task, lambda: utility.array_to_string(task.comm))
-            chain = self.read("task.pid_chain", task, lambda: self.pid_chain(task), [])
-            row["pid_chain"] = chain
-            if chain:
-                row["namespace_tid"] = chain[-1]["nr"]
-                row["namespaces"]["pid"] = chain[-1]["namespace"]
+            def pid_chain():
+                chain = self.pid_chain(task)
+                if chain and (chain[0]["nr"] != row["pid"] or any(n["namespace"] is None for n in chain)):
+                    raise ValueError("PID chain disagrees with task PID or lacks a namespace")
+                return chain
+            row["pid_chain"] = self.read("task.pid_chain", task, pid_chain, [])
             groups = self.read("task.cgroups", task, lambda: self.task_cgroups(task), [])
             row["cgroups"] = [g["address"] for g in groups]
-            row["container_ids"] = sorted({cid for group in groups for cid in group["container_ids"]})
-            row["process_start"] = self.read("task.start_time", task, lambda: self.process_start(task))
-            # Optional values cannot abort task discovery.
-            if task.has_member("cred") and task.cred:
-                cred = self.read("task.cred", task, lambda: task.cred.dereference())
-                if cred is not None:
-                    row["credential_location"] = self.location(cred)
-                    def effective_uid():
-                        value = cred.member("euid")
-                        return int(value.val) if value.has_member("val") else int(value)
-                    row["effective_uid"] = self.read("cred.euid", cred, effective_uid)
-                    row["effective_caps"] = self.read("cred.cap_effective", cred, lambda: hex(capability_mask(cred.cap_effective)))
+            row["container_ids"] = sorted({cid for g in groups for cid in g["container_ids"]})
+            if row["container_ids"]:
+                row["identity_sources"].append("cgroup")
+            if len(row["container_ids"]) > 1:
+                row["identity_conflicts"].append({"source": "cgroup", "ids": row["container_ids"]})
 
-    def collect_namespaces(self):
-        """Mount namespaces needed for VFS traversal; PID namespaces come from tasks."""
-        host = self.init or self.symbol("init_task", "task_struct")
-        all_tasks = [(host, None)] + [(t, self.task_rows[a]) for a, t in self.tasks.items()]
-        for task, row in all_tasks:
-            entity = "task:" + row["address"] if row else "host"
-            proxy = self.read("nsproxy", task, lambda: task.nsproxy.dereference() if task.nsproxy else None)
-            if proxy is None:
-                continue
-            ns = self.read("mnt namespace", proxy, lambda: self.namespace(proxy.mnt_ns, "mnt", entity))
-            if ns is None:
-                continue
-            if row is None:
-                self.host_ns["mnt"] = ns
-            else:
-                row["namespaces"]["mnt"] = ns
 
-    def collect_cgroups(self):
-        roots = []
-        if self.kernel.has_symbol("cgrp_dfl_root"):
-            roots.append(self.symbol("cgrp_dfl_root", "cgroup_root"))
-        if self.kernel.has_symbol("cgroup_roots"):
-            def additional_roots():
-                roots.extend(self.walk(self.symbol("cgroup_roots", "list_head"), "cgroup_root", "root_list"))
-            self.read("cgroup roots", "cgroup_roots", additional_roots)
-        if not roots:
-            raise Unsupported("No supported global cgroup root symbol")
-        pending = []
-        for root in roots:
-            self.report.setdefault("cgroup_roots", []).append(self.location(root))
-            pending.append(root.cgrp)
-        seen = set()
-        while pending:
-            group = pending.pop()
-            address = self.address(group)
-            if address in seen:
-                continue
-            if len(seen) >= LIMIT:
-                raise Incomplete("Global cgroup traversal budget")
-            seen.add(address)
-            self.read("global cgroup", group, lambda g=group: self.cgroup(g, "global"))
-            def children():
-                for child in self.walk(group.self.children, "cgroup_subsys_state", "sibling"):
-                    if child.cgroup:
-                        pending.append(child.cgroup.dereference())
-            self.read("cgroup children", group, children)
-        for address, (group, row) in self.cgroups.items():
-            row["location"] = self.location(group)
-            row["task_members"] = [t["address"] for t in self.report["tasks"]
-                                   if row["address"] in t.get("cgroups", [])]
-
-    def mount_record(self, mount, task=None):
-        address = self.address(mount)
-        if address in self.mounts:
-            return
-        ns = int(mount.mnt_ns) if mount.has_member("mnt_ns") else 0
-        row = {"address": hex(address), "namespace": hex(ns), "task": hex(task.vol.offset) if task is not None else None}
-        self.mounts[address] = (mount, task, row)
-        self.report["mounts"].append(row)
-        root = mount.get_mnt_root().dereference()
-        sb = mount.get_mnt_sb().dereference()
-        self.superblocks[sb.vol.offset] = sb
-        row["id"] = int(mount.mnt_id) if mount.has_member("mnt_id") else None
-        row["fstype"] = self.string(sb.s_type.name)
-        row["host_path"] = self.read("host mount path", mount, lambda: linux.LinuxUtilities.get_path_mnt(self.init, mount)) if self.init is not None else None
-        row["path"] = self.read("namespace mount path", mount, lambda: linux.LinuxUtilities.get_path_mnt(task, mount)) if task is not None else None
-        row["root_dentry"], row["superblock"] = hex(root.vol.offset), hex(sb.vol.offset)
-        row["root_inode"] = hex(int(root.d_inode))
-        def root_path():
-            current, parts, seen = root, [], set()
-            while True:
-                if current.vol.offset in seen or len(seen) >= LIMIT:
-                    raise Incomplete("Dentry parent cycle/budget")
-                seen.add(current.vol.offset)
-                name = current.d_name.name_as_str()
-                if name not in ("", "/"):
-                    parts.append(name)
-                if int(current.d_parent) == current.vol.offset:
-                    return "/" + "/".join(reversed(parts))
-                current = current.d_parent.dereference()
-        row["root_path"] = self.read("mount root dentry path", root, root_path)
-        row["container_ids"] = sorted({cid for path in (row["host_path"], row["path"], row["root_path"]) if path
-            for cid in re.findall(r"/containers/([0-9a-f]{64})(?=/|$)", path)})
-        row["location"] = self.location(mount)
-        row["parent"] = hex(int(mount.mnt_parent))
-
-    def collect_mounts(self):
-        if self.init is None:
-            self.init = self.read("init_task for VFS", "init_task", lambda: self.symbol("init_task", "task_struct"))
-        ns_tasks = {}
+    def collect_shims(self):
+        known = {cid for row in self.report["tasks"] for cid in row["container_ids"]}
+        shims = {}
         for address, task in self.tasks.items():
             row = self.task_rows[address]
-            ns = row.get("namespaces", {}).get("mnt")
-            if ns:
-                ns_tasks.setdefault(int(ns["address"], 16), task)
-        # Independent of finding a container task.
-        if self.init is not None and self.init.nsproxy and self.init.nsproxy.mnt_ns:
-            ns_tasks.setdefault(int(self.init.nsproxy.mnt_ns), self.init)
-        if self.kernel.has_symbol("init_nsproxy"):
-            proxy = self.symbol("init_nsproxy", "nsproxy")
-            if proxy.mnt_ns:
-                ns_tasks.setdefault(int(proxy.mnt_ns), self.init)
-        for address, task in ns_tasks.items():
-            ns = self.obj("mnt_namespace", address)
-            def mounts():
-                for mount in self.bounded(ns.get_mount_points()):
-                    self.read("mount", mount, lambda m=mount: self.mount_record(m, task))
-            self.read("mount namespace", ns, mounts)
-        # The global hash path can reach mounts not associated with observed tasks.
-        if self.kernel.has_symbol("mount_hashtable"):
-            def global_mounts():
-                hlist = self.kernel.has_symbol("m_hash_mask")
-                count = int(self.symbol("m_hash_mask", "unsigned int")) + 1 if hlist else self.layer.page_size // self.kernel.get_type("list_head").size
-                if not 0 < count <= LIMIT or count & (count - 1):
-                    raise Incomplete("Invalid/over-limit mount hash size")
-                address = int(self.symbol("mount_hashtable", "pointer"))
-                if not address:
-                    raise ValueError("NULL mount hash pointer")
-                typename = "mount" if self.kernel.has_type("mount") else "vfsmount"
-                bucket_type = "hlist_head" if hlist else "list_head"
-                width = self.kernel.get_type(bucket_type).size
-                for index in range(count):
-                    head = self.obj(bucket_type, address + index * width)
-                    def bucket():
-                        for mount in self.walk(head, typename, "mnt_hash", hlist=hlist):
-                            self.read("global mount", mount, lambda m=mount: self.mount_record(m))
-                    self.read("mount hash bucket", head, bucket)
-            self.read("global mount table", "mount_hashtable", global_mounts)
-        # Global superblocks are an independent VFS/page-cache entry point.
-        if self.kernel.has_symbol("super_blocks"):
-            def superblocks():
-                for sb in self.walk(self.symbol("super_blocks", "list_head"), "super_block", "s_list"):
-                    self.superblocks[sb.vol.offset] = sb
-            self.read("super_blocks", "super_blocks", superblocks)
+            if not (row.get("comm") or "").startswith("containerd-shim"):
+                continue
+            def decode():
+                args = self.argv(task)
+                cid, namespace = shim_arguments(args)
+                record = {"task": row["address"], "pid": row["pid"], "container_id": cid,
+                    "runtime_namespace": namespace, "argv": args,
+                    "attributed": namespace == "moby" or cid in known, "direct_children": []}
+                self.report["shims"].append(record)
+                if record["attributed"]:
+                    shims[address] = record
+            self.read("shim identity", task, decode)
+        for row in self.report["tasks"]:
+            shim = shims.get(row.get("real_parent"))
+            if shim is None:
+                continue
+            cid = shim["container_id"]
+            shim["direct_children"].append(row["address"])
+            row["direct_shim"] = {"task": shim["task"], "pid": shim["pid"], "container_id": cid}
+            if row["container_ids"] and row["container_ids"] != [cid]:
+                row["identity_conflicts"].append({"source": "shim", "container_id": cid,
+                    "reason": "direct shim ID disagrees with cgroup IDs"})
+            else:
+                row["container_ids"] = [cid]
+                row["identity_sources"].append("shim_direct_child")
 
-    def recover_file(self, inode, path, cid, filename):
+
+    def mount_namespace(self, task, entity=None):
+        if not task.nsproxy or not task.nsproxy.mnt_ns:
+            return None
+        return self.namespace(task.nsproxy.mnt_ns, "mnt", entity)
+
+
+    def bind_mount_record(self, mount, task, ns):
+        path = linux.LinuxUtilities.get_path_mnt(task, mount)
+        if path not in ("/etc/hosts", "/etc/hostname", "/etc/resolv.conf"):
+            return
+        root = mount.get_mnt_root().dereference()
+        parts, seen, current = [], set(), root
+        while True:
+            address = self.address(current)
+            if address in seen or len(seen) >= LIMIT:
+                raise Incomplete("Dentry parent cycle/budget")
+            seen.add(address)
+            name = current.d_name.name_as_str()
+            if name not in ("", "/"):
+                parts.append(name)
+            if int(current.d_parent) == current.vol.offset:
+                break
+            current = current.d_parent.dereference()
+        source = "/" + "/".join(reversed(parts))
+        match = BIND_ID.search(source)
+        if not match or match[2] != path.rsplit("/", 1)[-1]:
+            return
+        self.report["mounts"].append({"address": hex(self.address(mount)), "namespace": ns,
+            "path": path, "source_path": source, "container_id": match[1], "location": self.location(mount)})
+
+
+    def collect_mount_identity(self):
+        unknown = [r for r in self.report["tasks"] if not r["container_ids"]]
+        if not unknown or self.init is None:
+            return
+        host = self.read("host mount namespace", self.init, lambda: self.mount_namespace(self.init, "host"))
+        if host is None:
+            self.issue("mount identity scope", "host", Incomplete("Host mount namespace unavailable; fallback skipped"))
+            return
+        members = {}
+        for address, task in self.tasks.items():
+            row = self.task_rows[address]
+            ns = self.read("task mount namespace", task, lambda t=task: self.mount_namespace(t))
+            if ns:
+                row["namespaces"]["mnt"] = ns
+                members.setdefault(ns["address"], []).append(row)
+        for ns, rows in members.items():
+            unresolved = [r for r in rows if not r["container_ids"]]
+            if not unresolved or ns == host["address"]:
+                continue
+            prior_ids = {cid for r in rows for cid in r["container_ids"]}
+            if len(prior_ids) > 1:
+                continue  # Shared namespace with conflicting membership is not an ID fallback.
+            task = self.tasks[int(unresolved[0]["address"], 16)]
+            start, errors = len(self.report["mounts"]), len(self.report["errors"])
+            def scan():
+                namespace = self.obj("mnt_namespace", int(ns, 16))
+                for mnt in self.bounded(namespace.get_mount_points()):
+                    self.read("standard bind mount", mnt, lambda m=mnt: self.bind_mount_record(m, task, ns))
+            self.read("mount identity namespace", ns, scan)
+            evidence = self.report["mounts"][start:]
+            ids = {r["container_id"] for r in evidence}
+            if not ids:
+                continue
+            if len(ids) != 1 or (prior_ids and ids != prior_ids):
+                for row in unresolved:
+                    row["identity_conflicts"].append({"source": "mounts", "ids": sorted(ids | prior_ids),
+                        "reason": "standard bind mounts / namespace identities disagree"})
+                continue
+            if len(self.report["errors"]) != errors:
+                continue  # An incomplete namespace can conceal conflicting bind sources.
+            for row in unresolved:
+                row["container_ids"] = sorted(ids)
+                row["identity_sources"].append("standard_bind_mount")
+                row["identity_mounts"] = [r["address"] for r in evidence]
+
+
+    def collect_identity(self):
+        if not self.tasks:
+            self.skipped["identity"] = "No observed process leaders to attribute"
+            return
+        self.read("direct shim discovery", "tasks", self.collect_shims)
+        self.read("conditional mount identity", "tasks", self.collect_mount_identity)
+
+
+    def collect_selection(self):
+        groups = {}
+        for row in self.report["tasks"]:
+            for cid in row["container_ids"]:
+                if CID.fullmatch(cid):
+                    groups.setdefault(cid, []).append(row)
+        for cid, rows in sorted(groups.items()):
+            representative, selection = select_representative(rows, cid)
+            conflicts = [{"task": r["address"], **conflict}
+                         for r in rows for conflict in r["identity_conflicts"]]
+            obj = {"id": cid, "task_addresses": [r["address"] for r in rows],
+                "representative_task": representative["address"] if representative else None,
+                "representative_selection": selection, "representative": None,
+                "configured_privileged": None, "settings_refs": [],
+                "sources": sorted({source for r in rows for source in r["identity_sources"]}),
+                "conflicts": conflicts, "association": "CONFLICT" if conflicts else "TASK_LINKED_CANDIDATE"}
+            self.containers[cid] = obj
+            self.report["containers"].append(obj)
+
+
+    def collect_details(self):
+        if not self.containers:
+            self.skipped["details"] = "No task-linked container candidates"
+            return
+        for obj in self.containers.values():
+            address = obj["representative_task"]
+            if address is None:
+                continue
+            task, row = self.tasks[int(address, 16)], self.task_rows[int(address, 16)]
+            record = {"address": address, "pid": row["pid"], "comm": row["comm"],
+                "process_start": self.read("representative start time", task, lambda: self.process_start(task)),
+                "effective_uid": None, "effective_caps": None}
+            obj["representative"] = record
+            def credentials():
+                if not task.has_member("cred") or not task.cred:
+                    raise Unsupported("Representative credentials unavailable")
+                cred = task.cred.dereference()
+                record["credential_location"] = self.location(cred)
+                def effective_uid():
+                    value = cred.member("euid")
+                    return int(value.val) if value.has_member("val") else int(value)
+                record["effective_uid"] = self.read("cred.euid", cred, effective_uid)
+                record["effective_caps"] = self.read("cred.cap_effective", cred,
+                    lambda: hex(capability_mask(cred.cap_effective)))
+            self.read("representative credentials", task, credentials)
+
+
+    def settings_roots(self):
+        """Mounted filesystems reachable from the host; no global VFS/hash scan."""
+        if self.init is None:
+            raise Incomplete("Host task unavailable for settings")
+        ns = self.mount_namespace(self.init, "host")
+        if ns is None:
+            raise Incomplete("Host mount namespace unavailable for settings")
+        roots = {}
+        namespace = self.obj("mnt_namespace", int(ns["address"], 16))
+        def scan():
+            for mount in self.bounded(namespace.get_mount_points()):
+                def root():
+                    sb = mount.get_mnt_sb().dereference()
+                    if sb.s_root:
+                        roots[self.address(sb)] = sb.s_root.dereference()
+                self.read("settings filesystem root", mount, root)
+        self.read("settings mount namespace", namespace, scan)
+        return list(roots.values())
+
+
+    def collect_settings(self):
+        if not self.containers:
+            self.skipped["settings"] = "No task-linked IDs; hostconfig recovery not requested"
+            return
+        seen, files = set(), set()
+        scope = {"container_ids": sorted(self.containers), "dentries_visited": 0,
+                 "source": "host-mounted filesystem roots; matching hostconfig.json only",
+                 "roots": 0}
+        self.report["settings_scope"] = scope
+        roots = self.read("settings roots", "host", self.settings_roots, [])
+        scope["roots"] = len(roots)
+        for root in roots:
+            def scan():
+                pending = [(root, "")]
+                while pending:
+                    dentry, path = pending.pop()
+                    address = self.address(dentry)
+                    if address in seen:
+                        continue
+                    if len(seen) >= LIMIT:
+                        raise Incomplete("Settings dentry traversal budget")
+                    seen.add(address)
+                    scope["dentries_visited"] = len(seen)
+                    directory_id = SETTINGS_DIR.search(path)
+                    if directory_id and directory_id[1] not in self.containers:
+                        continue
+                    match = SETTINGS_FILE.search(path)
+                    if match and match[1] in self.containers and dentry.d_inode:
+                        inode = dentry.d_inode.dereference()
+                        key = (int(dentry.d_inode), path)
+                        if key not in files:
+                            files.add(key)
+                            self.read("hostconfig inode", inode,
+                                lambda: self.recover_privileged(inode, path, match[1]))
+                        continue
+                    def children():
+                        for child in self.bounded(dentry.get_subdirs()):
+                            name = self.read("settings dentry name", child, lambda ch=child: ch.d_name.name_as_str())
+                            if name and name not in (".", ".."):
+                                if directory_id and "/" not in path[directory_id.end():] and name != "hostconfig.json":
+                                    continue
+                                pending.append((child, path + "/" + name))
+                    self.read("settings dentries", dentry, children)
+            self.read("hostconfig search", root, scan)
+        self.merge_settings()
+
+
+    def merge_settings(self):
+        for cid, obj in self.containers.items():
+            rows = [(i, r) for i, r in enumerate(self.report["cached_settings"]) if r["container_id"] == cid]
+            obj["settings_refs"] = [i for i, _ in rows]
+            values = {r["privileged"] for _, r in rows
+                      if type(r.get("privileged")) is bool and not r.get("identity_conflict")}
+            conflicts = [{"source": "hostconfig", "index": i, "reason": "Path/JSON IDs disagree"}
+                         for i, r in rows if r.get("identity_conflict")]
+            if len(values) > 1:
+                conflicts.append({"source": "hostconfig", "field": "Privileged", "values": sorted(values),
+                                  "reason": "Recovered settings disagree"})
+            obj["configured_privileged"] = next(iter(values)) if len(values) == 1 and not conflicts else None
+            obj["conflicts"].extend(conflicts)
+            if rows and "hostconfig" not in obj["sources"]:
+                obj["sources"].append("hostconfig")
+            if obj["conflicts"]:
+                obj["association"] = "CONFLICT"
+
+
+    def collect(self):
+        for stage in STAGES:
+            self.stage_run(stage, getattr(self, "collect_" + stage))
+        return self.report
+
+
+    def read_vmemmap_base(self):
+        """Read the declared unsigned word, or its ABI layout if untyped.
+
+        The framework's native pointer format supplies width and byte order;
+        compiler-specific C integer type names are never looked up. An invalid
+        declared type or an unreadable value must not trigger the untyped path.
+        """
+        word = self.kernel.get_type("pointer").vol.data_format
+        if word.signed or word.length * 8 != self.layer.bits_per_register:
+            raise Unsupported("Native pointer layout disagrees with the kernel layer")
+        symbol = self.kernel.get_symbol("vmemmap_base")
+        template = symbol.type
+        if template is not None:
+            if isinstance(template, objects.templates.ReferenceTemplate):
+                template = self.context.symbol_space.get_type(template.vol.type_name)
+            if (not issubclass(template.vol.object_class, objects.Integer)
+                    or issubclass(template.vol.object_class, objects.Pointer)
+                    or template.size != word.length or template.vol.data_format != word):
+                raise Unsupported("vmemmap_base is not an unsigned native-width integer")
+            base = int(self.kernel.object_from_symbol("vmemmap_base"))
+        else:
+            # Some ISFs provide global addresses without variable types. Only
+            # this known address-valued global uses the native-word fallback.
+            address = self.layer.canonicalize(
+                self.kernel.get_absolute_symbol_address("vmemmap_base") & self.layer.address_mask)
+            raw = self.layer.read(address, word.length, pad=False)
+            if len(raw) != word.length:
+                raise Incomplete("Incomplete vmemmap_base value")
+            base = int.from_bytes(raw, byteorder=word.byteorder, signed=False)
+        if not base or self.layer.canonicalize(base & self.layer.address_mask) != base:
+            raise ValueError("Invalid vmemmap_base address")
+        return base
+
+
+    def recover_privileged(self, inode, path, cid):
+        if cid not in self.containers:
+            return
+        filename = "hostconfig.json"
         row = {"path": path, "container_id": cid, "filename": filename, "inode": hex(inode.vol.offset),
                "location": self.location(inode), "pages": [], "holes": [], "json_parse": "NOT FOUND"}
-        self.report["cached_files"].append(row)
+        self.report["cached_settings"].append(row)
         size = int(inode.i_size)
         if not 0 < size <= FILE_LIMIT:
             raise Incomplete("Empty/over-limit metadata inode")
@@ -982,9 +865,7 @@ class Collector:
                     if not 0 <= offset < size:
                         raise ValueError("Cached page outside inode")
                     if self.kernel.has_symbol("vmemmap_base") and self.kernel.has_symbol("mem_section"):
-                        # BTF ISFs can omit global variable types. Read the verified
-                        # pointer-sized vmemmap base explicitly, without patching core.
-                        base = int(self.symbol("vmemmap_base", "unsigned long"))
+                        base = self.read_vmemmap_base()
                         address = self.layer.canonicalize(page.vol.offset)
                         width = self.kernel.get_type("page").size
                         if address < base or (address - base) % width:
@@ -1025,274 +906,59 @@ class Collector:
                 data = prefix_json(bytes(prefix))
                 row["json_parse"] = "PARTIAL"
                 self.issue("metadata JSON", inode, Incomplete(str(exc)))
-            row["object"] = data
             embedded = data.get("ID")
             row["identity_conflict"] = embedded is not None and embedded != cid
             if row["identity_conflict"]:
                 self.issue("metadata identity", inode, ValueError("Path and JSON ID disagree"))
 
-    def collect_page_cache(self):
-        if not self.superblocks and self.kernel.has_symbol("super_blocks"):
-            for sb in self.walk(self.symbol("super_blocks", "list_head"), "super_block", "s_list"):
-                self.superblocks[sb.vol.offset] = sb
-        seen, metadata = set(), set()
-        for sb in self.superblocks.values():
-            def scan():
-                if not sb.s_root:
-                    return
-                pending = [(sb.s_root.dereference(), "")]
-                while pending:
-                    dentry, path = pending.pop()
-                    address = self.address(dentry)
-                    if address in seen:
-                        continue
-                    if len(seen) >= LIMIT:
-                        raise Incomplete("Global dentry budget")
-                    seen.add(address)
-                    match = FILE_ID.search(path)
-                    if match and dentry.d_inode:
-                        inode = dentry.d_inode.dereference()
-                        key = (int(dentry.d_inode), path)
-                        if key not in metadata:
-                            metadata.add(key)
-                            self.read("metadata inode", inode, lambda: self.recover_file(inode, path, match[1], match[2]))
-                    def children():
-                        for child in self.bounded(dentry.get_subdirs()):
-                            name = self.read("dentry name", child, lambda ch=child: ch.d_name.name_as_str())
-                            if name and name not in (".", ".."):
-                                pending.append((child, path + "/" + name))
-                    self.read("dentry children", dentry, children)
-            self.read("superblock dentries", sb, scan)
-        self.report["page_cache_scope"] = {"dentries_visited": len(seen), "superblocks": len(self.superblocks),
-                                          "path_scope": "relative to each superblock root; data-root is not hardcoded"}
-
-    def argv(self, task):
-        if not task.mm:
-            return []
-        start, end = int(task.mm.arg_start), int(task.mm.arg_end)
-        if not 0 <= end - start <= FILE_LIMIT:
-            raise Incomplete("Command line length outside budget")
-        layer_name = task.add_process_layer()
-        if layer_name is None:
-            raise Incomplete("No process address space")
-        return self.context.layers[layer_name].read(start, end - start).decode("utf-8", errors="replace").rstrip("\0").split("\0")
-
-    def collect_runtime(self):
-        process_error_start = len(self.report["errors"])
-        shims = {}
-        for address, task in self.tasks.items():
-            row = self.task_rows[address]
-            if row.get("pid") != row.get("tgid"):
-                continue
-            comm = row.get("comm") or ""
-            if not (comm in ("dockerd", "containerd") or comm.startswith("containerd-shim") or row["container_ids"]):
-                continue
-            args = self.read("runtime argv", task, lambda t=task: self.argv(t), [])
-            row["argv"] = args
-            ppid = self.task_rows.get(row.get("real_parent"), {}).get("pid")
-            record = {"task": row["address"], "pid": row["pid"], "comm": comm, "argv": args,
-                      "parent": row.get("real_parent"), "ppid": ppid, "container_ids": list(row["container_ids"])}
-            self.report["runtime_processes"].append(record)
-            if comm.startswith("containerd-shim"):
-                flags = {a: args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-id", "--id", "-namespace", "--namespace")}
-                cid = flags.get("-id", flags.get("--id"))
-                namespace = flags.get("-namespace", flags.get("--namespace"))
-                record.update(runtime_namespace=namespace, shim_id=cid if cid and CID.fullmatch(cid) else None)
-                if record["shim_id"]:
-                    shims[address] = (cid, namespace)
-        known = {cid for row in self.report["tasks"] for cid in row["container_ids"]}
-        known.update(r["container_id"] for r in self.report["cached_files"] if not r.get("identity_conflict"))
-        for record in self.report["runtime_processes"]:
-            cid = record.get("shim_id")
-            if cid and (record.get("runtime_namespace") == "moby" or cid in known):
-                record["container_ids"] = sorted(set(record["container_ids"] + [cid]))
-                record["docker_attribution"] = "moby namespace" if record.get("runtime_namespace") == "moby" else "matching independent Docker evidence"
-        for row in self.report["tasks"]:
-            parent, seen = row.get("real_parent"), set()
-            while parent in self.task_rows and parent not in seen and len(seen) < LIMIT:
-                seen.add(parent)
-                if parent in shims:
-                    cid, namespace = shims[parent]
-                    row["shim_candidate"] = cid
-                    if namespace == "moby" or cid in known:
-                        if row["container_ids"] and cid not in row["container_ids"]:
-                            row["identity_conflict"] = True
-                        else:
-                            row["container_ids"] = sorted(set(row["container_ids"] + [cid]))
-                    break
-                parent = self.task_rows[parent].get("real_parent")
-        recorded = {r["task"] for r in self.report["runtime_processes"]}
-        for address, row in self.task_rows.items():
-            if row["container_ids"] and row.get("pid") == row.get("tgid") and row["address"] not in recorded:
-                task = self.tasks[address]
-                row["argv"] = self.read("associated process argv", task, lambda t=task: self.argv(t), [])
-                record = {"task": row["address"], "pid": row["pid"], "comm": row.get("comm"), "argv": row["argv"],
-                          "parent": row.get("real_parent"), "ppid": self.task_rows.get(row.get("real_parent"), {}).get("pid"),
-                          "container_ids": row["container_ids"], "association": "shim ancestry candidate"}
-                self.report["runtime_processes"].append(record)
-        self.report["runtime_process_coverage"] = {
-            "completed_without_errors": len(self.report["errors"]) == process_error_start and self.report["coverage"]["tasks"]["completed_without_errors"],
-            "scope": "reachable task inventory and selected runtime command lines; excludes heap scan"}
-        for address, task in self.tasks.items():
-            row = self.task_rows[address]
-            if row.get("comm") == "dockerd" and row.get("pid") == row.get("tgid"):
-                self.read("dockerd heap", task, lambda t=task: collect_heap(self, t))
-
-    def correlate(self):
-        def entry(cid):
-            if not CID.fullmatch(cid):
-                raise ValueError("Invalid container ID")
-            return self.containers.setdefault(cid, {"id": cid, "tasks": [], "cgroups": [], "mounts": [], "shims": [],
-                "cached_files": [], "heap_candidates": [], "conflicts": [], "sources": []})
-        for row in self.report["mounts"]:
-            ns = row.get("namespace")
-            if ns and ns != self.host_ns.get("mnt", {}).get("address"):
-                members = [t for t in self.report["tasks"] if t["namespaces"].get("mnt", {}).get("address") == ns]
-                ids = {cid for t in members for cid in t["container_ids"]}
-                row["namespace_container_candidates"] = sorted(ids)
-                row["container_ids"] = sorted(set(row.get("container_ids", [])) | ids)
-        for field, rows, id_field in (("tasks", self.report["tasks"], "container_ids"),
-                                     ("cgroups", self.report["cgroups"], "container_ids"),
-                                     ("mounts", self.report["mounts"], "container_ids")):
-            for row in rows:
-                for cid in row.get(id_field, []):
-                    obj = entry(cid)
-                    obj[field].append(row["address"])
-                    if field not in obj["sources"]:
-                        obj["sources"].append(field)
-                    if row.get("identity_conflict"):
-                        obj["conflicts"].append({"source": field, "address": row["address"], "reason": "cgroup/ancestry IDs differ"})
-        for index, row in enumerate(self.report["cached_files"]):
-            obj = entry(row["container_id"])
-            obj["cached_files"].append(index)
-            if "page_cache" not in obj["sources"]:
-                obj["sources"].append("page_cache")
-            if row.get("identity_conflict"):
-                obj["conflicts"].append({"source": "page_cache", "inode": row["inode"], "reason": "path/JSON IDs differ"})
-        for index, row in enumerate(self.report["runtime_heap"]):
-            obj = entry(row["container_id"])
-            obj["heap_candidates"].append(index)
-            if "runtime_heap" not in obj["sources"]:
-                obj["sources"].append("runtime_heap")
-        for index, row in enumerate(self.report["runtime_processes"]):
-            if row.get("shim_id") and row.get("docker_attribution"):
-                obj = entry(row["shim_id"])
-                obj["shims"].append(index)
-                if "shim" not in obj["sources"]:
-                    obj["sources"].append("shim")
-        for cid, obj in self.containers.items():
-            tasks = [self.task_rows[int(a, 16)] for a in obj["tasks"]]
-            leaders = [t for t in tasks if t.get("pid") == t.get("tgid")]
-            obj["processes"] = [{k: t.get(k) for k in ("address", "pid", "tgid", "namespace_tid", "comm", "argv", "process_start", "effective_uid", "effective_caps", "identity_conflict")} for t in leaders]
-            states, metadata = [], []
-            for index in obj["cached_files"]:
-                r = self.report["cached_files"][index]
-                if r.get("object") and not r.get("identity_conflict"):
-                    metadata.append({"source": "page_cache", "index": index, "value": r["object"], "complete": r.get("complete", False)})
-                    if isinstance(r["object"].get("State"), dict):
-                        states.append({"source": "page_cache", "index": index, "value": r["object"]["State"]})
-            for index in obj["heap_candidates"]:
-                r = self.report["runtime_heap"][index]
-                states.append({"source": "heap_candidate", "index": index, "value": r["state"]})
-            obj["metadata"], obj["state_observations"] = metadata, states
-            for name in ("Running", "Paused", "Restarting", "Dead", "RemovalInProgress", "Pid", "ExitCode"):
-                values = {json.dumps(s["value"][name], sort_keys=True) for s in states if s["value"].get(name) is not None}
-                if len(values) > 1:
-                    obj["conflicts"].append({"field": name, "values": sorted(values), "reason": "metadata sources disagree"})
-            observed_pids = {t["pid"] for t in leaders if t.get("pid") is not None}
-            obj["pid_comparisons"] = [{"source": s["source"], "index": s["index"], "runtime_pid": s["value"].get("Pid"),
-                "matches_observed_task": s["value"]["Pid"] in observed_pids if s["value"]["Pid"] > 0 else None,
-                "comparison": "observed task PID" if s["value"]["Pid"] > 0 else "N/A: runtime PID is zero/nonpositive"}
-                for s in states if type(s["value"].get("Pid")) is int]
-            obj["association"] = "CONFLICT" if obj["conflicts"] else "TASK_LINKED_CANDIDATE" if leaders else "ARTIFACT_ONLY_CANDIDATE"
-            obj["shim_ancestry"] = [
-                {"task": t["address"], "shim_id": t["shim_candidate"],
-                 "matches_container_id": t["shim_candidate"] == cid}
-                for t in leaders if t.get("shim_candidate")]
-        self.report["containers"] = list(self.containers.values())
-        self.report["correlation_policy"] = "Full IDs group evidence for display; duplicate/stale heap instances and conflicts remain separate observations. PID/ns/ancestry alone is not a Docker verdict."
-
-    def collect(self):
-        for stage, fn in zip(STAGES, (self.collect_tasks, self.collect_namespaces, self.collect_cgroups,
-                                     self.collect_mounts, self.collect_page_cache, self.collect_runtime)):
-            self.stage_run(stage, fn)
-        self.stage = "correlation"
-        self.correlate()
-        return self.report
-
-
-def presentation(report):
-    """Prepare process records without changing the collected evidence."""
-    columns = ["Container ID", "Name", "Host PID", "NS PID", "Command", "Process Start UTC",
-               "Created UTC", "Runtime State Evidence", "Configured Privileged", "Effective UID",
-               "Effective Caps", "Association", "Sources"]
-    rows = []
-    def joined(values):
-        values = sorted({str(v) for v in values if v is not None and v != ""})
-        return "; ".join(values) if values else "-"
-    for obj in sorted(report["containers"], key=lambda r: r["id"]):
-        processes = obj["processes"]
-        states = []
-        for evidence in obj["state_observations"]:
-            fields = evidence["value"]
-            pairs = [f"{k}={fields[k]}" for k in RUNTIME_STATE_FIELDS if fields.get(k) is not None]
-            states.append(evidence["source"] + ": " + ",".join(pairs))
-        names = [m["value"].get("Name") for m in obj["metadata"]]
-        names.extend(report["runtime_heap"][i].get("name") for i in obj["heap_candidates"])
-        for process in sorted(processes, key=lambda p: p["pid"] or 0) or [{}]:
-            rows.append((obj["id"], joined(names), joined([process.get("pid")]), joined([process.get("namespace_tid")]),
-                joined([process.get("comm")]), joined([process.get("process_start")]),
-                joined(m["value"].get("Created") for m in obj["metadata"]),
-                joined(states), joined(m["value"].get("Privileged") for m in obj["metadata"] if isinstance(m["value"].get("Privileged"), bool)),
-                joined([process.get("effective_uid")]), joined([process.get("effective_caps")]),
-                obj["association"], ",".join(obj["sources"])))
-    return [(name, str) for name in columns], [tuple(v.replace("\n", "\\n").replace("\t", "\\t") for v in row) for row in rows]
+            privileged = data.get("Privileged")
+            if "Privileged" in data and type(privileged) is not bool:
+                raise ValueError("hostconfig Privileged is not a boolean")
+            row["privileged"] = privileged if not row["identity_conflict"] else None
 
 
 def vertical_presentation(report):
-    """Render process records as category/value blocks with raw values only."""
-    columns, records = presentation(report)
-    containers = {item["id"]: item for item in report["containers"]}
+    """One category/value block per container, with raw values only."""
     rows = []
-
     def cell(value):
-        return str(value).replace("\n", "\\n").replace("\t", "\\t")
-
-    for record in records:
+        return "-" if value is None or value == "" else str(value).replace("\n", "\\n").replace("\t", "\\t")
+    for obj in sorted(report["containers"], key=lambda c: c["id"]):
         if rows:
             rows.append(("", ""))
-        for (category, _), value in zip(columns, record):
-            observations = containers[record[0]]["state_observations"]
-            if category == "Runtime State Evidence" and observations:
-                for observation in observations:
-                    rows.append((category, cell(observation["source"])))
-                    rows.extend((field, cell(observation["value"][field]))
-                                for field in RUNTIME_STATE_FIELDS
-                                if observation["value"].get(field) is not None)
-            else:
-                rows.append((category, value))
+        process = obj.get("representative") or {}
+        selection = obj["representative_selection"]
+        fields = [("Container ID", obj["id"]), ("Command", process.get("comm")),
+            ("Process Start UTC", process.get("process_start")), ("Host PID", process.get("pid")),
+            ("Effective UID", process.get("effective_uid")), ("Effective Caps", process.get("effective_caps")),
+            ("Configured Privileged", obj.get("configured_privileged")),
+            ("Representative", selection["method"] or selection["status"]),
+            ("Association", obj["association"]), ("Sources", ",".join(obj["sources"]))]
+        rows.extend((name, cell(value)) for name, value in fields)
     return [("category", str), ("value", str)], rows
 
 
 class Ps(interfaces.plugins.PluginInterface):
-    """Inventory Docker processes and residual evidence as category/value blocks."""
+    """Summarize task-linked Docker containers and representative credentials."""
     _required_framework_version = (2, 28, 0)
-    _version = (1, 4, 0)
+    _version = (1, 5, 1)
 
     @classmethod
     def get_requirements(cls):
         return [requirements.ModuleRequirement(name="kernel", description="Linux kernel", architectures=["Intel32", "Intel64"]),
-                requirements.BooleanRequirement(name="ps", description="Collect all six analysis layers and list container candidates", optional=True, default=False)]
+                requirements.BooleanRequirement(name="ps", description="One summary per task-linked Docker container", optional=True, default=False)]
 
     def run(self):
         if not self.config.get("ps", False):
-            raise exceptions.VolatilityException("Select --ps to run the container inventory")
+            raise exceptions.VolatilityException("Select --ps to run the container summary")
         report = Collector(self.context, self.config["kernel"]).collect()
         with self.open("ps_evidence.json") as output:
             output.write(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
         if report["errors"]:
-            vollog.warning("ps: %d collection issues; review coverage and evidence in ps_evidence.json", len(report["errors"]))
+            vollog.warning("ps: %d collection issues; review coverage in ps_evidence.json", len(report["errors"]))
+        unresolved = sum(c["representative"] is None for c in report["containers"])
+        if unresolved:
+            vollog.warning("ps: %d container candidates have no unambiguous representative", unresolved)
         if not report["containers"]:
-            vollog.warning("ps: no attributed candidates in searched memory; see coverage in ps_evidence.json")
+            vollog.warning("ps: no task-linked Docker candidates in the searched process list; review coverage")
         columns, rows = vertical_presentation(report)
         return renderers.TreeGrid(columns, ((0, row) for row in rows))
