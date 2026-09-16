@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'src' / 'network_analysis'
 TARGET = ROOT / 'src' / 'plugins' / 'inspect_networks.py'
-MODULES = ('identity','topology','sockets','routes','neighbors','conntrack','multicast','presentation','collector','plugin')
+MODULES = ('identity','sockets','conntrack','context','collector','views','plugin')
 
 
 def build():
@@ -28,8 +28,6 @@ def build():
         def visit_Name(self,node):
             if node.id in functions[self.module]:
                 node.id=self.module+'_'+node.id
-            elif self.module=='plugin' and node.id=='table':
-                node.id='presentation_table'
             return node
         def visit_Attribute(self,node):
             if isinstance(node.value,ast.Name) and node.value.id in functions and node.attr in functions[node.value.id]:

@@ -38,6 +38,11 @@ def tuple_data(c, value):
 
 def collect(c, unsupported):
     rows = []
+    required = ('hlist_nulls_head', 'nf_conntrack_tuple_hash', 'nf_conn')
+    missing = [name for name in required if not c.kernel.has_type(name)]
+    if missing:
+        unsupported.append({'feature': 'conntrack', 'reason': 'ISF types absent: ' + ', '.join(missing)})
+        return rows
     names = ('nf_conntrack_hash', 'nf_conntrack_htable_size')
     found = symbols(c, names)
     if any(n not in found for n in names):
@@ -46,6 +51,8 @@ def collect(c, unsupported):
     def scan():
         address = int(c.obj('pointer', found[names[0]]))
         count = int(c.obj('unsigned int', found[names[1]]))
+        if not address or count <= 0:
+            raise ValueError('NULL conntrack hash or nonpositive bucket count')
         heads = c.array(address, 'hlist_nulls_head', count)
         entry_offset = c.kernel.get_type('nf_conntrack_tuple_hash').relative_child_offset('hnnode')
         tuples_offset = c.kernel.get_type('nf_conn').relative_child_offset('tuplehash')
@@ -68,8 +75,18 @@ def collect(c, unsupported):
                         continue
                     all_seen.add(ct.vol.offset)
                     def record():
+                        namespace = c.net_pointer(ct.ct_net)
+                        if not namespace:
+                            raise ValueError('NULL conntrack namespace')
+                        if hex(namespace) not in c.context_namespaces:
+                            return
                         status = int(ct.status)
-                        rows.append({'address': hex(ct.vol.offset), 'namespace': hex(int(ct.ct_net.net)),
+                        original, reply = ct.tuplehash[0].tuple, ct.tuplehash[1].tuple
+                        if (int(original.dst.dir), int(reply.dst.dir)) != (0, 1):
+                            raise ValueError('conntrack tuple direction pair mismatch')
+                        if (int(original.src.l3num), int(original.dst.protonum)) != (int(reply.src.l3num), int(reply.dst.protonum)):
+                            raise ValueError('conntrack tuple family/protocol mismatch')
+                        rows.append({'address': hex(ct.vol.offset), 'namespace': hex(namespace),
                                      'original': tuple_data(c, ct.tuplehash[0].tuple), 'reply': tuple_data(c, ct.tuplehash[1].tuple),
                                      'status': status, 'snat': bool(status & (1 << 4)), 'dnat': bool(status & (1 << 5)),
                                      'source': 'nf_conntrack_hash -> tuplehash -> nf_conn', 'confidence': 'hashed_flow_object',
