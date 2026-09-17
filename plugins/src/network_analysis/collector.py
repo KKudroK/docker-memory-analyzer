@@ -130,26 +130,57 @@ class Collector:
             node = parent.dereference()
 
     def append_tasks(self, iterator, seen):
-        """Consume a stock task iterator with a bounded output and address deduplication."""
+        """Consume a stock task iterator with a bounded output and deduplication by PID."""
         for count, task in enumerate(iterator):
             if count >= self.limit:
                 raise ValueError('task iterator output budget exceeded')
-            address = int(task.vol.offset)
-            if address not in seen:
-                seen.add(address)
+            pid = int(task.pid)
+            if pid not in seen:
+                seen.add(pid)
                 self.tasks.append(task)
 
     def discover_tasks(self):
-        """Reuse stock process discovery; isolate each leader's thread enumeration."""
+        """Reuse stock process discovery; supplement with psscan for unlinked tasks."""
         self.tasks = []
         seen = set()
         leaders = pslist.PsList.list_tasks(self.context, self.kernel.name, include_threads=False)
         self.read('tasks.list', 'PsList.list_tasks', self.append_tasks, args=(leaders, seen))
+        try:
+            from volatility3.plugins.linux import psscan
+            hidden_leaders = psscan.PsScan.scan_tasks(self.context, self.kernel.name, self.kernel.layer_name)
+            self.read('tasks.psscan', 'PsScan.scan_tasks', self.append_tasks, args=(hidden_leaders, seen))
+        except Exception:
+            pass
         for leader in list(self.tasks):
             self.read('tasks.threads', leader, self.append_thread_tasks, args=(leader, seen))
 
     def append_thread_tasks(self, leader, seen):
         self.append_tasks(leader.get_threads(), seen)
+
+    def collect_namespaces(self):
+        """Find all network namespaces using net_namespace_list."""
+        seen_nets = set()
+        self.nets = {}
+        if self.kernel.has_symbol('net_namespace_list'):
+            list_head_addr = self.kernel.get_symbol('net_namespace_list').address
+            list_head = self.obj('list_head', list_head_addr)
+            def add_net(net):
+                addr = int(net.vol.offset)
+                if addr not in self.nets:
+                    inode = self.read('net.inum', net, lambda: int(net.ns.inum))
+                    self.nets[addr] = {'address': hex(addr), 'inode': inode, 'object': net}
+            try:
+                for net in self.walk(list_head, 'net', 'list'):
+                    self.read('net', net, add_net, args=(net,))
+            except Exception as exc:
+                self.issue('net_namespace_list', list_head, exc)
+        if self.kernel.has_symbol('init_net'):
+            init_net_addr = self.kernel.get_symbol('init_net').address
+            if init_net_addr not in self.nets:
+                init_net = self.obj('net', init_net_addr)
+                inode = self.read('net.inum', init_net, lambda: int(init_net.ns.inum))
+                self.nets[init_net_addr] = {'address': hex(init_net_addr), 'inode': inode, 'object': init_net}
+        self.init_net_address = hex(self.kernel.get_symbol('init_net').address) if self.kernel.has_symbol('init_net') else None
 
     def collect_tasks(self):
         self.discover_tasks()
@@ -259,14 +290,18 @@ class Collector:
         features = {'sockets'} if features is None else set(features)
         if not features <= {'sockets', 'interfaces', 'conntrack'}:
             raise ValueError('Unknown collection features')
-        if self.kernel.has_symbol('init_net'):
-            initial = self.read('net.init', 'init_net', self.kernel.object_from_symbol,
-                                args=('init_net',))
-            if initial is not None:
-                self.init_net_address = hex(initial.vol.offset)
-                self.namespace(initial, 'init_net')
+        self.collect_namespaces()
         tasks = self.collect_tasks()
         identity.collect(self, tasks)
+        for task in self.tasks:
+            proxy = self.read('task.nsproxy', task, lambda: task.nsproxy.dereference() if task.nsproxy else None)
+            if proxy:
+                net = self.read('nsproxy.net_ns', proxy, lambda: proxy.net_ns.dereference() if proxy.net_ns else None)
+                if net:
+                    addr = int(net.vol.offset)
+                    if addr not in self.nets:
+                        inode = self.read('net.inum', net, lambda: int(net.ns.inum))
+                        self.nets[addr] = {'address': hex(addr), 'inode': inode, 'object': net}
         members = {task.get('namespace') for task in tasks if identity.member_id(task)}
         unsupported = []
         for ns in self.nets.values():

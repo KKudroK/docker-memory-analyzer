@@ -71,18 +71,15 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
 
     def _log_diagnostics(self, report):
         for error in report.get('errors', []):
-            vollog.warning('Parse error stage=%s object=%s type=%s detail=%s affected_holders=%s',
+            vollog.debug('Parse error stage=%s object=%s type=%s detail=%s affected_holders=%s',
                            error['stage'], error['address'], error['error'], error['detail'],
                            error.get('affected_holders', []))
         for item in report.get('unsupported', []):
-            requested = report.get('metadata', {}).get('requested_features', [])
-            log = (vollog.warning if item['feature'] in requested or
-                   item['feature'] == 'container_namespace_context' or 'all_supported' in requested else vollog.debug)
-            log('Unsupported feature=%s object=%s reason=%s',
+            vollog.debug('Unsupported feature=%s object=%s reason=%s',
                            item['feature'], item.get('interface', item.get('namespace', '')),
                            item['reason'])
         for address in report['container_context'].get('unresolved_tasks', []):
-            vollog.warning('Conflicting or multiple ID references for task %s; ID not assigned', address)
+            vollog.debug('Conflicting or multiple ID references for task %s; ID not assigned', address)
 
     @staticmethod
     def _columns():
