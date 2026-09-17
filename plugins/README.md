@@ -37,8 +37,13 @@ $dump = "D:\memory\memory.lime"
   inspect_mount.ContainerMounts
 ```
 
-기본 실행은 컨테이너 근거가 `HIGH` 또는 `MEDIUM`인 Mount Namespace에서
-`HIGH`와 `REVIEW` 마운트만 출력한다.
+기본 실행은 지원하는 cgroup 소속 또는 런타임 감시 프로세스 관계를 근거로
+대상을 선택하고, 선택한 대상에서 읽을 수 있는 마운트를 모두 출력한다.
+Mount Namespace가 분리됐다는 이유만으로 선택하지 않으며, 위험도 점수나
+경로 화이트리스트로 마운트 행을 걸러내지 않는다.
+
+기본 출력은 `PID`, `MNT NS`, `Container ID`, `Container Path`,
+`Host Paths`, `FS Type`, `RO/RW`의 7개 열이다.
 
 JSON으로 저장하려면 다음과 같이 실행한다.
 
@@ -52,18 +57,20 @@ JSON으로 저장하려면 다음과 같이 실행한다.
 
 | 옵션 | 기능 |
 |---|---|
-| 옵션 없음 | `HIGH`/`MEDIUM` 컨테이너 후보의 `HIGH`/`REVIEW` 마운트 출력 |
-| `--all-mounts` | 인프라 패턴으로 분류된 `INFRA` 마운트까지 출력 |
-| `--extended` | cgroup v1/v2 membership, 탐지 근거, Mount ID 등 상세 필드 출력 |
-| `--include-candidates` | Mount Namespace 분리만 확인된 `LOW` 후보도 출력 |
-| `--pids PID ...` | 지정한 Host PID를 `MANUAL` 대상으로 분석 (경로·ID 검증을 생략하지 않음) |
+| 옵션 없음 | 자동 선택한 대상의 읽을 수 있는 마운트를 기본 7개 열로 출력 |
+| `--extended` | 같은 마운트 행에 Runtime, 내부 PID, cgroup 소속, 읽기·경로 상태, Mount ID, 옵션 등 16개 상세 열 추가 |
+| `--pids PID ...` | 자동 대상 선택 대신 지정한 Host PID를 각각 분석 (경로·ID 검증은 유지) |
 
-모든 정보 확인:
+`--pids`에는 덤프 안의 양의 정수 Host PID를 1개 이상 지정한다.
+컨테이너 내부 PID가 아니며, 아래 `9933`은 실제 확인할 PID로 바꾼다.
+기존 `--all-mounts`와 `--include-candidates`는 삭제되어 사용할 수 없다.
+
+상세 정보 확인:
 
 ```powershell
 & $vol -p $plugins -s $symbols -f $dump `
   inspect_mount.ContainerMounts `
-  --all-mounts --extended --include-candidates
+  --extended
 ```
 
 특정 Host PID 확인:
@@ -71,7 +78,7 @@ JSON으로 저장하려면 다음과 같이 실행한다.
 ```powershell
 & $vol -p $plugins -s $symbols -f $dump `
   inspect_mount.ContainerMounts `
-  --pids 9933 --all-mounts --extended
+  --pids 9933 --extended
 ```
 
 ## 확인
@@ -89,15 +96,27 @@ JSON으로 저장하려면 다음과 같이 실행한다.
 & $vol -p $plugins inspect_mount.ContainerMounts -h
 ```
 
+상세 출력의 `Host Path Status`는 위험도나 신뢰도 점수가 아니라 경로 복원 상태다.
+
+| 값 | 의미 |
+|---|---|
+| `SINGLE` | 수집한 호스트 구조에서 검증된 경로가 하나 |
+| `MULTIPLE` | 검증된 경로가 여러 개 (`Host Paths`에 ` \| `로 구분) |
+| `UNRESOLVED` | 호스트 경로를 찾지 못했거나 내부 루트 항목이라 계산하지 않음 |
+| `PARTIAL` | 호스트 구조나 후보 경로를 완전히 읽지 못함. 일부 확인한 경로는 남을 수 있음 |
+
 결과 확인 시 다음을 주의한다.
 
-- `Traversal=PARTIAL`은 순회·필드·경로·전파 속성 중 일부를 완전히 읽지 못했다는 뜻이다. 원인은 덤프 누락, 심볼 불일치, 지원하지 않는 구조 등일 수 있다. 읽힌 필드는 유지하며, 항목별 실패 건수는 서로 겹칠 수 있다.
-- `Source Confidence=CONFIRMED`는 수집한 호스트 마운트 구조에서 끝까지 검증된 경로가 하나라는 뜻이다. 원래 `docker run -v`에 입력했던 문자열을 보증하지는 않는다. `AMBIGUOUS`는 검증된 경로가 여러 개, `UNKNOWN`은 전체 확인에 필요한 근거가 부족한 경우다. `UNKNOWN`에도 일부 확인된 후보 경로가 남을 수 있다.
-- `Container Path`와 `Mount Root`는 읽힌 마운트·dentry 연결 관계를 나타낸다. inode 정보가 누락되어도 연결 관계가 완전하면 표시할 수 있으므로, 이 경로만으로 현재 호스트에서 접근 가능하다고 판단하지 않는다.
-- `Cgroups`는 커널의 내부 hierarchy 기준 membership이다. cgroup namespace 기준으로 상대화된 `/proc/<pid>/cgroup` 출력이나 실제 마운트된 cgroup 모드와는 다르다. v1 사용 환경에도 내부 v2 루트 `/`가 존재할 수 있다.
-- 같은 Mount Namespace에서 ID가 충돌하면 Container ID를 비우고 근거에 충돌을 표시한다. 여러 task root가 있으면 경로는 출력된 대표 PID 기준이다.
-- `HIGH`는 우선 검토 대상, `REVIEW`는 추가 확인 대상, `INFRA`는 알려진 인프라 패턴이다. 공격 성공이나 안전성을 확정하는 판정이 아니다. `rw`/`ro`는 마운트·슈퍼블록 플래그이며 실제 접근 권한은 별도다.
-- 기본 결과가 비어 있으면 `--all-mounts --extended --include-candidates`와 경고 로그를 확인한다. 모든 행이 필터링되거나 디코드에 실패해도 경고는 남는다. JSON의 빈 배열은 마운트가 없다는 증거가 아니다.
+- `Container Path`는 출력된 PID 관점의 마운트 경로이고, `Host Paths`는 덤프의 호스트 구조에서 확인한 경로다. 원래 `docker run -v`에 입력한 문자열이나 현재 접근 가능성을 보증하지 않는다. 경로가 `-`라고 해서 마운트가 없다는 뜻은 아니다.
+- `Read Status=PARTIAL:...`은 해당 PID 관점의 마운트 순회·필드·경로 중 일부를 읽지 못했다는 뜻이다. 읽힌 값은 유지하며, 같은 관점의 행에 상태를 함께 표시한다. `COMPLETE`도 호스트 경로나 모든 파일시스템별 옵션의 복원을 보증하지 않는다.
+- `Cgroups`는 커널 내부 hierarchy 기준 소속이다. cgroup namespace 기준으로 상대화된 `/proc/<pid>/cgroup` 출력과 다를 수 있고, v1 환경에도 내부 v2 루트 `/`가 존재할 수 있다.
+- 같은 Mount Namespace라도 컨테이너 소유자나 task root가 다르면 나눠서 출력한다. 자동 모드에서 같은 관점의 대표는 가장 작은 Host PID다. cgroup ID 근거 자체가 충돌하면 ID를 `-`로 두고 `Selection Evidence`에 `cgroup-id-conflict`를 표시한다.
+- `RO/RW`의 `ro`/`rw`는 마운트·슈퍼블록 플래그 기준이며 실제 파일 접근 권한은 별도다. 필요한 플래그를 확인하지 못하면 `-`로 표시한다.
+- `Superblock Options`는 완전한 `/proc/<pid>/mountinfo` 옵션 목록이 아니다. overlay의 `lowerdir`/`upperdir`, tmpfs의 `size` 같은 파일시스템별 옵션은 빠질 수 있다.
+- 기본 결과가 비면 경고 로그를 확인하고, 알고 있는 Host PID로 `--pids PID --extended`를 실행한다. 자동 선택에서 빠졌거나 읽기에 실패했을 수 있으므로 빈 결과는 마운트가 없다는 증거가 아니다.
 
-검증 범위: cgroup v2 Round2 덤프 실행 및 손상·충돌 회귀 테스트를 수행했다.
+검증 범위: 회귀 테스트 128개 통과. cgroup v2 S01 덤프에서 15개 컨테이너의
+368행을 출력했고, 그중 353개 마운트의 경로·파일시스템·마운트 플래그·전파 속성을
+`/proc` 수집값과 대조했다. 나머지 15행은 내부 루트 항목이다.
+Round2는 기존 27행을 유지했지만 호스트 경로 미복원이 남아 있어 경로 검증 완료로 보지 않는다.
 v1/hybrid는 구조별 테스트 기준이며 실제 덤프 통합 검증은 별도로 필요하다.
