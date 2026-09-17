@@ -1,15 +1,17 @@
-"""Unified entry point for the standalone volatility-docker-v2 analyses.
+"""Unified entry point for the volatility-docker-v2 analyses.
 
 Usage: vol -p plugins -s symbols -f memory.lime linux.docker.Docker --detector
 Select exactly one of --detector, --ps, --inspect-mounts, --inspect-networks,
 or --inspect-caps. Analysis-specific settings are accepted only with their
 corresponding selector. Native collectors, defaults, TreeGrid schemas and
-evidence files are preserved, as are the existing standalone entry points.
+evidence files are preserved. The analysis modules are internal backends;
+linux.docker.Docker is the only public entry point for these five analyses.
 The official Volatility framework and core Linux plugins are not replaced.
 """
 
 import copy
 import importlib
+import re
 
 from volatility3.framework import exceptions, interfaces
 from volatility3.framework.configuration import requirements
@@ -20,46 +22,45 @@ from volatility3.framework.configuration import requirements
 # import-time error in another plugin in the search path.
 BACKENDS = {
     "detector": ("detector", "Detector"),
-    "ps": ("ps", "Ps"),
+    "ps": ("ps", "run_ps"),
     "inspect-mounts": ("inspect_mount", "ContainerMounts"),
     "inspect-networks": ("inspect_networks", "InspectNetworks"),
-    # importlib supports this original module name. Do not rename it and break
-    # the user's standalone CLI / saved-report launcher.
+    # Keep the existing filename; importlib can load its hyphenated name.
     "inspect-caps": ("inspect-caps", "ContainerCaps"),
 }
 
 # Public option -> {analysis selector: native backend setting}.
 SETTINGS = {
-    "limit": {"detector": "limit", "inspect-networks": "limit"},
+    "limit": {"detector": "limit"},
     "pids": {"inspect-mounts": "pids"},
-    "include-candidates": {"inspect-mounts": "include-candidates"},
-    "all-mounts": {"inspect-mounts": "all-mounts"},
+    "extended": {"inspect-mounts": "extended"},
     "mounts-extended": {"inspect-mounts": "extended"},
-    "identity-mode": {"inspect-networks": "identity-mode"},
-    "disable-cgroup-cache": {"inspect-networks": "disable-cgroup-cache"},
-    "identity-only": {"inspect-networks": "identity-only"},
-    "include-host": {"inspect-networks": "include-host"},
-    "containers-only": {"inspect-networks": "containers-only"},
     "dump-evidence": {"inspect-networks": "dump-evidence"},
-    "dump-metrics": {"inspect-networks": "dump-metrics"},
-    "container": {"inspect-caps": "container"},
+    "container": {"inspect-networks": "container", "inspect-caps": "container"},
     "leaders": {"inspect-caps": "leaders"},
-    "view": {"inspect-caps": "view"},
+    "unresolved": {"inspect-caps": "unresolved"},
+    "view": {"inspect-networks": "view", "inspect-caps": "view"},
+}
+
+VIEWS = {
+    "inspect-networks": ["sockets", "relations", "containers", "interfaces", "conntrack", "diagnostics"],
+    "inspect-caps": ["raw", "analyst"],
 }
 
 
 class Docker(interfaces.plugins.PluginInterface):
     """Docker v2: detector, process inventory, mounts, networks or capabilities.
 
-    Select exactly one analysis. Use --mounts-extended with --inspect-mounts
-    for its additional columns; --ps already provides the v2 combined view.
-    --container/--leaders/--view apply to capabilities only. Network
-    --dump-evidence also enables its optional evidence collectors. All JSON
-    evidence files use the normal Volatility -o directory.
+    Select exactly one analysis. --extended/--mounts-extended adds mount
+    columns. --container and --view apply to networks or capabilities;
+    capabilities accept one container prefix, networks accept several.
+    --leaders/--unresolved apply to capabilities only. Network --dump-evidence
+    saves evidence for the selected view; --view diagnostics runs all retained
+    network collectors. Evidence files use Volatility's -o directory.
     """
 
     _required_framework_version = (2, 28, 0)
-    _version = (2, 0, 0)
+    _version = (2, 1, 0)
 
     @classmethod
     def get_requirements(cls):
@@ -68,11 +69,11 @@ class Docker(interfaces.plugins.PluginInterface):
             architectures=["Intel32", "Intel64"],
         )]
         descriptions = {
-            "detector": "Detect Docker-labelled evidence and generic container hints",
-            "ps": "Inventory container processes and residual evidence (all six stages)",
-            "inspect-mounts": "Inspect container mounts, host sources and exposure indicators",
-            "inspect-networks": "Inspect network namespaces, interfaces, topology and sockets",
-            "inspect-caps": "Inspect Docker cgroup-v2 task capabilities and security context (Intel64)",
+            "detector": "Observe runtime, mount and network presence checks",
+            "ps": "Summarize task-linked Docker containers and representative credentials",
+            "inspect-mounts": "Inspect container mount paths, host aliases and access modes",
+            "inspect-networks": "Inspect container sockets, sharing relations and network context (Intel64)",
+            "inspect-caps": "Inspect Docker task capabilities and security context (Intel64)",
         }
         result.extend(requirements.BooleanRequirement(
             name=name, description=description, optional=True, default=False,
@@ -82,35 +83,25 @@ class Docker(interfaces.plugins.PluginInterface):
         # obtained from that backend's requirements, not duplicated here.
         result.extend([
             requirements.IntRequirement(name="limit", optional=True, default=None,
-                description="[detector, networks] Nodes per traversal; backend default 100000"),
+                description="[detector] Nodes per traversal (1..1000000); default 100000"),
             requirements.ListRequirement(name="pids", element_type=int, min_elements=1,
                 optional=True, default=None, description="[mounts] Inspect these host PIDs"),
-            requirements.BooleanRequirement(name="include-candidates", optional=True, default=None,
-                description="[mounts] Include low-confidence namespace candidates"),
-            requirements.BooleanRequirement(name="all-mounts", optional=True, default=None,
-                description="[mounts] Include expected infrastructure mounts"),
+            requirements.BooleanRequirement(name="extended", optional=True, default=None,
+                description="[mounts] Add Mount ID, Read Status and Host Path Status"),
             requirements.BooleanRequirement(name="mounts-extended", optional=True, default=None,
-                description="[mounts] Add evidence and raw mountinfo columns"),
-            requirements.ChoiceRequirement(name="identity-mode", choices=["combined", "cgroup", "shim"],
-                optional=True, default=None, description="[networks] Container identity strategy"),
-            requirements.BooleanRequirement(name="disable-cgroup-cache", optional=True, default=None,
-                description="[networks] Recompute cgroup paths (benchmark setting)"),
-            requirements.BooleanRequirement(name="identity-only", optional=True, default=None,
-                description="[networks] Skip socket and optional evidence collectors"),
-            requirements.BooleanRequirement(name="include-host", optional=True, default=None,
-                description="[networks] Include host and unattributed namespaces"),
-            requirements.BooleanRequirement(name="containers-only", optional=True, default=None,
-                description="[networks] Explicitly select the default attributed-namespace scope"),
+                description="[mounts] Alias for --extended"),
             requirements.BooleanRequirement(name="dump-evidence", optional=True, default=None,
-                description="[networks] Collect all supported evidence and save network_evidence.json"),
-            requirements.BooleanRequirement(name="dump-metrics", optional=True, default=None,
-                description="[networks] Save traversal/timing metrics"),
-            requirements.StringRequirement(name="container", optional=True, default=None,
-                description="[caps] Docker ID or unique 6-64 hex prefix"),
+                description="[networks] Save evidence for the selected --view to network_evidence.json"),
+            requirements.ListRequirement(name="container", element_type=str, min_elements=1,
+                optional=True, default=None,
+                description="[networks, caps] Container ID prefix(es); caps accepts one 6-64 hex prefix"),
             requirements.BooleanRequirement(name="leaders", optional=True, default=None,
                 description="[caps] Collect process leaders only; default includes threads"),
-            requirements.ChoiceRequirement(name="view", choices=["raw", "analyst"],
-                optional=True, default=None, description="[caps] Output view; backend default raw"),
+            requirements.BooleanRequirement(name="unresolved", optional=True, default=None,
+                description="[caps] Show unresolved task membership; cannot combine with --container"),
+            requirements.ChoiceRequirement(name="view", choices=VIEWS["inspect-networks"] + VIEWS["inspect-caps"],
+                optional=True, default=None,
+                description="[networks, caps] Output view; defaults: networks=sockets, caps=raw"),
         ])
         return result
 
@@ -121,7 +112,7 @@ class Docker(interfaces.plugins.PluginInterface):
             choices = ", ".join("--" + name for name in BACKENDS)
             raise exceptions.VolatilityException("Select exactly one analysis: " + choices)
         action = selected[0]
-        overrides = {"ps": True} if action == "ps" else {}
+        overrides = {}
         for public_name, routes in SETTINGS.items():
             value = config.get(public_name)
             if value is None:
@@ -130,26 +121,62 @@ class Docker(interfaces.plugins.PluginInterface):
                 allowed = ", ".join("--" + name for name in routes)
                 raise exceptions.VolatilityException(
                     f"--{public_name} is only valid with {allowed}; selected --{action}")
-            overrides[routes[action]] = value
-        if "limit" in overrides and not 1 <= overrides["limit"] <= 1000000:
-            raise exceptions.VolatilityException("--limit must be in 1..1000000")
+            native_name = routes[action]
+            if native_name in overrides and overrides[native_name] != value:
+                raise exceptions.VolatilityException("--extended and --mounts-extended disagree")
+            overrides[native_name] = value
+        if "limit" in overrides:
+            limit = overrides["limit"]
+            if type(limit) is not int or not 1 <= limit <= 1000000:
+                raise exceptions.VolatilityException("--limit must be in 1..1000000")
+        if "pids" in overrides:
+            pids = overrides["pids"]
+            if not isinstance(pids, list) or not pids or any(type(pid) is not int or pid <= 0 for pid in pids):
+                raise exceptions.VolatilityException("--pids requires one or more positive host PIDs")
+        if "view" in overrides and overrides["view"] not in VIEWS[action]:
+            raise exceptions.VolatilityException(
+                f"--view for --{action} must be one of: " + ", ".join(VIEWS[action]))
+        if "container" in overrides:
+            prefixes = overrides["container"]
+            # Accept the earlier single-string JSON configuration as well.
+            if isinstance(prefixes, str):
+                prefixes = [prefixes]
+            if not isinstance(prefixes, list) or not prefixes or any(not isinstance(p, str) or not p for p in prefixes):
+                raise exceptions.VolatilityException("--container requires one or more ID prefixes")
+            if action == "inspect-caps":
+                if len(prefixes) != 1 or not re.fullmatch(r"[0-9a-fA-F]{6,64}", prefixes[0]):
+                    raise exceptions.VolatilityException("--inspect-caps accepts one --container prefix of 6-64 hex characters")
+                if overrides.get("unresolved"):
+                    raise exceptions.VolatilityException("--unresolved cannot be combined with --container")
+                overrides["container"] = prefixes[0]
+            else:
+                overrides["container"] = list(prefixes)
         return action, overrides
 
     def run(self):
         action, overrides = self.resolve_options(self.config)
-        module_name, class_name = BACKENDS[action]
+        module_name, entry_name = BACKENDS[action]
         try:
             module = importlib.import_module("volatility3.plugins." + module_name)
-        except ImportError as exc:
+            backend = getattr(module, entry_name)
+        except (ImportError, AttributeError) as exc:
             raise exceptions.VolatilityException(
                 f"Cannot load --{action}: {module_name}.py and its dependencies must be in the plugin path: {exc}"
             ) from exc
-        backend_class = getattr(module, class_name)
+        if action == "ps":
+            return backend(self.context, self.config["kernel"], self.open)
+        backend_class = backend
+        native_requirements = backend_class.get_requirements()
+        native_names = {requirement.name for requirement in native_requirements}
+        unknown = set(overrides) - native_names
+        if unknown:
+            raise exceptions.VolatilityException(
+                f"--{action} backend does not support settings: " + ", ".join(sorted(unknown)))
         config_path = interfaces.configuration.path_join(self.config_path, "analysis", action)
         overrides["kernel"] = self.config["kernel"]
         # Reinitialize native defaults on every invocation, even when the same
         # context/plugin instance is reused by a non-CLI caller.
-        for requirement in backend_class.get_requirements():
+        for requirement in native_requirements:
             if isinstance(requirement, requirements.VersionRequirement):
                 continue
             value = overrides.get(requirement.name, copy.deepcopy(requirement.default))

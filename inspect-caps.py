@@ -1,58 +1,40 @@
 #!/usr/bin/env python3
-"""ContainerCaps — 단일 파일 배포판 (버전은 --version으로 확인).
 
-Docker cgroup v2의 태스크별 capabilities와 보안 맥락을 메모리에서 읽는다.
-플러그인 자체는 이 파일 하나이며, Python과 Volatility는 별도로 설치한다.
-
-설치 (검증 환경: Python 3.12, 전용 가상환경):
-    python -m pip install volatility3==2.28.0 pefile==2024.8.26 jsonschema==4.26.0
-핵심 표 / 상세 JSON / 저장 결과 조회:
-    python inspect-caps.py --dump memory.lime --symbols symbols --output-root results
-    python inspect-caps.py --saved --output-root results --json
-    python inspect-caps.py --saved --output-root results --container <ID접두사>
-Volatility 명령 직접 실행 (이 파일이 있는 폴더에서):
-    python inspect-caps.py --volatility -p . -s symbols -f memory.lime -o results inspect-caps.ContainerCaps --view analyst
-    vol -p . -s symbols -f memory.lime -o results inspect-caps.ContainerCaps --view analyst
-실험용 BTF ISF를 사용할 때만 필요한 메타데이터 준비 / 원복:
-    python inspect-caps.py --prepare-lab-schema
-    python inspect-caps.py --restore-lab-schema
-
-symbols는 덤프와 일치하는 ISF가 들어 있는 linux/의 상위 폴더다.
-기본 화면은 7열 요약이며 상세 근거는 결과 폴더의 JSON에 저장한다.
-실제 검증: Ubuntu 7.0.0-31-generic, x86-64, Docker cgroup v2의 5개 컨테이너.
-다른 커널은 심볼 구조를 검사해 지원 가능한 경로를 선택하며, 모든 커널을
-검증했다는 뜻은 아니다. 권한 관측만으로 침해나 컨테이너 탈출을 판정하지 않는다.
-
-파일 구성: 1) 저장 자료 해석·표 2) 사용자 CLI 3) 선택적 스키마 준비
-           4) 심볼/PID 5) cgroup 소속 6) capability 판독 7) 보안 맥락 8) 수집 플러그인
-cap_last_cap 타입 누락과 보조 조회 실패를 처리하며, 전역 관측 상태도 함께 보고한다.
-화면의 제어문자는 이스케이프하고 원본 문자열은 감사 JSON에 보존한다.
-"""
-
-import argparse
-import datetime
-import hashlib
-import importlib.metadata
-import importlib.util
-import json
-import logging
-import multiprocessing
-import os
-from pathlib import Path
-import platform
-import re
-import shutil
-import subprocess
-import sys
-import tempfile
-import unicodedata
+# 첫 줄은 Linux 등에서 파일을 직접 실행할 때 Python 3를 선택하는 shebang이다.
+# 아래 import는 기능을 사용할 준비이며, 여기서 덤프 분석을 시작하지 않는다.
+import argparse  # --dump, --symbols 등 터미널 옵션을 정의하고 해석한다.
+import datetime  # 결과 생성 시각과 실행별 폴더 이름에 UTC 시간을 사용한다.
+import hashlib  # 실행한 플러그인 소스의 SHA-256을 기록한다. 덤프 전체 해시는 아니다.
+import importlib.metadata  # 설치된 volatility3 패키지 버전을 조회한다.
+import json  # 분석 결과를 JSON으로 저장·출력하거나 저장된 JSON을 읽는다.
+import logging  # 분석 중 발생한 부분 오류 등의 경고를 전달한다.
+import multiprocessing  # Windows 실행 파일 패키징 환경을 위한 freeze_support()에 사용한다.
+import os  # CAPS_DUMP·CAPS_SYMBOLS 환경 변수에서 기본 입력 경로를 읽는다.
+from pathlib import Path  # 덤프·심볼·결과 파일의 경로를 구성하고 파일을 읽고 쓴다.
+import platform  # 분석을 실행하는 운영체제·Python 버전을 기록한다. 덤프 속 환경은 아니다.
+import re  # 컨테이너 ID와 cgroup 이름이 정해진 문자열 형식인지 검사한다.
+import subprocess  # 간편 명령에서 별도 Python 프로세스로 공식 Volatility 경로를 실행한다.
+import sys  # 명령줄 인자·현재 Python 경로·오류 출력·프로그램 종료를 다룬다.
+import unicodedata  # 제어문자를 분류하고 한글 등 문자의 터미널 표시 폭을 계산한다.
 
 BASE = Path(__file__).resolve().parent
 # 버전은 여기서만 정의한다. CLI·Volatility 클래스·감사 JSON이 같은 값을 사용한다.
-VERSION_INFO = (1, 4, 2)
+VERSION_INFO = (1, 6, 1)
 VERSION = '.'.join(map(str, VERSION_INFO))
+# 실행 조건을 기록한다. 버전 번호 허용 목록이나 실제 검증 환경 목록이 아니다.
+# 새 결과에만 저장하며, 과거 결과에 현재 정책을 소급해서 붙이지 않는다.
+SUPPORT_POLICY = {
+    'summary': 'Ubuntu·커널 버전 번호로 제한하지 않고, 심볼 구조에 따라 분석합니다. 모든 커널의 완전한 분석을 보장하지 않습니다.',
+    'requirements': 'x86-64 Linux, 덤프와 일치하는 심볼, Volatility의 메모리 계층·태스크 열거 지원이 필요합니다.',
+    'ubuntu_version_filter': False, 'kernel_version_filter': False,
+    'reader_selection': 'symbol_structure', 'architecture': 'Intel64',
+    'unknown_layout': 'preserve_available_raw_evidence_and_mark_unknown',
+    'all_kernels_guaranteed': False,
+}
 CAPS = ('cap_inheritable', 'cap_permitted', 'cap_effective', 'cap_bounding', 'cap_ambient')
 CAP_FIELDS = CAPS
+# 손상된 심볼의 거대 배열/정수로 인한 자원 소모를 제한한다. 커널 버전 제한은 아니다.
+MAX_CAPABILITY_BYTES = 256
 
 # --volatility는 첫 번째 옵션이다. 클래스 정의 전에 공식 CLI로 진입해야
 # __main__과 정식 플러그인 모듈에 클래스가 이중 등록되는 것을 막는다.
@@ -60,16 +42,14 @@ CAP_FIELDS = CAPS
 if __name__ == '__main__' and sys.argv[1:2] == ['--volatility']:
     multiprocessing.freeze_support()
     sys.argv = [sys.argv[0], *sys.argv[2:]]
-    from volatility3.cli import main as volatility_main
+    from volatility3.cli import main as volatility_main  # 공식 CLI 진입 함수를 별칭으로 가져온다.
     volatility_main()
     raise SystemExit(0)
-
 
 
 # 1. 저장된 관측 자료의 해석과 터미널 표
 
 REPORT_VERSION = '1.0'
-LABELS = dict(zip(CAPS, ('I / 상속 후보', 'P / 보유', 'E / 현재 유효', 'B / exec 제한', 'A / ambient')))
 REVIEW_CAPS = {
     'sys_admin': '시스템 관리 작업 범위', 'sys_module': '커널 모듈 관련 작업',
     'sys_ptrace': '다른 프로세스 조사·접근 범위', 'sys_rawio': '원시 I/O 접근 범위',
@@ -149,7 +129,7 @@ def number(value):
         if value is None or isinstance(value, bool):
             return None
         result = int(value, 0) if isinstance(value, str) else int(value)
-        return result if 0 <= result < (1 << 64) else None
+        return result if 0 <= result and result.bit_length() <= MAX_CAPABILITY_BYTES * 8 else None
     except (ValueError, TypeError, OverflowError):
         return None
 
@@ -179,8 +159,8 @@ def task_report(member):
     # 이름 문자열이 아닌 보존된 원시 마스크로 집합 차이를 계산한다. 미기록 값은 미확인이다.
     # Bounding은 exec 시 취득 제한이므로 E가 B 밖에 있다는 이유만으로 불일치로 분류하지 않는다.
     sets = {field: cap_entry(member, field) for field in CAPS}
-    # i/p/e/b/a는 각각 상속 후보·보유·현재 유효·exec 취득 제한·ambient 집합의 비트마스크다.
-    i, p, e, b, a = (sets[field]['mask'] for field in CAPS)
+    # 집합 관계 계산에는 I/P/E/A를 쓰며, Bounding 근거는 sets에 그대로 보존한다.
+    i, p, e, _, a = (sets[field]['mask'] for field in CAPS)
     deltas = {
         'permitted_not_effective': p & ~e if p is not None and e is not None else None,
         'effective_not_permitted': e & ~p if e is not None and p is not None else None,
@@ -284,101 +264,15 @@ def build_report(audit, members):
                                 for pid in sorted({t['pid'] for t in group['members']})]
         group['member_comparison'] = compare(group['members'])
     return {'report_version': REPORT_VERSION, 'plugin_version': audit.get('plugin_version'),
+            'support_policy': audit.get('support_policy'),
             'created_utc': audit.get('created_utc'), 'enumerated_tasks': audit.get('enumerated_tasks'),
             'discovered_docker_tasks': audit.get('discovered_docker_tasks'),
             'unmarked_tasks': audit.get('tasks_without_docker_marker', audit.get('non_docker_tasks')),
             'include_threads': audit.get('include_threads'),
             'quality': audit_quality(audit), 'global_observations': global_observations(audit),
-            'thread_inventory': audit.get('thread_inventory', []), 'groups': groups}
-
-
-def mask_text(entry):
-    value = entry['mask']
-    return '확인 불가' if value is None else f'원시 {value.bit_count()}비트 / {value:#x}'
-
-
-def rows(report):
-    """Three narrow columns for both a native TreeGrid and the readable CLI."""
-    q = report['quality']
-    yield '전체', '분석 범위', f"태스크 {report['enumerated_tasks']} | Docker 표식 {report['discovered_docker_tasks']} | 표시 컨테이너 {len(report['groups'])}"
-    yield '전체', '관측 품질', '소속 오류 {membership_errors} / 필드 오류 {field_errors} / 순회 오류 {traversal_errors} / 부분 관측 {partial_observations}'.format(**q)
-    if q.get('global_partial_observations'):
-        yield '전체', '전역 관측', f"오류 {q['global_errors']} / 부분 {q['global_partial_observations']}"
-        for item in report.get('global_observations', []):
-            if item['status'] != 'ok':
-                yield '전역 확인', item['feature'], STATUS.get(item['status'], item['status']) + ': ' + item.get('reason', '')
-    yield '전체', '선택 기준', f"Docker cgroup v2 커널 연결 관계. 표식 없는 태스크 {report['unmarked_tasks']}개는 미표시. 다른 런타임 부재 판정 아님."
-    yield '전체', '수집 범위', '프로세스와 스레드' if report['include_threads'] else '대표 스레드만 수집됨; 전체 스레드 비교 불가'
-    for group in report['groups']:
-        for task in group['members']:
-            yield '목록', f"{group['label']} {task['pid']}/{task['tid']}", f"{task['name']} | E={task['sets']['cap_effective']['text']}"
-    review_count = 0
-    for group in report['groups']:
-        for task in group['members']:
-            for check in task['checks']:
-                if check['kind'] != '관측':
-                    review_count += 1
-                    yield '확인 대상', f"{group['label']} {task['pid']}/{task['tid']}", check['kind'] + ': ' + check['text']
-    if not review_count:
-        yield '확인 대상', '자동 검토 규칙', '일치 항목 없음. 관측값의 안전·무해 판정은 아님.'
-    for group in report['groups']:
-        label = group['label']
-        yield label, '컨테이너', group['container_id']
-        yield label, '소속 근거', f"root={group['root_address']} | {group['path']}"
-        yield label, '구성원', f"프로세스 {len({t['pid'] for t in group['members']})} / 태스크 {len(group['members'])}"
-        for task in group['members']:
-            m, sets = task['source'], task['sets']
-            section = f"{label} {task['pid']}/{task['tid']}"
-            yield section, '프로세스', f"{task['name']} | 내부 PID/TID={clean(m.get('NSPID'))}/{clean(m.get('NSTID'))} | 관측={clean(m.get('Status'))}"
-            yield section, 'E 현재 유효', sets['cap_effective']['text'] + ' | ' + mask_text(sets['cap_effective'])
-            yield section, '나머지 집합', ' | '.join(f"{LABELS[f]}: {mask_text(sets[f])}" for f in CAPS if f != 'cap_effective')
-            for field in CAPS:
-                if field != 'cap_effective' and sets[field]['mask'] not in (0, sets['cap_effective']['mask']):
-                    yield section, LABELS[field], sets[field]['text']
-            d = task['deltas']
-            yield section, '집합 비교', 'P-E=' + clean(hex(d['permitted_not_effective']) if d['permitted_not_effective'] is not None else None) + ' | E-P=' + clean(hex(d['effective_not_permitted']) if d['effective_not_permitted'] is not None else None) + ' | A-(P&I)=' + clean(hex(d['ambient_outside_pi']) if d['ambient_outside_pi'] is not None else None)
-            scope = {'initial_user_namespace': '초기 user namespace', 'descendant_user_namespace': '하위 user namespace'}.get(m.get('CapabilityScope'), '범위 확인 불가')
-            yield section, '권한 범위', f"{scope} {clean(m.get('UserNS'))} | EUID 커널/내부={clean(m.get('EUID'))}/{clean(m.get('UserEUID'))}"
-            sec = m.get('seccomp') or {}
-            mode = {0: '0 disabled', 1: '1 strict', 2: '2 filter'}.get(m.get('SeccompMode'), clean(m.get('SeccompMode')))
-            yield section, '실행 제한', f"seccomp={mode} | 필터={clean(m.get('SeccompFilters'))} | no_new_privs={clean(m.get('NoNewPrivs'))} | securebits={clean(m.get('Securebits'))}"
-            if sec.get('filter_count_source'):
-                yield section, '필터 근거', f"{sec['filter_count_source']} | 체인 관측={clean(sec.get('observed_filter_count'))} | 완전={clean(sec.get('chain_complete'))}"
-            resources = m.get('resource_namespaces') or {}
-            net = resources.get('network') or {}
-            yield section, '자원 범위', f"PIDNS={clean(m.get('PIDNS'))} | MountNS={clean(m.get('MountNS'))} | NetNS={clean(m.get('NetNS'))} | NetNS 소유 UserNS={clean(net.get('owner_user_namespace_inum'))}"
-            yield section, 'cred 근거', f"{clean(m.get('CredSource'))}={clean(m.get('CredAddress'))} | real_cred={clean(m.get('RealCredAddress'))} | 주소 다름={clean(m.get('CredsDiffer'))}"
-            evidence = sets['cap_effective']['evidence']
-            yield section, 'E 원시 근거', f"주소={clean(evidence.get('virtual_address'))} | bytes={clean(evidence.get('bytes_hex'))} | 커널 유효 마스크={clean(evidence.get('kernel_mask'))}"
-            for item in task['checks']:
-                yield section, item['kind'] + ' ' + item['code'], item['text']
-        comparison = group['member_comparison']
-        if len(group['members']) > 1:
-            yield label, '구성원 차이', ', '.join(comparison['different_fields']) or '비교한 요약 필드에서 관측 차이 없음'
-            if comparison['unknown_fields']:
-                yield label, '비교 미확인', ', '.join(comparison['unknown_fields'])
-        for c in group['comparisons']:
-            count = sum(t['pid'] == c['pid'] for t in group['members'])
-            if count > 1:
-                yield label, f"PID {c['pid']} 스레드 차이", ', '.join(c['different_fields']) or '비교한 요약 필드에서 관측 차이 없음'
-    counts = [item for item in report['thread_inventory'] if item.get('pid') in
-              {t['pid'] for group in report['groups'] for t in group['members']}]
-    yield '전체', '스레드 교차확인', f"signal.nr_threads 일치 {sum(c.get('count_matches') is True for c in counts)}/{len(counts)} | 불일치 {sum(c.get('count_matches') is False for c in counts)} | 미확인 {sum(c.get('count_matches') is None for c in counts)}"
-    if not report['groups']:
-        yield '전체', '검색 결과', '선택 조건에 맞는 Docker 표식 구성원 없음. 순회·소속 오류와 수집 범위 확인.'
-    yield '해석', '집합 의미', 'P-E는 보유 중 비활성. B는 exec 시 파일 권한 취득을 제한하며 현재 E의 상한과 동일하지 않음.'
-    yield '해석', '판정 한계', '검토 항목은 침해·권한 상승 이력·탈출 성공 판정이 아님. 초기 UserNS/EUID 0도 호스트 접근 성공을 보장하지 않음.'
-    yield '해석', '관측 상태', 'ok는 수집한 필드를 읽었다는 뜻. 검토 권한 목록은 조사 편의를 위한 일부 항목이며 전체 위험 목록이 아님.'
-    yield '해석', '미평가', 'seccomp 규칙별 허용, LSM, 파일 DAC/ACL·idmapped mount. no_new_privs=False는 권한 상승 발생 증거가 아님.'
-
-
-def grid_rows(report):
-    for section, item, value in rows(report):
-        items = list(wrap_cells(item, 26)) or ['']
-        values = list(wrap_cells(value, 72)) or ['']
-        for index in range(max(len(items), len(values))):
-            yield (clean(section) if index == 0 else '', items[index] if index < len(items) else '',
-                   values[index] if index < len(values) else '')
+            'thread_inventory': audit.get('thread_inventory', []), 'groups': groups,
+            'unresolved_members': audit.get('unresolved_members', []),
+            'unresolved_collected': 'unresolved_members' in audit}
 
 
 SUMMARY_COLUMNS = ('Container', 'PID/TID', 'Name', 'Effective', 'UserNS', 'Seccomp', 'Check')
@@ -432,8 +326,17 @@ def summary_rows(report):
             yield tuple(clean(v) for v in (identity, f"{task['pid']}/{task['tid']}", task['name'], effective, scope, seccomp, check))
 
 
-def format_summary(report):
-    table = list(summary_rows(report))
+def unresolved_rows(report):
+    # 표를 재사용하기 위한 표시 전용 묶음이다. 컨테이너 ID를 만들거나 groups에 저장하지 않는다.
+    tasks = [task_report(member) for member in report.get('unresolved_members', [])]
+    group = {'container_id': '소속 미확인', 'label': '?', 'members': tasks,
+             'comparisons': [dict(pid=pid, **compare([t for t in tasks if t['pid'] == pid]))
+                             for pid in sorted({t['pid'] for t in tasks})]}
+    yield from summary_rows({'groups': [group]})
+
+
+def format_summary(report, unresolved=False):
+    table = list(unresolved_rows(report) if unresolved else summary_rows(report))
     headers = ('컨테이너', 'PID/TID', '프로세스', 'Effective', 'UserNS', 'seccomp', '확인')
     widths = [max([cell_width(headers[i])] + [cell_width(row[i]) for row in table]) for i in range(len(headers))]
     def line(row):
@@ -441,13 +344,19 @@ def format_summary(report):
     q = report['quality']
     errors, partial = quality_totals(q)
     output = [f"Container Caps {clean(report['plugin_version'])} | 컨테이너 {len(report['groups'])} · 표시 태스크 {len(table)} | 오류 {errors} · 부분 {partial}"]
+    if report.get('unresolved_members'):
+        output.append(f"소속 미확인 태스크 {len(report['unresolved_members'])}개 별도 보존 · 조회: --unresolved / --json")
+    if unresolved:
+        output.append('소속 미확인 보기: 아래 태스크는 Docker 컨테이너 구성원으로 확인되지 않았습니다.')
     issues = global_issue_text(report.get('global_observations', []))
     if issues:
         output.append('전역 확인: ' + issues)
     output.extend(['', line(headers), '-' * cell_width(line(headers))])
     output.extend(line(row) for row in table)
     if not table:
-        output.append('선택 조건에 맞는 Docker 표식 구성원 없음.')
+        output.append(('소속 미확인 태스크 없음.' if report.get('unresolved_collected') else
+                       '이 과거 결과에는 소속 미확인 태스크 수집 기록이 없습니다.')
+                      if unresolved else '선택 조건에 맞는 Docker 표식 구성원 없음.')
     output.extend(['', 'UserNS=권한 적용 범위. 확인 항목은 조사 대상이며 침해 판정이 아닙니다.',
                    '권한 전체·집합 차이·NNP·주소·원시 바이트는 상세 JSON에 있습니다.'])
     return '\n'.join(output) + '\n'
@@ -458,67 +367,16 @@ def cell_width(text):
     return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
 
 
-def wrap_cells(text, width):
-    line = ''
-    for token in clean(text).split(' '):
-        proposed = line + (' ' if line else '') + token
-        if cell_width(proposed) <= width:
-            line = proposed
-            continue
-        if line:
-            yield line
-            line = ''
-        for char in token:
-            if cell_width(line + char) > width:
-                yield line
-                line = ''
-            line += char
-    if line:
-        yield line
-
-
-def format_report(report, width=112):
-    width = max(64, min(width, 160))
-    output = ['Container Caps ' + clean(report['plugin_version']) + ' | 분석가 보기',
-              '분석 시각(UTC): ' + clean(report['created_utc']), '=' * width]
-    previous = None
-    for section, item, value in rows(report):
-        if section != previous:
-            output.extend(['', '[' + clean(section) + ']'])
-            previous = section
-        prefix = '  ' + clean(item) + ': '
-        if cell_width(prefix) > 32:
-            output.append(prefix.rstrip())
-            prefix = '    '
-        lines = list(wrap_cells(value, width - cell_width(prefix))) or ['']
-        output.append(prefix + lines[0])
-        output.extend(' ' * cell_width(prefix) + line for line in lines[1:])
-    return '\n'.join(output) + '\n'
-
-
 # 2. 사용자 CLI: 새 분석 또는 저장 결과 조회
-
-STATUS_LABELS = {'ok': '확인', 'unsupported': '미지원', 'not_present': '필드 없음',
-                 'read_error': '읽기 실패', 'inconsistent': '불일치', 'not_evaluated': '미평가'}
-
 
 def display(value):
     return '<확인 불가>' if value is None else clean(value)
 
 
-def capability_text(member, field):
-    value = member[field]
-    if value is not None:
-        return value or '<없음>'
-    states = [item for item in member.get('observations', [])
-              if item.get('source') == 'credentials' and item.get('feature') == field and item['status'] != 'ok']
-    return '<' + STATUS_LABELS.get(states[0]['status'], states[0]['status']) + '>' if states else '<읽기 실패/미지원>'
-
-
 def compatibility_summary(audit):
     """Count observed reader outcomes, not a claim about every kernel."""
     counts = {}
-    for member in audit['members']:
+    for member in [*audit['members'], *audit.get('unresolved_members', [])]:
         for observation in member.get('observations', []):
             key = (observation['source'], observation['feature'], observation['status'],
                    json.dumps(observation.get('layout'), sort_keys=True))
@@ -620,14 +478,15 @@ def run_analysis(args):
                '-q', '--offline', '-f', str(dump), '-s', str(symbols),
                '-p', str(BASE), '-o', str(out), '-r', 'json',
                'inspect-caps.ContainerCaps']
+    source_hash = {Path(__file__).name: hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     manifest = {
         'wrapper_version': VERSION, 'volatility_version': importlib.metadata.version('volatility3'),
         'python_version': platform.python_version(), 'analysis_platform': platform.platform(),
         'command': command, 'dump': str(dump), 'dump_size': dump.stat().st_size,
         'dump_mtime_ns': dump.stat().st_mtime_ns, 'symbols_directory': str(symbols),
         # 수집기와 실행기가 같은 파일이므로 두 출처 모두 이 파일의 해시를 가리킨다.
-        'plugin_sha256': {Path(__file__).name: hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
-        'launcher_sha256': {Path(__file__).name: hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
+        'plugin_sha256': source_hash,
+        'launcher_sha256': source_hash,
     }
     print('메모리 덤프에서 컨테이너 소속과 권한을 읽는 중입니다. 수 분 걸릴 수 있습니다.', file=sys.stderr)
     # 표 렌더러의 rows.json과 플러그인의 감사 JSON을 분리한다. 재조회는 감사 JSON을 사용한다.
@@ -638,7 +497,6 @@ def run_analysis(args):
     if result.returncode or not (out / 'containercaps-audit.json').is_file():
         raise RuntimeError(f'Volatility 실행을 완료하지 못했습니다. 로그: {out / "run.log"}')
     audit = read_json(out / 'containercaps-audit.json')
-    write_json(out / 'containers.json', {'source': manifest, 'groups': group_members(audit['members'])})
     pointer = out.parent / 'latest.json'
     temporary = pointer.with_name(out.name + '.latest.tmp')
     # Relative pointer remains usable if the entire results directory is moved.
@@ -648,32 +506,24 @@ def run_analysis(args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Docker cgroup v2별 프로세스·스레드 capabilities 추출',
-        epilog='공식 CLI: python inspect-caps.py --volatility -p . [Volatility 옵션] inspect-caps.ContainerCaps --view analyst')
+    parser = argparse.ArgumentParser(description='심볼 구조에 따른 Docker 태스크 capabilities 추출',
+        epilog=SUPPORT_POLICY['summary'] + ' ' + SUPPORT_POLICY['requirements'] +
+        ' 공식 CLI: python inspect-caps.py --volatility -p . [Volatility 옵션] inspect-caps.ContainerCaps --view analyst')
     parser.add_argument('--version', action='version', version=VERSION)
     parser.add_argument('--container', default='', help='전체 Docker ID 또는 6자리 이상의 고유 접두사')
     parser.add_argument('--list', action='store_true', help='컨테이너별 구성원 수만 표시')
     parser.add_argument('--leaders', action='store_true', help='출력에서 프로세스 대표 스레드만 표시')
+    parser.add_argument('--unresolved', action='store_true', help='컨테이너 소속을 확인하지 못한 태스크를 별도로 표시')
     parser.add_argument('--json', action='store_true', help='선택된 결과를 JSON으로 출력')
     parser.add_argument('--compatibility', action='store_true', help='이 분석에서 확인한 구조별 지원·관측 상태 표시')
-    parser.add_argument('--view', choices=('summary', 'analyst', 'details'), default='summary', help='summary: 핵심 표(기본), analyst: 근거별 설명, details: 기존 전체 상세 보기')
     parser.add_argument('--saved', nargs='?', const='latest', metavar='DIRECTORY', help='재분석 없이 저장 결과 표시; 생략 시 최근 실행')
     parser.add_argument('--dump', default=os.environ.get('CAPS_DUMP'), help='분석할 Linux 메모리 덤프 파일')
     parser.add_argument('--symbols', default=os.environ.get('CAPS_SYMBOLS'), help='해당 커널의 심볼 검색 디렉터리 (linux/ 포함)')
     parser.add_argument('--output-root', default=str(Path.cwd() / 'container_caps_runs'), help='결과 저장 디렉터리')
-    schema_options = parser.add_mutually_exclusive_group()
-    schema_options.add_argument('--prepare-lab-schema', action='store_true', help='전용 venv의 Volatility 2.28.0에 실험 BTF 메타데이터 출처 허용')
-    schema_options.add_argument('--restore-lab-schema', action='store_true', help='보존한 공식 원본 스키마로 복원')
     tokens = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(tokens)
-    if args.prepare_lab_schema or args.restore_lab_schema:
-        if len(tokens) != 1:
-            parser.error('스키마 준비/원복 옵션은 분석·조회 옵션과 함께 사용하지 마세요.')
-        path = installed_schema()
-        print(prepare_schema(path, restore=args.restore_lab_schema))
-        print(f'대상: {clean(path)}')
-        return 0
-
+    if args.unresolved and (args.container or args.list):
+        parser.error('--unresolved는 --container 또는 --list와 함께 사용할 수 없습니다.')
     if args.container and not re.fullmatch(r'[0-9a-fA-F]{6,64}', args.container):
         parser.error('--container에는 6~64자리 16진수를 입력하세요.')
     if not args.saved and (not args.dump or not args.symbols):
@@ -690,11 +540,17 @@ def main(argv=None):
         directory = run_analysis(args)
     audit = read_json(directory / 'containercaps-audit.json')
     # 컨테이너 선택은 표시할 구성원만 제한한다. 오류·수집 범위는 전체 실행의 기록을 유지한다.
-    groups = group_members(select_members(audit, args.container, args.leaders))
+    selected = select_members(audit, args.container, args.leaders)
+    if args.unresolved:
+        selected = []
+    groups = group_members(selected)
     errors = {k: audit[k] for k in ('membership_errors', 'field_errors', 'traversal_errors')}
     quality = audit_quality(audit)
     # 종료 상태는 표시 필터나 이스케이프 처리 전에 전체 원본 관측으로 판단한다.
-    exit_code = 2 if any(quality.values()) or any(m.get('Status') == 'partial' for m in audit['members']) else 0
+    exit_code = 2 if any(quality.values()) or audit.get('unresolved_members') or any(m.get('Status') == 'partial' for m in audit['members']) else 0
+    # 미확인 소속은 ID 필터를 적용할 수 없다. 대표 스레드 표시만 독립적으로 적용한다.
+    if args.leaders and 'unresolved_members' in audit:
+        audit = dict(audit, unresolved_members=[m for m in audit['unresolved_members'] if m['PID'] == m['TID']])
     summary = {
         'saved_result': bool(args.saved), 'created_utc': audit['created_utc'],
         'directory': str(directory), 'enumerated_tasks': audit['enumerated_tasks'],
@@ -704,22 +560,32 @@ def main(argv=None):
         'quality': quality, 'global_observations': global_observations(audit),
         'thread_inventory': audit.get('thread_inventory', []),
         'plugin_version': audit.get('plugin_version'), 'kernel_banner': audit.get('kernel_banner'),
+        'support_policy': audit.get('support_policy'),
         'compatibility': audit.get('compatibility'), 'feature_status': compatibility_summary(audit),
         'partial_observations': audit.get('partial_observations', []),
         'not_evaluated': audit.get('not_evaluated', ['Permission context was not collected in this older result']),
+        'unresolved_members': audit.get('unresolved_members', []),
+        'unresolved_collected': 'unresolved_members' in audit,
     }
-    # 이전 상세/목록/호환성 화면은 복사본만 정제한다. JSON과 집합 비교는 원본을 쓴다.
-    if not args.json and (args.compatibility or args.list or args.view == 'details'):
+    # 목록/호환성 화면은 복사본만 정제한다. JSON과 집합 비교는 원본을 쓴다.
+    if not args.json and (args.compatibility or args.list):
         audit = clean_data(audit)
         summary = clean_data(summary)
         groups = summary['groups']
     if args.json:
-        # CLI JSON은 선택한 구성원과 그룹 자료다. native --view analyst의 보고서와 형식이 다르다.
+        # 기존 원시 자료와 함께, 긴 화면에서 보던 집합 차이·확인 항목을 제공한다.
+        summary['analyst_report'] = build_report(audit, selected)
         # 터미널 JSON은 Unicode 제어문자도 escape한다. 파싱하면 원본 문자열로 복원된다.
         print(json.dumps(summary, ensure_ascii=True, indent=2))
     elif args.compatibility:
         print(f"Container Caps {audit.get('plugin_version', '<과거 결과>')} | 저장된 분석의 구조별 관측")
         print('대상 커널: ' + display(audit.get('kernel_banner')))
+        policy = audit.get('support_policy')
+        if policy:
+            print('지원 조건: ' + display(policy.get('summary')))
+            print('필수 환경: ' + display(policy.get('requirements')))
+        else:
+            print('이 과거 결과에는 실행 당시 지원 조건이 기록되지 않았습니다.')
         compatibility = audit.get('compatibility')
         if compatibility:
             # 사전 키를 바꾸면 서로 다른 키가 충돌할 수 있어 직렬화한 표시 문자열을 정제한다.
@@ -728,20 +594,19 @@ def main(argv=None):
         else:
             print('이 과거 결과에는 구조별 지원 검사가 기록되지 않았습니다.')
         for item in summary['global_observations']:
-            print(f"  {item['feature']}: {STATUS_LABELS.get(item['status'], item['status'])} — {item.get('reason', '')}")
+            print(f"  {item['feature']}: {STATUS.get(item['status'], item['status'])} — {item.get('reason', '')}")
         for item in summary['feature_status']:
             layout = ' | ' + str(item['layout']) if item['layout'] else ''
-            print(f"  {item['source']}.{item['feature']}: {STATUS_LABELS.get(item['status'], item['status'])} | {item['tasks']}개 태스크{layout}")
+            print(f"  {item['source']}.{item['feature']}: {STATUS.get(item['status'], item['status'])} | {item['tasks']}개 태스크{layout}")
             for reason in item['reasons']:
                 print('    ' + reason)
         print(f'근거·원시 필드·로그: {clean(directory)}')
-    elif args.view in ('summary', 'analyst') and not args.list:
-        report = build_report(audit, [member for group in groups for member in group['members']])
+    elif not args.list:
+        report = build_report(audit, selected)
         print('저장 결과 재표시' if args.saved else '새 메모리 분석 결과')
-        print(format_summary(report) if args.view == 'summary' else
-              format_report(report, shutil.get_terminal_size((112, 30)).columns), end='')
+        print(format_summary(report, unresolved=args.unresolved), end='')
         print(f'\n상세·원시 바이트: {clean(directory / "containercaps-audit.json")}')
-        print('조회: --container <ID> | 상세 JSON: --json | 전체 설명: --view analyst')
+        print('조회: --container <ID> | 집합 차이·확인 항목·상세 JSON: --json')
     else:
         print(('저장 결과' if args.saved else '새 분석 결과') + f" | 분석 시각(UTC): {audit['created_utc']}")
         if audit.get('kernel_banner'):
@@ -752,43 +617,11 @@ def main(argv=None):
         issues = global_issue_text(summary['global_observations'])
         if issues:
             print('전역 확인: ' + issues)
-        print('식별 기준: Docker cgroup v2 경로와 커널 연결 관계')
+        print('식별 기준: 지원하는 cgroup 구조의 Docker 경로 표식과 커널 연결 관계')
         for group in groups:
             members = group['members']
             print(f"\n컨테이너 {group['container_id']}\n  cgroup: {group['container_path']}\n  주소: {group['root_address']}")
             print(f"  표시 프로세스 {len({m['PID'] for m in members})}개 / 태스크 {len(members)}개")
-            if args.list:
-                continue
-            for member in members:
-                print(f"  PID {member['PID']} / TID {member['TID']} | {member['Name']} | 내부 PID {display(member['NSPID'])} / TID {display(member['NSTID'])} | EUID {display(member['EUID'])} | {member['Status']}")
-                print(f"    PID namespace {display(member['PIDNS'])} | user namespace {display(member['UserNS'])}")
-                if 'CapabilityScope' in member:
-                    print(f"    권한 기준: {member['CredSource']} | 범위: {member['CapabilityScope']} | real_cred와 주소 다름: {display(member['CredsDiffer'])}")
-                    print(f"    EUID: 커널 ID {display(member['EUID'])} / 해당 user namespace ID {display(member['UserEUID'])}")
-                    print(f"    seccomp mode {display(member['SeccompMode'])} / filters {display(member['SeccompFilters'])} | no_new_privs {display(member['NoNewPrivs'])} | securebits {display(member['Securebits'])}")
-                    if member.get('seccomp', {}).get('filter_count_source'):
-                        print('    필터 개수 출처: ' + member['seccomp']['filter_count_source'])
-                    print(f"    mount namespace {display(member['MountNS'])} | network namespace {display(member['NetNS'])}")
-                    scope = member.get('credentials', {}).get('user_namespace') or {}
-                    chain = scope.get('chain_leaf_to_initial', [])
-                    if chain:
-                        print('    user namespace 계층: ' + ' -> '.join(str(node['inum']) for node in chain))
-                        for label in ('uid_map', 'gid_map'):
-                            mapping = chain[0].get(label)
-                            print('    ' + label + ' (namespace 시작 / 커널 ID 시작 / 개수): ' +
-                                  ('<확인 불가>' if mapping is None else ', '.join(f"{e['namespace_first']}/{e['kernel_first']}/{e['count']}" for e in mapping)))
-                    mounts = member.get('mounts')
-                    if mounts is not None:
-                        if mounts.get('entries') is not None:
-                            print(f"    복원한 마운트 {len(mounts['entries'])}개 / 불완전 항목 {len(mounts.get('errors', []))}개 (경로·옵션은 상세 JSON)")
-                for field in CAPS:
-                    print(f"    {field}: " + capability_text(member, field))
-                for item in member.get('observations', []):
-                    if item['status'] != 'ok':
-                        print(f"    관측 {item['source']}.{item['feature']}: {STATUS_LABELS.get(item['status'], item['status'])} — {item.get('reason', '')}")
-            for comparison in group['process_comparison']:
-                if comparison['different_observed_fields']:
-                    print(f"  PID {comparison['pid']} 스레드 간 차이: " + ', '.join(comparison['different_observed_fields']))
         if not groups:
             print('선택 조건에 맞는 Docker 표식 소속을 찾지 못했습니다. 다른 런타임까지 부재를 뜻하지는 않습니다.')
         if any(quality.values()):
@@ -807,110 +640,8 @@ def main(argv=None):
     return exit_code
 
 
-# 3. 선택적 실험 스키마 준비: 원본 해시·백업을 확인하고 명시적으로만 실행
-
-VOLATILITY_VERSION = "2.28.0"
-# btf/symdb는 심볼 생성 출처의 이름이다. 허용해도 필드 오프셋·주소나 스키마 검증은 바꾸지 않는다.
-STOCK_PATTERN = "^(dwarf|symtab|system-map)$"
-LAB_PATTERN = "^(btf|symdb|dwarf|symtab|system-map)$"
-# PyPI volatility3 2.28.0 wheel에 포함된 원본 스키마의 SHA-256이다.
-# 예상과 다른 코어 수정 위에 패치를 겹쳐 적용하지 않는다.
-STOCK_SHA256 = "39386442c722598f55213399b1bc603b49c7ecd43ecf58c2f110a97624da5246"
-BACKUP_SUFFIX = ".containercaps-original"
-
-
-def schema_state(raw: bytes) -> str:
-    """알려진 원본 또는 아래 한 항목만 수정된 스키마인지 확인한다."""
-    try:
-        document = json.loads(raw)
-        pattern = document["definitions"]["metadata_nix_item"]["properties"]["kind"][
-            "pattern"
-        ]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise RuntimeError("예상한 metadata_nix_item.kind 스키마가 아닙니다.") from exc
-    if pattern not in (STOCK_PATTERN, LAB_PATTERN):
-        raise RuntimeError("예상과 다른 메타데이터 허용 패턴입니다. 수정하지 않았습니다.")
-    if raw.count(pattern.encode("ascii")) != 1:
-        raise RuntimeError("수정 대상 패턴이 정확히 한 곳에 있어야 합니다.")
-    normalized = raw.replace(LAB_PATTERN.encode("ascii"), STOCK_PATTERN.encode("ascii"))
-    if hashlib.sha256(normalized).hexdigest() != STOCK_SHA256:
-        raise RuntimeError("공식 2.28.0 스키마와 다른 내용입니다. 수정하지 않았습니다.")
-    return "stock" if pattern == STOCK_PATTERN else "prepared"
-
-
-def installed_schema() -> Path:
-    """시스템 Python 및 가상환경 밖의 editable 설치를 수정 대상에서 제외한다."""
-    prefix = Path(sys.prefix).resolve()
-    if prefix == Path(sys.base_prefix).resolve():
-        raise RuntimeError("전용 가상환경(.venv)의 Python으로 실행하세요.")
-    try:
-        installed_version = importlib.metadata.version("volatility3")
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise RuntimeError("이 가상환경에 volatility3==2.28.0을 설치하세요.") from exc
-    if installed_version != VOLATILITY_VERSION:
-        raise RuntimeError(f"Volatility {installed_version} 감지: 정확히 2.28.0만 지원합니다.")
-    if importlib.util.find_spec("jsonschema") is None:
-        raise RuntimeError("유효성 검사를 유지하려면 이 가상환경에 jsonschema를 설치하세요.")
-    spec = importlib.util.find_spec("volatility3")
-    if spec is None or spec.origin is None:
-        raise RuntimeError("Volatility 설치 위치를 확인할 수 없습니다.")
-    schema = (Path(spec.origin).parent / "schemas" / "schema-6.2.0.json").resolve()
-    if not schema.is_relative_to(prefix):
-        raise RuntimeError("스키마가 현재 가상환경 밖에 있습니다. editable 설치는 수정하지 않습니다.")
-    if not schema.is_file():
-        raise RuntimeError("설치된 schema-6.2.0.json을 찾을 수 없습니다.")
-    return schema
-
-
-def replace_atomically(path: Path, raw: bytes) -> None:
-    """쓰기 도중 중단되어도 원본 스키마가 잘린 파일이 되지 않게 한다."""
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", delete=False) as temp:
-            temp_path = Path(temp.name)
-            temp.write(raw)
-            temp.flush()
-            os.fsync(temp.fileno())
-        shutil.copymode(path, temp_path)
-        temp_path.replace(path)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-
-
-def prepare_schema(path: Path, *, restore: bool = False) -> str:
-    """원본 백업을 보존하며 멱등 적용하거나 정확한 원본으로 복원한다."""
-    raw = path.read_bytes()
-    state = schema_state(raw)
-    backup = path.with_name(path.name + BACKUP_SUFFIX)
-    if backup.exists():
-        if schema_state(backup.read_bytes()) != "stock":
-            raise RuntimeError("백업이 공식 원본과 다릅니다. 수정하지 않았습니다.")
-    elif state == "prepared":
-        raise RuntimeError("이미 수정된 스키마에 원본 백업이 없습니다. 자동 변경하지 않습니다.")
-    elif not restore:
-        # 기존 백업을 덮어쓰지 않는다. 새 백업 생성이 끝난 후에만 수정한다.
-        with backup.open("xb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-    if restore:
-        if state == "stock":
-            return "이미 공식 원본 상태입니다."
-        replace_atomically(path, backup.read_bytes())
-        return "공식 원본 스키마로 복원했습니다. 백업은 보존했습니다."
-    if state == "prepared":
-        return "이미 준비되어 있습니다. 스키마와 백업을 확인했습니다."
-    modified = raw.replace(STOCK_PATTERN.encode("ascii"), LAB_PATTERN.encode("ascii"))
-    if schema_state(modified) != "prepared":
-        raise RuntimeError("수정 결과 검증에 실패했습니다.")
-    replace_atomically(path, modified)
-    return "btf/symdb 메타데이터 출처만 추가 허용했습니다. 유효성 검사는 유지합니다."
-
-
-# 저장 결과 조회와 스키마 준비는 아래 커널 판독기를 불러오지 않는다.
-# 따라서 --saved 조회에는 Volatility 설치가 필요 없다. 새 분석은 이 파일을
-# --volatility로 다시 실행하여 공식 플러그인 탐색·심볼 자동 구성을 이용한다.
+# 저장 조회는 아래 커널 판독기를 불러오지 않아 Volatility 설치 없이 가능하다.
+# 새 분석은 --volatility로 다시 실행해 공식 플러그인 탐색·심볼 구성을 이용한다.
 if __name__ == '__main__':
     try:
         sys.exit(main())
@@ -920,15 +651,14 @@ if __name__ == '__main__':
 
 
 # 여기부터는 공식 Volatility가 이 파일을 플러그인 모듈로 import할 때 사용한다.
-from volatility3.framework import exceptions, interfaces, objects, renderers
-from volatility3.framework.configuration import requirements
-from volatility3.framework.constants import linux
-from volatility3.framework.objects import utility
-from volatility3.plugins.linux import pslist, mountinfo
+from volatility3.framework import exceptions, interfaces, objects, renderers  # 읽기 예외·플러그인 기반·메모리 객체·결과 표 API.
+from volatility3.framework.configuration import requirements  # 커널 모듈·의존 API·실행 옵션의 요구 조건을 선언한다.
+from volatility3.framework.constants import linux  # capability 비트 번호에 대응하는 이름 등 Linux 상수를 사용한다.
+from volatility3.framework.objects import utility  # 메모리의 문자 배열을 프로세스 이름 등의 문자열로 변환한다.
+from volatility3.plugins.linux import pslist  # 공식 PsList API로 프로세스와 스레드를 열거한다.
 
 
-
-# 4. 심볼 구조 검사와 PID namespace 복원
+# 3. 심볼 구조 검사와 PID namespace 복원
 
 # 커널 버전 문자열 대신 일치하는 ISF의 타입·멤버로 알려진 구조를 선택한다.
 # 새 구조는 명시적으로 지원해야 하며, 심볼 제공만으로 모든 커널 호환이 보장되지는 않는다.
@@ -1065,10 +795,10 @@ def read_pid_chain(task, module):
         raise ValueError(f'{field}: could not read PID namespace evidence ({type(exc).__name__}: {exc})') from exc
 
 
-# 5. Docker cgroup v2 소속 복원
+# 4. 심볼 구조에 따른 Docker cgroup 소속 복원
 
 # 이름이 containerd-shim인 프로세스의 자식만 고르는 방식이 아니라, 각 태스크의
-# cgroup v2 소속과 Docker 경로 표식을 확인한다. 표식은 런타임 신원 인증이 아니다.
+# cgroup 소속과 Docker 경로 표식을 확인한다. 표식은 런타임 신원 인증이 아니다.
 
 
 SCOPE = re.compile(r'docker-([0-9a-fA-F]{64})\.scope\Z')
@@ -1190,7 +920,99 @@ class CgroupV2Resolver:
         return cset, cgroup, chain, group
 
 
-# 6. Capability 원시 비트와 읽기 상태 판독
+class CgroupLinksResolver:
+    """Read actual memberships across known kernfs-based v1/v2 hierarchies.
+
+    css_set.subsys can point to ancestors and omits controller-less hierarchies.
+    Use cgrp_links instead, validating ownership and both directions of the list.
+    """
+    def __init__(self, module):
+        feature = 'container_membership'
+        fields = {'task_struct': ('cgroups',), 'css_set': ('cgrp_links',),
+                  'cgrp_cset_link': ('cgrp', 'cset', 'cgrp_link'),
+                  'cgroup': ('kn', 'self', 'root'), 'cgroup_root': ('hierarchy_id',),
+                  'cgroup_subsys_state': ('parent', 'cgroup'),
+                  'kernfs_node': ('name',), 'list_head': ('next', 'prev')}
+        types = {name: require_fields(module, name, names, feature) for name, names in fields.items()}
+        node = types['kernfs_node']
+        self.parent_field = 'parent' if node.has_member('parent') else '__parent' if node.has_member('__parent') else None
+        if self.parent_field is None:
+            raise UnsupportedLayoutError(feature, 'kernfs_node.parent|__parent', 'unsupported parent layout')
+        self.link_offset = types['cgrp_cset_link'].relative_child_offset('cgrp_link')
+        if not 0 <= self.link_offset < types['cgrp_cset_link'].size:
+            raise ValueError('Invalid cgrp_cset_link.cgrp_link offset in symbols')
+        self.module, self.cache = module, {}
+        self.compatibility = {'feature': feature, 'status': 'ok', 'layout': {
+            'hierarchy': 'cgroup-v1/v2-kernfs', 'task_cgroups': 'task_struct.cgroups',
+            'membership_links': 'css_set.cgrp_links -> cgrp_cset_link.cgrp',
+            'css_parent': 'cgroup.self.parent.cgroup',
+            'kernfs_parent': 'kernfs_node.' + self.parent_field}}
+
+    def resolve(self, task):
+        if not int(task.cgroups):
+            raise ValueError('task_struct.cgroups: null css_set pointer')
+        cset = task.cgroups.dereference()
+        address = int(cset.vol.offset)
+        if address not in self.cache:
+            head = cset.cgrp_links
+            head_address = int(head.vol.offset)
+            previous, current = head_address, int(head.next)
+            seen, entries, evidence = set(), [], []
+            while current != head_address:
+                if not current or current in seen or len(seen) >= 256:
+                    raise ValueError('Broken, cyclic or oversized css_set.cgrp_links list')
+                seen.add(current)
+                link = self.module.object('cgrp_cset_link', offset=current - self.link_offset, absolute=True)
+                if int(link.cgrp_link.vol.offset) != current or int(link.cgrp_link.prev) != previous:
+                    raise ValueError('cgrp_links forward/backward links disagree')
+                if int(link.cset) != address or not int(link.cgrp):
+                    raise ValueError('cgrp_cset_link owner or cgroup pointer disagrees')
+                cgroup = link.cgrp.dereference()
+                chain = read_cgroup_chain(cgroup, parent_field=self.parent_field)
+                if not int(cgroup.root):
+                    raise ValueError('cgroup.root: null hierarchy pointer')
+                hierarchy = int(cgroup.root.dereference().hierarchy_id)
+                if hierarchy < 0:
+                    raise ValueError('Negative cgroup hierarchy ID')
+                group = identify_docker(chain)
+                evidence.append({'hierarchy_id': hierarchy, 'hierarchy': 'v2' if hierarchy == 0 else 'v1',
+                                 'cgroup_address': hex(int(cgroup.vol.offset)),
+                                 'chain': chain, 'docker_marker': group})
+                entries.append((hierarchy, cgroup, chain, group))
+                previous, current = current, int(link.cgrp_link.next)
+            if int(head.prev) != previous or not entries:
+                raise ValueError('Incomplete or empty css_set.cgrp_links list')
+            if len({entry[0] for entry in entries}) != len(entries):
+                raise ValueError('Multiple cgroup memberships in the same hierarchy')
+            matches = [entry for entry in entries if entry[3] is not None]
+            if len({entry[3]['id'] for entry in matches}) > 1:
+                error = ValueError('Docker markers disagree across cgroup hierarchies')
+                error.membership_evidence = evidence
+                raise error
+            # 같은 Docker ID라도 각 계층의 근거는 모두 보존한다. 기본 계층(0)을 우선해
+            # 기존 v2의 루트 주소를 유지하고, v1-only에서는 계층 ID 순서로 대표를 고른다.
+            _, cgroup, chain, group = min(matches or entries, key=lambda entry: entry[0])
+            if group is not None:
+                group = dict(group, membership_evidence=evidence)
+            self.cache[address] = (cgroup, chain, group)
+        cgroup, chain, group = self.cache[address]
+        return cset, cgroup, chain, group
+
+
+def membership_resolver(module):
+    # 두 판독기는 심볼 구조로 선택한다. 타입이 없는 경우만 대안을 시도하며,
+    # 선택한 판독기의 실제 메모리 오류를 다른 경로의 성공으로 덮지 않는다.
+    try:
+        return CgroupLinksResolver(module)
+    except (UnsupportedLayoutError, AttributeError, KeyError) as exc:
+        resolver = CgroupV2Resolver(module)
+        if resolver.compatibility.get('layout', {}).get('hierarchy') == 'cgroup-v2':
+            resolver.compatibility['coverage'] = 'default_hierarchy_only'
+            resolver.compatibility['unavailable_reader'] = str(exc)
+        return resolver
+
+
+# 5. Capability 원시 비트와 읽기 상태 판독
 
 # 자체 구조 판독기다. 공식 Capabilities._decode_cap은 호출하지 않으며,
 # Volatility의 Integer/Array 객체와 linux.CAPABILITIES 이름 목록만 재사용한다.
@@ -1200,12 +1022,17 @@ class UnsupportedLayout(ValueError):
     """The supplied symbol types do not describe a supported capability layout."""
 
 
-def _observation(feature, status, reason, **details):
-    return {'feature': feature, 'status': status, 'reason': reason, **details}
+def observation(feature, status, reason, layout=None, **details):
+    value = {'feature': feature, 'status': status, 'reason': reason, **details}
+    if layout is not None:
+        value['layout'] = layout
+    return value
 
 
 def _unsigned(value, width, cap, raw):
-    if not isinstance(value, objects.Integer):
+    if not isinstance(width, int) or not 1 <= width <= MAX_CAPABILITY_BYTES:
+        raise UnsupportedLayout('Invalid capability integer size or safety limit exceeded')
+    if not isinstance(value, objects.Integer) or isinstance(value, objects.Pointer):
         raise UnsupportedLayout('Capability component is not a symbol-defined integer')
     fmt = value.vol.data_format
     if value.vol.size != width or fmt.length != width or fmt.signed:
@@ -1225,33 +1052,45 @@ def _unsigned(value, width, cap, raw):
 
 
 def _read_mask(cap, raw):
+    # 정수의 크기/바이트 순서는 심볼에서 읽는다. cap 배열은 기존 Linux 규칙대로
+    # 원소 0이 하위 비트다. 임의의 다른 멤버 이름이나 포인터를 권한으로 추정하지 않는다.
+    if isinstance(cap, objects.Pointer):
+        raise UnsupportedLayout('A capability pointer is not a stored capability mask')
+    if isinstance(cap, objects.Integer):
+        width = cap.vol.size
+        return _unsigned(cap, width, cap, raw), f'integer_u{width * 8}', width * 8
     has_val, has_cap = cap.has_member('val'), cap.has_member('cap')
     if has_val and has_cap:
         raise UnsupportedLayout('Ambiguous capability structure contains both val and cap')
     if has_val:
-        return _unsigned(cap.member('val'), 8, cap, raw), 'val_u64'
+        value = cap.member('val')
+        width = value.vol.size
+        return _unsigned(value, width, cap, raw), f'val_u{width * 8}', width * 8
     if not has_cap:
         raise UnsupportedLayout('Capability structure has neither val nor cap')
     value = cap.member('cap')
     if isinstance(value, objects.Array):
         count = len(value)
-        if count not in (1, 2):
-            raise UnsupportedLayout('Capability cap array must contain one or two u32 words')
+        if not 1 <= count <= MAX_CAPABILITY_BYTES:
+            raise UnsupportedLayout('Capability cap array is empty or exceeds the safety limit')
+        width = value.vol.subtype.size
+        if not isinstance(width, int) or width < 1 or count * width > MAX_CAPABILITY_BYTES:
+            raise UnsupportedLayout('Invalid capability array element size or safety limit exceeded')
         mask = 0
         for index, word in enumerate(value):
-            # cap[0]은 하위 32비트다. 각 원소의 바이트 순서 해석은 _unsigned에서 끝난다.
-            mask |= _unsigned(word, 4, cap, raw) << (32 * index)
-        return mask, f'cap_u32_array_{count}'
-    return _unsigned(value, 4, cap, raw), 'cap_u32_scalar'
+            mask |= _unsigned(word, width, cap, raw) << (width * 8 * index)
+        return mask, f'cap_u{width * 8}_array_{count}', width * 8 * count
+    width = value.vol.size
+    return _unsigned(value, width, cap, raw), f'cap_u{width * 8}_scalar', width * 8
 
 
-def _kernel_range(module):
+def _kernel_range(module, storage_bits=64):
     # 보조 범위의 실패가 이미 읽은 capability 마스크·바이트를 무효화하지 않게 한다.
     # 타입 보완 근거는 범위 관측에만 남긴다. 정상적인 기존 타입은 덮어쓰지 않는다.
     details = {}
     try:
         if not module.has_symbol('cap_last_cap'):
-            return None, None, _observation(
+            return None, None, observation(
                 'capability_kernel_range', 'not_present',
                 'cap_last_cap symbol is absent; kernel capability range is unknown')
         if module.get_symbol('cap_last_cap').type is None:
@@ -1273,32 +1112,33 @@ def _kernel_range(module):
         else:
             value = module.object_from_symbol('cap_last_cap')
         if not isinstance(value, objects.Integer):
-            return None, None, _observation(
+            return None, None, observation(
                 'capability_kernel_range', 'unsupported',
                 'cap_last_cap is not a symbol-defined integer', **details)
         last = int(value)
         if last < 0:
-            return None, None, _observation(
+            return None, None, observation(
                 'capability_kernel_range', 'inconsistent', 'cap_last_cap is negative', value=last, **details)
-        if last > 63:
-            return None, None, _observation(
+        if last >= storage_bits:
+            return None, None, observation(
                 'capability_kernel_range', 'unsupported',
-                'cap_last_cap exceeds the supported 64-bit capability representation', value=last, **details)
-        return (1 << (last + 1)) - 1, last, _observation(
+                'cap_last_cap exceeds this capability storage width', value=last,
+                storage_bits=storage_bits, **details)
+        return (1 << (last + 1)) - 1, last, observation(
             'capability_kernel_range', 'ok', 'Kernel capability range read from cap_last_cap', value=last, **details)
     except UnsupportedLayout as exc:
-        return None, None, _observation(
+        return None, None, observation(
             'capability_kernel_range', 'unsupported', str(exc), **details)
     except exceptions.SymbolError as exc:
-        return None, None, _observation(
+        return None, None, observation(
             'capability_kernel_range', 'not_present', f'cap_last_cap is unavailable: {exc}', **details)
     except exceptions.InvalidAddressException as exc:
-        return None, None, _observation(
+        return None, None, observation(
             'capability_kernel_range', 'read_error', f'Cannot read cap_last_cap: {exc}', **details)
     except Exception as exc:
         # TypeError·ValueError·기타 보조 조회 실패도 범위만 미확인으로 남긴다.
         # 원시 capability 자체의 읽기/구조 검사는 이 예외 경계 밖에서 수행한다.
-        return None, None, _observation(
+        return None, None, observation(
             'capability_kernel_range', 'read_error',
             f'Cannot read cap_last_cap: {type(exc).__name__}: {exc}', **details)
 
@@ -1317,14 +1157,25 @@ def decode_capability(context, module, cap):
     Core layout/read errors propagate so callers can report the affected set.
     """
     size = cap.vol.size
-    if not isinstance(size, int) or not 1 <= size <= 64:
+    if not isinstance(size, int) or not 1 <= size <= MAX_CAPABILITY_BYTES:
         raise UnsupportedLayout('Unsupported capability structure size')
     raw = context.layers[cap.vol.layer_name].read(cap.vol.offset, size, pad=False)
     if len(raw) != size:
         raise ValueError('Short read of capability structure')
-    raw_mask, layout = _read_mask(cap, raw)
+    try:
+        raw_mask, layout, storage_bits = _read_mask(cap, raw)
+    except Exception as exc:
+        # 해석 실패도 원시 증거는 유지한다. None을 0 또는 빈 집합으로 바꾸지 않는다.
+        exc.capability_evidence = {
+            'virtual_address': hex(int(cap.vol.offset)), 'size': size,
+            'type_name': getattr(cap.vol, 'type_name', None), 'bytes_hex': raw.hex(),
+            'raw_mask': None, 'decoded_mask': None, 'names': None, 'layout': None,
+            'kernel_mask': None, 'kernel_last_cap': None, 'unknown_bits': None,
+            'out_of_range_bits': None,
+        }
+        raise
     # _kernel_range는 보조 관측이다. 실패해도 아래 원시 증거와 이름 해석은 계속한다.
-    kernel_mask, last_cap, range_observation = _kernel_range(module)
+    kernel_mask, last_cap, range_observation = _kernel_range(module, storage_bits)
     # 표시용 decoded_mask와 원래 저장된 raw_mask를 분리한다. 커널 범위 밖 비트나
     # 설치된 이름 목록에 없는 비트도 JSON에서 사라지지 않게 보존한다.
     decoded_mask = raw_mask if kernel_mask is None else raw_mask & kernel_mask
@@ -1336,15 +1187,15 @@ def decode_capability(context, module, cap):
         for bit in range(decoded_mask.bit_length()) if decoded_mask & (1 << bit)
     ]
     observations = [
-        _observation('capability_layout', 'ok', 'Capability storage read and checked against raw bytes', layout=layout),
+        observation('capability_layout', 'ok', 'Capability storage read and checked against raw bytes', layout=layout),
         range_observation,
     ]
     if unknown_bits:
-        observations.append(_observation(
+        observations.append(observation(
             'capability_names', 'unsupported', 'Stored bits have no name in the installed capability dictionary',
             bits=_bit_labels(unknown_bits)))
     if out_of_range:
-        observations.append(_observation(
+        observations.append(observation(
             'capability_value', 'inconsistent', 'Stored bits exceed the kernel cap_last_cap range',
             bits=_bit_labels(out_of_range)))
     text = ', '.join(names)
@@ -1359,7 +1210,7 @@ def decode_capability(context, module, cap):
     return {
         'text': text,
         'evidence': {
-            'virtual_address': hex(int(cap.vol.offset)), 'size': size,
+            'virtual_address': hex(int(cap.vol.offset)), 'size': size, 'storage_bits': storage_bits,
             'bytes_hex': raw.hex(), 'decoded_mask': hex(decoded_mask), 'names': names,
             'raw_mask': hex(raw_mask), 'kernel_mask': None if kernel_mask is None else hex(kernel_mask),
             'kernel_last_cap': last_cap, 'unknown_bits': hex(unknown_bits),
@@ -1369,7 +1220,7 @@ def decode_capability(context, module, cap):
     }
 
 
-# 7. Credential·user namespace·seccomp·마운트 보안 맥락
+# 6. Credential·user namespace·seccomp·마운트 보안 맥락
 
 ID_FIELDS = ('uid', 'euid', 'suid', 'fsuid', 'gid', 'egid', 'sgid', 'fsgid')
 SAFETY_ITEMS = 65536
@@ -1377,13 +1228,6 @@ SAFETY_ITEMS = 65536
 
 class InconsistentData(ValueError):
     """Successfully read fields fail a structural consistency check."""
-
-
-def observation(feature, status, reason, layout=None):
-    value = {'feature': feature, 'status': status, 'reason': reason}
-    if layout is not None:
-        value['layout'] = layout
-    return value
 
 
 def member(obj, name):
@@ -1484,7 +1328,7 @@ class SecurityReader:
         self.context, self.module = context, module
         self.observations = []
         self.compatibility = self.observations
-        self.ns_cache, self.mount_cache = {}, {}
+        self.ns_cache = {}
         self.banner = capture(self.observations, 'kernel.banner', lambda: str(module.object_from_symbol('linux_banner').cast(
             'string', max_length=512, encoding='utf-8', errors='replace')).rstrip('\n'))
         self.initial_ns = None
@@ -1570,11 +1414,10 @@ class SecurityReader:
         observations = []
         result = {'address': hex(int(cred.vol.offset)), 'ids_kernel': {}, 'ids_in_user_namespace': {},
                   'capability_evidence': {}, 'capabilities': {}, 'securebits': None,
-                  'security_blob_address': None, 'lsm_policy': 'not_evaluated', 'observations': observations}
+                  'lsm_policy': 'not_evaluated', 'observations': observations}
         for name in ID_FIELDS:
             result['ids_kernel'][name] = capture(observations, 'credentials.' + name, lambda name=name: kernel_id(member(cred, name)))
         result['securebits'] = capture(observations, 'credentials.securebits', lambda: int(member(cred, 'securebits')))
-        result['security_blob_address'] = capture(observations, 'credentials.security_blob', lambda: hex(int(member(cred, 'security'))))
         for name in CAP_FIELDS:
             result['capabilities'][name] = None
             result['capability_evidence'][name] = None
@@ -1585,10 +1428,13 @@ class SecurityReader:
                     continue
                 decoded = decode_capability(self.context, self.module, cred.member(field))
             except UnsupportedLayout as exc:
+                result['capability_evidence'][name] = getattr(exc, 'capability_evidence', None)
                 observations.append(observation(name, 'unsupported', str(exc)))
             except ValueError as exc:
+                result['capability_evidence'][name] = getattr(exc, 'capability_evidence', None)
                 observations.append(observation(name, 'inconsistent', str(exc)))
             except Exception as exc:
+                result['capability_evidence'][name] = getattr(exc, 'capability_evidence', None)
                 observations.append(observation(name, 'read_error', type(exc).__name__ + ': ' + str(exc)))
             else:
                 result['capabilities'][name] = decoded['text']
@@ -1762,9 +1608,11 @@ class SecurityReader:
         return result
 
     def mounts(self, task):
+        # CAPS 비교에 필요한 namespace와 프로세스 루트 주소만 수집한다.
+        # 마운트 목록은 읽지 않으므로 빈 목록 대신 명시적인 미수집 상태를 남긴다.
         observations = []
         result = {'namespace_address': None, 'task_root_mount': None, 'task_root_dentry': None,
-                  'entries': [], 'errors': [], 'file_access_policy_evaluated': False, 'observations': observations}
+                  'mount_list_collected': False, 'file_access_policy_evaluated': False, 'observations': observations}
         namespace = capture(observations, 'mounts.namespace', lambda: dereference(member(dereference(member(task, 'nsproxy'), 'nsproxy'), 'mnt_ns'), 'mount namespace'))
         root = capture(observations, 'mounts.task_root', lambda: member(dereference(member(task, 'fs'), 'fs'), 'root'))
         if namespace is not None:
@@ -1772,60 +1620,38 @@ class SecurityReader:
         if root is not None:
             result['task_root_mount'] = capture(observations, 'mounts.root_mnt', lambda: hex(int(member(root, 'mnt'))))
             result['task_root_dentry'] = capture(observations, 'mounts.root_dentry', lambda: hex(int(member(root, 'dentry'))))
-        if namespace is None:
-            return result
-        # 같은 mount namespace에서도 태스크의 root가 다르면 보이는 경로가 달라진다.
-        # 따라서 캐시는 namespace와 root의 mount/dentry 주소가 모두 같은 경우에만 공유한다.
-        key = (result['namespace_address'], result['task_root_mount'], result['task_root_dentry'])
-        if all(key) and key in self.mount_cache:
-            return self.mount_cache[key]
-        def collect_mounts():
-            if not hasattr(namespace, 'get_mount_points'):
-                raise UnsupportedLayout('Volatility mount traversal extension unavailable')
-            seen = set()
-            # 순회와 경로/옵션 복원은 공식 mnt_namespace 확장·MountInfo API를 호출한다.
-            # 이 마운트 정보만으로 특정 파일의 DAC/ACL·LSM 접근 허용까지 판정하지 않는다.
-            for mnt in namespace.get_mount_points():
-                address = int(mnt.vol.offset)
-                if address in seen or len(seen) >= SAFETY_ITEMS:
-                    raise InconsistentData('Invalid/oversized mount traversal')
-                seen.add(address)
-                record = capture(observations, 'mounts.entry.' + hex(address), lambda: mountinfo.MountInfo.get_mountinfo(mnt, task))
-                if record is None:
-                    result['errors'].append({'mount': hex(address), 'error': 'Mount entry unavailable; see observations'})
-                else:
-                    result['entries'].append({**record._asdict(), 'mount_address': hex(address)})
-            return len(seen)
-        capture(observations, 'mounts.traversal', collect_mounts)
-        if all(key) and not result['errors'] and all(item['status'] == 'ok' for item in observations):
-            self.mount_cache[key] = result
         return result
 
 
-# 8. Volatility 플러그인: 태스크 열거, 수집, 감사 JSON과 표 출력
+# 7. Volatility 플러그인: 태스크 열거, 수집, 감사 JSON과 표 출력
 
 # 수집 순서: 전체 태스크 → Docker cgroup 소속 → 태스크별 보안 맥락 → 감사 JSON/표.
-# 공식 PsList·MountInfo·렌더러 API를 사용하며, 원본 volatility-docker 코드를 복사하거나
-# 공식 Capabilities 플러그인을 호출하지 않는다. 실제 덤프 검증 커널은 7.0.0-31-generic이다.
+# 공식 PsList·렌더러 API를 사용하며, 원본 volatility-docker 코드를 복사하거나
+# 공식 Capabilities 플러그인을 호출하지 않는다. 검증 범위는 CAPS_CONTEXT.md에 기록한다.
 
 
 LOG = logging.getLogger(__name__)
 
 
 class ContainerCaps(interfaces.plugins.PluginInterface):
-    """Group Docker cgroup-v2 tasks and extract their capabilities."""
+    """Extract Docker task capabilities using matching symbols and supported layouts.
+
+    Ubuntu/kernel version numbers do not select readers. Unknown layouts remain
+    explicit; matching symbols do not guarantee complete analysis of every kernel.
+    """
+    hidden = True  # Exposed through linux.docker.Docker --inspect-caps.
     _required_framework_version = (2, 13, 0)
     _version = VERSION_INFO
 
     @classmethod
     def get_requirements(cls):
-        # pslist/mountinfo의 version은 각 플러그인 API 버전이며 pip 패키지 버전과 구별한다.
+        # pslist의 version은 플러그인 API 버전이며 pip 패키지 버전과 구별한다.
         return [
-            requirements.ModuleRequirement(name='kernel', description='Linux x86-64 kernel with matching symbols and cgroup v2', architectures=['Intel64']),
+            requirements.ModuleRequirement(name='kernel', description='Linux x86-64 kernel with matching symbols', architectures=['Intel64']),
             requirements.VersionRequirement(name='pslist', component=pslist.PsList, version=(4, 0, 0)),
-            requirements.VersionRequirement(name='mountinfo', component=mountinfo.MountInfo, version=(1, 2, 4)),
             requirements.StringRequirement(name='container', description='Docker ID or unique hex prefix (6-64 characters)', optional=True),
             requirements.BooleanRequirement(name='leaders', description='Only process leaders; default includes threads', default=False, optional=True),
+            requirements.BooleanRequirement(name='unresolved', description='Show tasks whose container membership could not be read (not confirmed containers)', default=False, optional=True),
             requirements.ChoiceRequirement(name='view', description='Raw columns or evidence-based analyst report', choices=['raw', 'analyst'], default='raw', optional=True),
         ]
 
@@ -1921,8 +1747,6 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
             try:
                 member[source] = reader(task)
                 self._observations(member, audit, source, member[source].get('observations', []))
-                if source == 'mounts' and member[source].get('errors'):
-                    raise ValueError('Mount entries incomplete; see mounts.errors')
             except Exception as exc:
                 self._failure(member, audit, source, exc)
         seccomp = member.get('seccomp', {})
@@ -1933,15 +1757,19 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         member['MountNS'] = (resources.get('mount') or {}).get('inum')
         member['NetNS'] = (resources.get('network') or {}).get('inum')
 
-    def _bytes(self, obj):
-        layer = self.context.layers[obj.vol.layer_name]
-        return {'virtual_address': hex(int(obj.vol.offset)), 'size': obj.vol.size,
-                'bytes_hex': layer.read(obj.vol.offset, obj.vol.size, pad=False).hex()}
-
     def run(self):
         module = self.context.modules[self.config['kernel']]
-        # 소속 복원에 필수인 cgroup 구조는 먼저 검사한다. 선택적인 PID/보안 필드는 부분 수집한다.
-        resolver = CgroupV2Resolver(module)
+        # 소속 판독을 지원하지 않아도 태스크의 권한 수집은 진행한다. 이 태스크들은
+        # confirmed members에 섞지 않고 unresolved_members에 별도로 보존한다.
+        membership_error = None
+        try:
+            resolver = membership_resolver(module)
+            membership_layout = resolver.compatibility
+        except Exception as exc:
+            resolver, membership_error = None, exc
+            membership_layout = {'feature': 'container_membership', 'status': 'unsupported'
+                                 if isinstance(exc, (UnsupportedLayoutError, AttributeError, KeyError)) else 'read_error',
+                                 'reason': str(exc)}
         security = SecurityReader(self.context, module)
         try:
             pid_layout = inspect_pid_layout(module)
@@ -1951,28 +1779,40 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         if prefix and not re.fullmatch(r'[0-9a-fA-F]{6,64}', prefix):
             raise ValueError('Container prefix must be 6-64 hexadecimal characters')
         prefix = prefix.lower()
+        show_unresolved = self.config.get('unresolved', False)
+        if show_unresolved and prefix:
+            raise ValueError('--unresolved cannot be combined with --container')
         # audit는 실행 전체, members의 각 항목은 태스크 하나의 값과 그 값을 읽은 근거다.
         audit = {
             'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'plugin_version': VERSION, 'kernel_banner': security.banner,
+            'support_policy': dict(SUPPORT_POLICY),
             'global_observations': [dict(item, source='security') for item in security.observations],
             'compatibility': {
-                'policy': 'matching symbols; structure-selected readers; cgroup v2 and Intel64',
-                'membership': resolver.compatibility,
+                'policy': 'matching symbols; structure-selected readers; Intel64; unknown layouts remain explicit',
+                'membership': membership_layout,
                 'pid_namespace': pid_layout,
                 'security': getattr(security, 'compatibility', {}),
             },
             'credential_source': 'task.cred (subjective); task.real_cred recorded separately',
-            'method': 'task.cgroups -> css_set.dfl_cgrp -> cgroup CSS/kernfs parent chains',
-            'scope': 'Docker-marked cgroup-v2 paths; no Docker registry reconstruction; no paused verdict',
+            'method': 'symbol-selected css_set memberships -> cgroup CSS/kernfs parent chains',
+            'scope': 'Docker-marked paths in supported cgroup layouts; unresolved tasks stored separately; no Docker registry reconstruction',
             'include_threads': not self.config.get('leaders', False),
             'seen_task_addresses': [], 'seen_tids': [], 'tasks_without_docker_marker': 0,
             'membership_errors': [], 'field_errors': [], 'traversal_errors': [],
             'partial_observations': [],
-            'containers': [], 'members': [],
+            'containers': [], 'members': [], 'unresolved_members': [],
             'thread_inventory': [],
             'not_evaluated': ['LSM policies', 'seccomp BPF rule outcomes', 'per-file DAC/ACL and idmapped-mount decisions'],
         }
+        if membership_error is not None:
+            audit['global_observations'].append(dict(membership_layout, source='membership'))
+        if membership_layout.get('coverage') == 'default_hierarchy_only':
+            # v2 경로가 읽혔다고 v1/혼합 계층까지 검사했다고 보고하지 않는다.
+            audit['global_observations'].append(observation(
+                'legacy_membership', 'unsupported',
+                'Only the default cgroup hierarchy was inspected; legacy hierarchies are unverified',
+                source='membership'))
         seen = set()
         found_groups = {}
         all_tids_by_pid = {}
@@ -1991,31 +1831,48 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 all_tids_by_pid.setdefault(tgid, set()).add(tid)
                 audit['seen_task_addresses'].append(hex(address))
                 audit['seen_tids'].append(tid)
+                identity_error = membership_error
+                cset = cgroup = group = None
+                chain = []
                 try:
+                    if resolver is None:
+                        raise membership_error
                     cset, cgroup, chain, group = resolver.resolve(task)
-                    key = int(cgroup.vol.offset)
                     if group is None:
                         audit['tasks_without_docker_marker'] += 1
                         continue
                 except Exception as exc:
+                    identity_error = exc
                     audit['membership_errors'].append({'pid': tgid, 'tid': tid, 'task': hex(address), 'error': str(exc)})
-                    continue
                 # 같은 ID 표식이라도 다른 cgroup 객체는 합치지 않는다.
-                group_key = (group['id'], group['root_address'])
-                found_groups[group_key] = group
+                if group is not None:
+                    group_key = (group['id'], group['root_address'])
+                    found_groups[group_key] = group
                 member = {
-                    'ContainerID': group['id'], 'ContainerRoot': group['root_address'],
-                    'ContainerPath': group['root_path'], 'CgroupPath': '/' + '/'.join(x['name'] for x in chain if x['name']),
-                    'PID': tgid, 'TID': tid, 'Name': utility.array_to_string(task.comm),
-                    'TaskAddress': hex(address), 'CssSetAddress': hex(int(cset.vol.offset)),
-                    'CgroupAddress': hex(key), 'PIDNS': None, 'NSPID': None, 'NSTID': None,
+                    'ContainerID': group['id'] if group else None, 'ContainerRoot': group['root_address'] if group else None,
+                    'ContainerPath': group['root_path'] if group else None,
+                    'CgroupPath': '/' + '/'.join(x['name'] for x in chain if x['name']) if chain else None,
+                    'PID': tgid, 'TID': tid, 'Name': None,
+                    'TaskAddress': hex(address), 'CssSetAddress': hex(int(cset.vol.offset)) if cset else None,
+                    'CgroupAddress': hex(int(cgroup.vol.offset)) if cgroup else None, 'PIDNS': None, 'NSPID': None, 'NSTID': None,
                     'UserNS': None, 'EUID': None, 'Status': 'ok',
                     'UserEUID': None, 'CapabilityScope': 'unknown', 'CredSource': 'task.cred',
                     'CredsDiffer': None, 'NoNewPrivs': None, 'SeccompMode': None,
                     'SeccompFilters': None, 'Securebits': None, 'MountNS': None, 'NetNS': None,
                     'ExpectedThreads': None,
                     'cgroup_chain': chain, 'capability_evidence': {}, 'observations': [],
+                    'membership_status': 'confirmed_marker' if group else 'unresolved',
+                    'membership_evidence': group.get('membership_evidence', []) if group else
+                                           getattr(identity_error, 'membership_evidence', []),
                 }
+                if identity_error is not None:
+                    # 소속 오류는 membership_errors에 이미 집계했다. 필드 오류로 중복 계산하지 않는다.
+                    self._failure(member, {'partial_observations': audit['partial_observations'], 'field_errors': []},
+                                  'container_membership', identity_error)
+                try:
+                    member['Name'] = utility.array_to_string(task.comm)
+                except Exception as exc:
+                    self._failure(member, audit, 'process_name', exc)
                 for field in CAP_FIELDS:
                     # 읽기 전 값은 미확인(None)이다. 읽기에 성공한 빈 권한 집합과 구별한다.
                     member[field] = None
@@ -2036,7 +1893,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     member['ExpectedThreads'] = int(task.signal.nr_threads)
                 except Exception as exc:
                     self._failure(member, audit, 'thread_count', exc)
-                audit['members'].append(member)
+                audit['members' if group else 'unresolved_members'].append(member)
         except Exception as exc:
             audit['traversal_errors'].append(str(exc))
 
@@ -2045,12 +1902,16 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
             raise ValueError('Container prefix is ambiguous; supply more characters')
         selected = [m for m in audit['members'] if m['ContainerID'].startswith(prefix)]
         selected.sort(key=lambda m: (m['ContainerID'], m['ContainerRoot'], m['PID'], m['TID']))
+        audit['unresolved_members'].sort(key=lambda m: (m['PID'], m['TID']))
         audit['containers'] = sorted(found_groups.values(), key=lambda g: (g['id'], g['root_address']))
         audit['selected_prefix'] = prefix
         audit['selected_tasks'] = len(selected)
         audit['selected_containers'] = len({(m['ContainerID'], m['ContainerRoot']) for m in selected})
         audit['enumerated_tasks'] = len(seen)
         audit['discovered_docker_tasks'] = len(audit['members'])
+        audit['unresolved_tasks'] = len(audit['unresolved_members'])
+        audit['display_scope'] = 'unresolved' if show_unresolved else 'confirmed_docker_markers'
+        audit['displayed_tasks'] = audit['unresolved_tasks'] if show_unresolved else len(selected)
         # 같은 프로세스의 스레드가 다른 cgroup에 있을 수 있어 전체 열거 TID로 nr_threads를 대조한다.
         # 대표 스레드만 수집했거나 비교 근거가 모자라면 count_matches는 미확인(None)으로 남긴다.
         for pid in sorted({m['PID'] for m in audit['members']}):
@@ -2066,7 +1927,9 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 for member in members:
                     self._observations(member, audit, 'thread_inventory', [{'feature': 'thread_coverage',
                         'status': 'inconsistent', 'reason': 'Observed TIDs and signal.nr_threads disagree'}])
-        audit['coverage_complete_within_enumerated_tasks'] = not (audit['membership_errors'] or audit['traversal_errors'])
+        audit['coverage_complete_within_enumerated_tasks'] = not (
+            audit['membership_errors'] or audit['traversal_errors'] or
+            membership_layout.get('coverage') == 'default_hierarchy_only')
         audit['quality'] = audit_quality(audit)
         # self.open은 Volatility 출력 디렉터리(-o)를 따른다. 화면을 줄여도 원시 근거는
         # 감사 JSON에 남기며, analyst JSON에는 집합 비교와 확인 항목을 추가한다.
@@ -2077,11 +1940,11 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
             LOG.warning('ContainerCaps: incomplete observations; inspect containercaps-audit.json (errors=%d, partial=%d; global errors=%d, global partial=%d)',
                         total_errors, total_partial, audit['quality']['global_errors'], audit['quality']['global_partial_observations'])
         if self.config.get('view', 'raw') == 'analyst':
-            report = build_report(audit, selected)
+            report = build_report(audit, [] if show_unresolved else selected)
             with self.open('containercaps-analyst.json') as handle:
                 handle.write(json.dumps(report, ensure_ascii=False, indent=2).encode('utf-8'))
             return renderers.TreeGrid([(name, str) for name in SUMMARY_COLUMNS],
-                                      ((0, row) for row in summary_rows(report)))
+                                      ((0, row) for row in (unresolved_rows(report) if show_unresolved else summary_rows(report))))
         columns = [('ContainerID', str), ('ContainerRoot', str), ('CgroupPath', str),
                    ('PID', int), ('TID', int), ('Name', str), ('NSPID', int), ('NSTID', int),
                    ('PIDNS', int), ('UserNS', int), ('EUID', int), ('UserEUID', int),
@@ -2089,7 +1952,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                    ('NoNewPrivs', bool), ('SeccompMode', int), ('SeccompFilters', int),
                    ('Securebits', int), ('MountNS', int), ('NetNS', int), ('Status', str)] + [(x, str) for x in CAP_FIELDS]
         def generate():
-            for member in selected:
+            for member in audit['unresolved_members'] if show_unresolved else selected:
                 # TreeGrid는 표시용이다. renderer JSON도 정제된 셀이며 원본은 audit JSON에 있다.
                 values = tuple((clean(member[key]) if kind is str else member[key])
                                if member[key] is not None else renderers.NotAvailableValue() for key, kind in columns)

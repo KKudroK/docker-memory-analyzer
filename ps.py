@@ -1,6 +1,6 @@
 """Task-linked Docker container summaries for stock Volatility 3 >= 2.28.0.
 
-Run ``vol ... -p ./plugins -o ./results ps.Ps --ps``. Each full container ID
+Run via ``vol ... -p ./plugins linux.docker.Docker --ps``. Each full container ID
 has one category/value block. A representative is chosen from an observed
 namespace init or attributed direct shim child; ambiguous cases remain unknown.
 Only that representative's start time, effective UID and capability are read.
@@ -9,9 +9,10 @@ PID 1 capability comparison. Cache freshness cannot be established from presence
 
 The reachable leader list is audited in both directions. Identity uses task
 cgroups, shim arguments/direct children and conditional standard bind mounts.
-Settings recovery uses host-mounted roots and filters to task-linked IDs. It
-keeps only the Privileged value and validation evidence, not general settings.
-The output has no lifecycle classifier. ps_evidence.json uses schema 4.
+Settings recovery follows verified standard bind mounts to each task-linked
+container directory. It keeps only fully recovered Privileged values and
+validation evidence, not general settings. The output has no lifecycle
+classifier. ps_evidence.json uses schema 5.
 """
 import datetime
 import hashlib
@@ -21,19 +22,19 @@ import re
 import struct
 import time
 
-from volatility3.framework import constants, exceptions, interfaces, objects, renderers
-from volatility3.framework.configuration import requirements
+from volatility3.framework import constants, exceptions, objects, renderers
 from volatility3.framework.objects import utility
 from volatility3.framework.symbols import linux
 
 vollog = logging.getLogger(__name__)
 LIMIT = 100000
 FILE_LIMIT = 16 * 1024 * 1024
+SETTINGS_MOUNT_LIMIT = 2048
+SETTINGS_CHILD_LIMIT = 4096
+SETTINGS_SECONDS = 20
 CID = re.compile(r"[0-9a-f]{64}\Z")
 CGROUP_ID = re.compile(r"/(?:docker/|docker-)([0-9a-f]{64})(?:\.scope)?(?=/|$)")
 BIND_ID = re.compile(r"(?:^|/)containers/([0-9a-f]{64})/(hosts|hostname|resolv\.conf)\Z")
-SETTINGS_FILE = re.compile(r"(?:^|/)containers/([0-9a-f]{64})/hostconfig\.json\Z")
-SETTINGS_DIR = re.compile(r"(?:^|/)containers/([0-9a-f]{64})(?=/|$)")
 UTC = datetime.timezone.utc
 STAGES = ("tasks", "identity", "selection", "details", "settings")
 STAGE_SCOPES = {
@@ -41,7 +42,7 @@ STAGE_SCOPES = {
     "identity": "shim arguments/direct children and conditional non-host namespace bind mounts",
     "selection": "one candidate per ID observed on a process leader",
     "details": "selected representative start time and credentials only",
-    "settings": "Privileged from hostconfig.json for task-linked IDs; host-mounted roots only",
+    "settings": "Privileged from verified container bind-mount directories; bounded lookup",
 }
 
 
@@ -58,7 +59,10 @@ class DuplicateJSONKey(ValueError):
 
 
 def utc(seconds, nanoseconds=0):
-    # 초·나노초 값을 UTC 시각 문자열로 변환하며, 시각이 미확인이면 None을 반환한다.
+    """초·나노초 값을 UTC 시각 문자열로 변환하며, 시각이 미확인이면 None을 반환한다.
+
+    로직: 입력 범위를 검사하고 UTC 기준 시각으로 바꾼 뒤 나노초 자릿수를 붙인다.
+    """
     if seconds is None:
         return None
     if not 0 <= nanoseconds < 1000000000:
@@ -69,7 +73,10 @@ def utc(seconds, nanoseconds=0):
 
 
 def unique_pairs(pairs):
-    # JSON 키·값 쌍을 사전으로 만들고, 중복 키가 있으면 오류로 처리한다.
+    """JSON 키·값 쌍을 사전으로 만들고, 중복 키가 있으면 오류로 처리한다.
+
+    로직: 키를 순서대로 사전에 넣고 기존 키가 다시 나타나면 예외를 발생시킨다.
+    """
     result = {}
     for key, value in pairs:
         if key in result:
@@ -79,8 +86,10 @@ def unique_pairs(pairs):
 
 
 def prefix_json(raw):
-    # 일부만 복구된 JSON의 연속된 앞부분에서 완전하게 읽힌 최상위 키·값 쌍만 추출한다.
-    """Only complete top-level key/value pairs in the contiguous prefix count."""
+    """일부만 복구된 JSON의 연속된 앞부분에서 완전하게 읽힌 최상위 키·값 쌍만 추출한다.
+
+    로직: 앞에서부터 완전하게 해석된 최상위 키·값만 보관하며 불완전한 뒤쪽 데이터에서 멈춘다.
+    """
     text = raw.decode("utf-8", errors="surrogateescape")
     decoder = json.JSONDecoder(object_pairs_hook=unique_pairs)
     pos = len(text) - len(text.lstrip())
@@ -119,7 +128,10 @@ def prefix_json(raw):
 
 
 def json_object(raw):
-    # 중복 키를 검사하며 JSON을 해석하고, 최상위 값이 객체인지 확인한다.
+    """중복 키를 검사하며 JSON을 해석하고, 최상위 값이 객체인지 확인한다.
+
+    로직: 중복 키 검사기를 적용해 JSON을 읽고 결과가 사전인지 확인한다.
+    """
     obj = json.loads(raw, object_pairs_hook=unique_pairs)
     if not isinstance(obj, dict):
         raise ValueError("Metadata is not an object")
@@ -127,8 +139,10 @@ def json_object(raw):
 
 
 def capability_mask(value):
-    # 실제 val/cap 필드의 타입·크기를 검증해 capability 비트마스크를 읽고, 미지원 구조는 오류로 알린다.
-    """Read supported symbol-described unsigned layouts; never invent zero."""
+    """실제 val/cap 필드의 타입·크기를 검증해 capability 비트마스크를 읽고, 미지원 구조는 오류로 알린다.
+
+    로직: val 또는 cap 필드를 골라 부호·폭·배열 길이를 검증하고 비트마스크로 결합한다. 알 수 없는 구조를 0으로 처리하지 않는다.
+    """
     fields = [name for name in ("val", "cap") if value.has_member(name)]
     if len(fields) != 1:
         raise Unsupported("Capability needs one val/cap member")
@@ -137,7 +151,10 @@ def capability_mask(value):
     if offset < 0 or offset + template.size > value.vol.size:
         raise Unsupported("Capability exceeds its structure")
     def unsigned(t, sizes):
-        # 타입이 포인터가 아닌 부호 없는 정수이며 허용된 크기인지 검사한다.
+        """타입이 포인터가 아닌 부호 없는 정수이며 허용된 크기인지 검사한다.
+
+        로직: 객체 타입·부호·크기를 확인해 허용된 정수 타입인지 반환한다.
+        """
         return (issubclass(t.vol.object_class, objects.Integer)
                 and not issubclass(t.vol.object_class, objects.Pointer)
                 and t.size in sizes and not t.vol.data_format.signed)
@@ -151,17 +168,18 @@ def capability_mask(value):
 
 
 def audit_task_list(head, read_link, limit=LIMIT):
-    # 태스크 연결 목록을 양방향으로 검사하고, 도달한 노드·연결 불일치·순회 중단 내역을 반환한다.
-    """Audit both directions independently, retaining reachable nodes on failure.
+    """태스크 연결 목록을 양방향으로 검사하고, 도달한 노드·연결 불일치·순회 중단 내역을 반환한다.
 
-    read_link(address, field) must return a normalized list_head address.
-    A union is a recovery set, never a claim that a damaged list is complete.
+    로직: 정방향과 역방향을 따로 순회해 역연결을 검사하고 발견 노드를 합친다. 합집합이 완전한 목록이라는 뜻은 아니다.
     """
     result = {"head": hex(head), "directions": {}, "issues": []}
     cache = {}
 
     def link(address, field):
-        # 노드의 연결 포인터를 읽고 결과를 캐시해 같은 주소·필드의 중복 읽기를 줄인다.
+        """노드의 연결 포인터를 읽고 결과를 캐시해 같은 주소·필드의 중복 읽기를 줄인다.
+
+        로직: 주소와 필드를 키로 읽기 결과를 저장한 뒤 재요청에는 캐시 값을 사용한다.
+        """
         key = address, field
         if key not in cache:
             cache[key] = read_link(address, field)
@@ -207,8 +225,10 @@ def audit_task_list(head, read_link, limit=LIMIT):
 
 
 def select_representative(rows, cid):
-    # ID 충돌이 없는 태스크에서 namespace PID 1 또는 직접 shim 자식으로 유일한 대표를 선정한다.
-    """Choose an evidenced container init; PID ordering is never a criterion."""
+    """ID 충돌이 없는 태스크에서 namespace PID 1 또는 직접 shim 자식으로 유일한 대표를 선정한다.
+
+    로직: 충돌 없는 태스크를 추린 뒤 유일한 namespace PID 1을 우선하고, 필요하면 귀속된 직접 shim 자식을 사용한다. PID 크기로 고르지 않는다.
+    """
     eligible = [r for r in rows if r.get("container_ids") == [cid]
                 and not r.get("identity_conflicts")]
     chains = [r for r in eligible if r.get("pid_chain")]
@@ -231,8 +251,10 @@ def select_representative(rows, cid):
 
 
 def shim_arguments(args):
-    # shim 명령행의 분리된 ID·namespace 인자를 해석하고 누락·충돌·ID 형식을 검사한다.
-    """Parse the supported separate-value flags; reject conflicting identities."""
+    """shim 명령행의 분리된 ID·namespace 인자를 해석하고 누락·충돌·ID 형식을 검사한다.
+
+    로직: ID·namespace 플래그의 다음 인자를 모아 값의 개수와 컨테이너 ID 형식을 검사한다.
+    """
     ids, namespaces = set(), set()
     for index, arg in enumerate(args):
         if arg not in ("-id", "--id", "-namespace", "--namespace"):
@@ -250,13 +272,16 @@ def shim_arguments(args):
 
 class Collector:
     def __init__(self, context, kernel_name):
-        # 분석 context와 커널 계층을 연결하고, 수집 결과·출처·오류·중복 방지 저장소를 초기화한다.
+        """분석 context와 커널 계층을 연결하고, 수집 결과·출처·오류·중복 방지 저장소를 초기화한다.
+
+        로직: 커널 모듈·메모리 계층을 조회하고 단계별 증거·오류를 담을 보고서와 조회용 사전을 만든다.
+        """
         self.context = context
         self.kernel = context.modules[kernel_name]
         self.layer = context.layers[self.kernel.layer_name]
         self.stage = "tasks"
-        self.report = {"schema_version": 4, "method": "One summary per task-linked Docker container",
-            "provenance": {"plugin_version": "1.5.1", "volatility_version": constants.PACKAGE_VERSION,
+        self.report = {"schema_version": 5, "method": "One summary per task-linked Docker container",
+            "provenance": {"plugin_version": "1.5.2", "volatility_version": constants.PACKAGE_VERSION,
                 "collection_started_utc": datetime.datetime.now(UTC).isoformat(),
                 "kernel_module": kernel_name, "kernel_layer": self.kernel.layer_name,
                 "isf_url": context.symbol_space[self.kernel.symbol_table_name].config.get("isf_url"),
@@ -265,7 +290,10 @@ class Collector:
             "coverage": {}, "errors": [], "tasks": [], "cgroups": [], "namespaces": [],
             "shims": [], "mounts": [], "cached_settings": [], "containers": [],
             "task_list_integrity": [],
-            "limits": {"objects_per_traversal": LIMIT, "settings_file_bytes": FILE_LIMIT},
+            "limits": {"objects_per_traversal": LIMIT, "settings_file_bytes": FILE_LIMIT,
+                "settings_mounts_per_container": SETTINGS_MOUNT_LIMIT,
+                "settings_children_per_directory": SETTINGS_CHILD_LIMIT,
+                "settings_seconds": SETTINGS_SECONDS},
             "scope": "Reachable process leaders; cgroup IDs and limited identity fallback; representative credentials and cached Privileged only",
             "limitations": ["A task-linked candidate does not establish Docker lifecycle state.",
                 "A damaged task list remains partial after reverse recovery.",
@@ -279,37 +307,92 @@ class Collector:
 
 
     def process_start(self, task):
-        # 커널 시계 정보로 프로세스 시작 시각을 UTC로 변환하고, 적용할 수 없으면 태스크의 시각 API를 사용한다.
+        """검증된 커널 시간 구조와 태스크의 실제 시작 필드로 UTC 시작 시각을 계산한다.
+
+        로직: ISF의 tk_core 구조를 검증해 부팅 시각을 얻고, 존재하는 시작 필드의 나노초 값을 더한다.
+        """
         if self.boot is None:
-            for symbol, typename in (("timekeeper_data", "tk_data"), ("tk_core", "tk_data"),
-                                     ("tk_core_mono", "tk_data"), ("timekeeper", "timekeeper")):
-                if self.kernel.has_symbol(symbol) and self.kernel.has_type(typename):
-                    candidate = self.symbol(symbol, typename)
-                    keeper = candidate.timekeeper if candidate.has_member("timekeeper") else candidate
-                    if keeper.has_member("offs_real") and keeper.has_member("offs_boot"):
-                        def signed_ns(field):
-                            # 커널 시간 필드를 tv64 구조 또는 정수 형태에 맞춰 나노초 값으로 읽는다.
-                            value = keeper.member(field)
-                            return int(value.tv64) if value.has_member("tv64") else int(value)
-                        self.boot = signed_ns("offs_real") - signed_ns("offs_boot")
-                        self.report["boot_time_source"] = {"symbol": symbol, "location": self.location(keeper), "nanoseconds": self.boot}
-                        break
-        if self.boot is not None and task.has_member("start_boottime"):
-            total = self.boot + int(task.start_boottime)
-            return utc(*divmod(total, 1000000000))
-        value = task.get_create_time()
-        if value is None:
-            raise Unsupported("Process start time has no verified clock conversion")
-        return value.astimezone(UTC).isoformat()
+            self.boot = self.kernel_boot_ns()
+        for field in ("start_boottime", "real_start_time", "start_time"):
+            if not task.has_member(field):
+                continue
+            value = task.member(field)
+            if value.has_member("tv_sec") and value.has_member("tv_nsec"):
+                start_ns = int(value.tv_sec) * 1000000000 + int(value.tv_nsec)
+            elif issubclass(type(value), objects.Integer) and value.vol.size == 8:
+                start_ns = int(value)
+            else:
+                raise Unsupported("Unsupported process start field: " + field)
+            if start_ns < 0:
+                raise Unsupported("Negative process start time")
+            return utc(*divmod(self.boot + start_ns, 1000000000))
+        raise Unsupported("No supported process start field")
+
+
+    def kernel_boot_ns(self):
+        """심볼의 실제 구조를 검증해 커널의 부팅 기준 UTC 시각을 나노초로 읽는다.
+
+        로직: tk_core가 void이면 timekeeper 멤버를 가진 유일한 구조체를 찾고 필드 폭을 확인한다.
+        """
+        for symbol_name in ("timekeeper_data", "tk_core", "tk_core_mono", "timekeeper"):
+            if not self.kernel.has_symbol(symbol_name):
+                continue
+            if symbol_name == "timekeeper" and self.kernel.has_type("timekeeper"):
+                type_name = "timekeeper"
+            elif self.kernel.has_type("tk_data") and self.kernel.get_type("tk_data").has_member("timekeeper"):
+                type_name = "tk_data"
+            else:
+                candidates = []
+                table = self.context.symbol_space[self.kernel.symbol_table_name]
+                for candidate_name in table.types:
+                    if candidate_name == "timekeeper":
+                        continue
+                    template = self.kernel.get_type(candidate_name)
+                    if not template.has_member("timekeeper"):
+                        continue
+                    member = template.child_template("timekeeper")
+                    if member.vol.type_name.split(constants.BANG)[-1] == "timekeeper":
+                        candidates.append(candidate_name)
+                if len(candidates) != 1:
+                    raise Unsupported("No unique tk_core timekeeper layout")
+                type_name = candidates[0]
+            container = self.symbol(symbol_name, type_name)
+            keeper = container if type_name == "timekeeper" else container.timekeeper
+            if not keeper.has_member("offs_real") or not keeper.has_member("offs_boot"):
+                raise Unsupported("Timekeeper has no boot offsets")
+            def offset_ns(field):
+                """timekeeper 오프셋이 64비트 정수인지 검사하고 값을 읽는다.
+
+                로직: 구형 tv64 필드 또는 현재 64비트 정수를 허용한다.
+                """
+                value = keeper.member(field)
+                if value.has_member("tv64"):
+                    value = value.tv64
+                if not issubclass(type(value), objects.Integer) or value.vol.size != 8:
+                    raise Unsupported("Unsupported timekeeper offset: " + field)
+                return int(value)
+            boot = offset_ns("offs_real") - offset_ns("offs_boot")
+            if boot <= 0:
+                raise Unsupported("Invalid kernel boot time")
+            self.report["boot_time_source"] = {"symbol": symbol_name,
+                "layout": type_name, "location": self.location(keeper), "nanoseconds": boot}
+            return boot
+        raise Unsupported("No supported timekeeper symbol")
 
 
     def address(self, obj):
-        # Volatility 객체의 메모리 오프셋 또는 전달된 주소를 정수로 반환한다.
+        """Volatility 객체의 메모리 오프셋 또는 전달된 주소를 정수로 반환한다.
+
+        로직: vol 속성이 있으면 객체 오프셋을, 없으면 전달된 값 자체를 정수로 바꾼다.
+        """
         return int(obj.vol.offset) if hasattr(obj, "vol") else int(obj)
 
 
     def location(self, obj):
-        # 객체의 가상 주소와 계층을 기록하고, 변환 가능하면 하위 계층의 이름·오프셋도 덧붙인다.
+        """객체의 가상 주소와 계층을 기록하고, 변환 가능하면 하위 계층의 이름·오프셋도 덧붙인다.
+
+        로직: 가상 주소를 기록한 다음 주소 변환이 성공하면 매핑된 계층과 오프셋을 추가한다.
+        """
         address = self.address(obj)
         result = {"layer": self.kernel.layer_name, "virtual": hex(address)}
         try:
@@ -321,7 +404,10 @@ class Collector:
 
 
     def issue(self, operation, obj, exc):
-        # 수집 오류를 종류별로 구분해 단계·작업·주소·예외명·상세 내용과 함께 기록한다.
+        """수집 오류를 종류별로 구분해 단계·작업·주소·예외명·상세 내용과 함께 기록한다.
+
+        로직: 주소를 문자열로 만들고 예외 종류를 판별해 현재 단계의 errors 목록에 추가한다.
+        """
         try:
             address = hex(self.address(obj))
         except (ValueError, TypeError, AttributeError):
@@ -333,7 +419,10 @@ class Collector:
 
 
     def read(self, operation, obj, function, default=None):
-        # 읽기·해석 함수를 실행하고, 처리 대상 예외가 발생하면 오류를 기록한 뒤 기본값을 반환한다.
+        """읽기·해석 함수를 실행하고, 처리 대상 예외가 발생하면 오류를 기록한 뒤 기본값을 반환한다.
+
+        로직: 요청한 함수를 호출하고 지정된 예외만 잡아 issue에 남긴 뒤 기본값으로 돌아간다.
+        """
         try:
             return function()
         except (exceptions.VolatilityException, ValueError, AttributeError, TypeError,
@@ -343,23 +432,35 @@ class Collector:
 
 
     def obj(self, name, address):
-        # 지정한 절대 메모리 주소에서 해당 타입의 커널 객체를 생성한다.
+        """지정한 절대 메모리 주소에서 해당 타입의 커널 객체를 생성한다.
+
+        로직: 커널 모듈의 object API에 타입과 절대 오프셋을 전달한다.
+        """
         return self.kernel.object(name, offset=int(address), absolute=True)
 
 
     def symbol(self, name, typename):
-        # 커널 심볼의 주소를 조회하고 모듈 기준 주소 이동을 반영해 지정 타입의 객체를 생성한다.
+        """커널 심볼의 주소를 조회하고 모듈 기준 주소 이동을 반영해 지정 타입의 객체를 생성한다.
+
+        로직: 심볼 주소를 찾은 뒤 모듈 상대 오프셋으로 해당 타입의 객체를 생성한다.
+        """
         sym = self.kernel.get_symbol(name)
         return self.kernel.object(typename, offset=sym.address, absolute=False)
 
 
     def string(self, ptr):
-        # 포인터가 가리키는 문자열을 길이 제한 내에서 읽으며, NULL이면 빈 문자열을 반환한다.
+        """포인터가 가리키는 문자열을 길이 제한 내에서 읽으며, NULL이면 빈 문자열을 반환한다.
+
+        로직: NULL 포인터는 빈 문자열로 처리하고, 나머지는 최대 길이를 지정해 읽는다.
+        """
         return utility.pointer_to_string(ptr, 4096) if ptr else ""
 
 
     def bounded(self, iterator):
-        # 순회 원소를 차례로 전달하되, 허용 개수를 넘으면 불완전한 수집으로 처리한다.
+        """순회 원소를 차례로 전달하되, 허용 개수를 넘으면 불완전한 수집으로 처리한다.
+
+        로직: 반복자를 열거하다가 LIMIT에 도달하면 Incomplete 예외로 순회를 중단한다.
+        """
         for index, value in enumerate(iterator):
             if index >= LIMIT:
                 raise Incomplete("Traversal budget exceeded")
@@ -367,7 +468,10 @@ class Collector:
 
 
     def namespace(self, ptr, kind, entity=None):
-        # 네임스페이스 주소·식별 번호를 중복 없이 기록하고, 관련 태스크와의 연결을 추가한다.
+        """네임스페이스 주소·식별 번호를 중복 없이 기록하고, 관련 태스크와의 연결을 추가한다.
+
+        로직: 포인터를 역참조해 주소별 기록을 재사용하고, 요청된 태스크 주소를 연결한다.
+        """
         if not ptr:
             return None
         obj = ptr.dereference() if isinstance(ptr, objects.Pointer) else ptr
@@ -385,7 +489,10 @@ class Collector:
 
 
     def pid_chain(self, task):
-        # 태스크의 PID 구조를 따라 각 PID namespace 계층의 PID와 네임스페이스 정보를 수집한다.
+        """태스크의 PID 구조를 따라 각 PID namespace 계층의 PID와 네임스페이스 정보를 수집한다.
+
+        로직: thread_pid 또는 pids에서 PID를 찾아 계층 깊이를 검증하고 upid 배열을 순회한다.
+        """
         if task.has_member("thread_pid"):
             pid = task.thread_pid
         elif task.has_member("pids"):
@@ -409,7 +516,10 @@ class Collector:
 
 
     def task_cgroups(self, task):
-        # 태스크의 css_set에서 기본·subsystem cgroup을 찾아 주소로 중복을 제거하고 정보를 수집한다.
+        """태스크의 css_set에서 기본·subsystem cgroup을 찾아 주소로 중복을 제거하고 정보를 수집한다.
+
+        로직: css_set의 dfl_cgrp·subsys 포인터에서 cgroup을 모아 주소별로 중복 제거한다.
+        """
         if not task.has_member("cgroups"):
             raise Unsupported("task.cgroups absent")
         if not task.cgroups:
@@ -426,7 +536,10 @@ class Collector:
 
 
     def cgroup_path(self, group):
-        # cgroup 또는 kernfs의 부모 연결을 따라 전체 경로와 추적 정보를 만들고 순환·순회 한도를 검사한다.
+        """cgroup 또는 kernfs의 부모 연결을 따라 전체 경로와 추적 정보를 만들고 순환·순회 한도를 검사한다.
+
+        로직: 부모 노드를 거슬러 이름을 모으고 추적 주소를 기록한다. 순환과 탐색 한도를 검사한다.
+        """
         node = group.kn.dereference() if group.has_member("kn") and group.kn else group
         if group.has_member("kn") and not group.kn:
             raise ValueError("NULL kernfs node")
@@ -450,7 +563,10 @@ class Collector:
 
 
     def task_list(self, head, member, kind):
-        # 양방향에서 발견한 태스크를 합쳐 검증·반환하고, 목록 무결성과 역방향 복구 여부를 기록한다.
+        """양방향에서 발견한 태스크를 합쳐 검증·반환하고, 목록 무결성과 역방향 복구 여부를 기록한다.
+
+        로직: 목록 양방향 순회 결과를 합쳐 task_struct를 검증한다. 불일치·역방향 복구를 증거와 오류에 남긴다.
+        """
         mask = self.layer.address_mask
         offset = self.kernel.get_type("task_struct").relative_child_offset(member)
         audit = audit_task_list(self.address(head) & mask,
@@ -482,7 +598,10 @@ class Collector:
         for address in dict.fromkeys(forward + backward):
             task = self.obj("task_struct", (address - offset) & mask)
             def validate():
-                # 발견한 태스크의 PID·TGID·group_leader와 comm 읽기 가능 여부를 확인한다.
+                """발견한 태스크의 PID·TGID·group_leader와 comm 읽기 가능 여부를 확인한다.
+
+                로직: PID와 TGID가 양수이고 group_leader가 있으며 comm을 읽을 수 있는지 확인한다.
+                """
                 if int(task.pid) <= 0 or int(task.tgid) <= 0 or not task.group_leader:
                     raise Incomplete("Reachable task has invalid PID/TGID/group_leader")
                 utility.array_to_string(task.comm)
@@ -495,7 +614,10 @@ class Collector:
 
 
     def argv(self, task):
-        # 프로세스 주소 공간의 인자 영역을 읽고 NULL 구분자로 나누어 명령행 인자 목록을 반환한다.
+        """프로세스 주소 공간의 인자 영역을 읽고 NULL 구분자로 나누어 명령행 인자 목록을 반환한다.
+
+        로직: arg_start·arg_end 길이를 검증하고 프로세스 계층에서 바이트를 읽어 NULL 단위로 나눈다.
+        """
         if not task.mm:
             return []
         start, end = int(task.mm.arg_start), int(task.mm.arg_end)
@@ -508,7 +630,10 @@ class Collector:
 
 
     def stage_run(self, name, function):
-        # 수집 단계를 실행하고 결과 수·오류 수·상태·수집 범위·소요 시간을 coverage에 기록한다.
+        """수집 단계를 실행하고 결과 수·오류 수·상태·수집 범위·소요 시간을 coverage에 기록한다.
+
+        로직: 수집 함수를 오류 격리 경로로 실행한 뒤 레코드·오류 수로 상태를 정하고 범위와 시간을 기록한다.
+        """
         self.stage = name
         errors, started = len(self.report["errors"]), time.perf_counter()
         vollog.info("ps: collecting %s", name)
@@ -527,7 +652,10 @@ class Collector:
 
 
     def cgroup(self, group, source):
-        # cgroup 경로에서 Docker ID를 추출하고 주소·경로·메모리 위치를 중복 없이 저장한다.
+        """cgroup 경로에서 Docker ID를 추출하고 주소·경로·메모리 위치를 중복 없이 저장한다.
+
+        로직: 주소가 처음 발견됐을 때 경로·Docker ID·위치를 만들고 이후에는 저장된 기록을 반환한다.
+        """
         address = self.address(group)
         if address not in self.cgroups:
             path, _ = self.cgroup_path(group)
@@ -539,10 +667,16 @@ class Collector:
 
 
     def collect_tasks(self):
-        # 프로세스 리더를 수집하고 PID·부모·명령·PID namespace·cgroup ID 및 충돌 정보를 기록한다.
+        """프로세스 리더를 수집하고 PID·부모·명령·PID namespace·cgroup ID 및 충돌 정보를 기록한다.
+
+        로직: 리더 목록을 모은 뒤 각 task의 PID·명령·namespace·cgroup을 읽고 ID 출처와 충돌을 정리한다.
+        """
         self.init = self.symbol("init_task", "task_struct")
         def leaders():
-            # 검증된 태스크 목록에서 PID와 TGID가 같은 프로세스 리더를 주소별로 저장한다.
+            """검증된 태스크 목록에서 PID와 TGID가 같은 프로세스 리더를 주소별로 저장한다.
+
+            로직: 양방향 목록에서 얻은 task 중 pid와 tgid가 일치하는 항목을 주소별로 저장한다.
+            """
             for task in self.task_list(self.init.tasks, "tasks", "process_leaders"):
                 if int(task.pid) == int(task.tgid):
                     self.tasks[self.address(task)] = task
@@ -557,7 +691,10 @@ class Collector:
                 row[field] = self.read("task." + field, task, lambda f=field: int(task.member(f)))
             row["comm"] = self.read("task.comm", task, lambda: utility.array_to_string(task.comm))
             def pid_chain():
-                # PID namespace 계층을 읽고 호스트 PID 일치 여부와 네임스페이스 누락을 검사한다.
+                """PID namespace 계층을 읽고 호스트 PID 일치 여부와 네임스페이스 누락을 검사한다.
+
+                로직: PID 계층을 수집하고 첫 PID가 호스트 PID와 맞는지, namespace가 모두 있는지 확인한다.
+                """
                 chain = self.pid_chain(task)
                 if chain and (chain[0]["nr"] != row["pid"] or any(n["namespace"] is None for n in chain)):
                     raise ValueError("PID chain disagrees with task PID or lacks a namespace")
@@ -573,7 +710,10 @@ class Collector:
 
 
     def collect_shims(self):
-        # shim 이름·인자로 Docker 귀속을 확인하고, 직접 자식의 ID를 보완하거나 기존 ID와의 충돌을 기록한다.
+        """shim 이름·인자로 Docker 귀속을 확인하고, 직접 자식의 ID를 보완하거나 기존 ID와의 충돌을 기록한다.
+
+        로직: shim 후보의 인자를 읽어 귀속 여부를 정한 뒤 직접 자식에게 ID를 연결하거나 충돌을 남긴다.
+        """
         known = {cid for row in self.report["tasks"] for cid in row["container_ids"]}
         shims = {}
         for address, task in self.tasks.items():
@@ -581,7 +721,10 @@ class Collector:
             if not (row.get("comm") or "").startswith("containerd-shim"):
                 continue
             def decode():
-                # shim 인자에서 ID·runtime namespace를 읽고 moby 또는 기존 ID 근거에 따라 Docker 귀속 여부를 기록한다.
+                """shim 인자에서 ID·runtime namespace를 읽고 moby 또는 기존 ID 근거에 따라 Docker 귀속 여부를 기록한다.
+
+                로직: 인자에서 ID·namespace를 해석하고 moby 또는 이미 알려진 ID와 일치하는지 기록한다.
+                """
                 args = self.argv(task)
                 cid, namespace = shim_arguments(args)
                 record = {"task": row["address"], "pid": row["pid"], "container_id": cid,
@@ -607,22 +750,49 @@ class Collector:
 
 
     def mount_namespace(self, task, entity=None):
-        # 태스크의 nsproxy에서 mount namespace를 찾아 공통 네임스페이스 기록에 등록한다.
+        """태스크의 nsproxy에서 mount namespace를 찾아 공통 네임스페이스 기록에 등록한다.
+
+        로직: nsproxy의 mnt_ns 포인터를 확인하고 공통 namespace 수집 함수에 전달한다.
+        """
         if not task.nsproxy or not task.nsproxy.mnt_ns:
             return None
         return self.namespace(task.nsproxy.mnt_ns, "mnt", entity)
 
 
     def bind_mount_record(self, mount, task, ns):
-        # 표준 설정 파일의 bind mount 원천 경로를 복원하고, 경로에서 확인한 컨테이너 ID를 기록한다.
-        path = linux.LinuxUtilities.get_path_mnt(task, mount)
-        if path not in ("/etc/hosts", "/etc/hostname", "/etc/resolv.conf"):
+        """표준 설정 파일의 bind mount 원천 경로를 복원하고, 경로에서 확인한 컨테이너 ID를 기록한다.
+
+        로직: 표준 /etc 파일의 마운트만 골라 원천 dentry 경로를 복원하고 ID·파일명 일치를 검사한다.
+        """
+        source = self.standard_bind_source(mount, task)
+        if source is None:
             return
+        cid, path, source_path, _ = source
+        self.report["mounts"].append({"address": hex(self.address(mount)), "namespace": ns,
+            "path": path, "source_path": source_path, "container_id": cid,
+            "location": self.location(mount)})
+
+
+    def standard_bind_source(self, mount, task):
+        """표준 /etc bind mount의 원천 파일과 컨테이너 디렉터리를 검증해 반환한다.
+
+        로직: 파일명을 먼저 확인하고, mount 경로·상위 dentry·전체 원천 경로의 ID가 일치하는지 검사한다.
+        """
         root = mount.get_mnt_root().dereference()
+        filename = root.d_name.name_as_str()
+        if filename not in ("hosts", "hostname", "resolv.conf"):
+            return None
+        path = linux.LinuxUtilities.get_path_mnt(task, mount)
+        if path != "/etc/" + filename:
+            return None
+        directory = root.d_parent.dereference()
+        cid = directory.d_name.name_as_str()
+        if not CID.fullmatch(cid) or directory.d_parent.dereference().d_name.name_as_str() != "containers":
+            return None
         parts, seen, current = [], set(), root
         while True:
             address = self.address(current)
-            if address in seen or len(seen) >= LIMIT:
+            if address in seen or len(seen) >= 256:
                 raise Incomplete("Dentry parent cycle/budget")
             seen.add(address)
             name = current.d_name.name_as_str()
@@ -633,14 +803,16 @@ class Collector:
             current = current.d_parent.dereference()
         source = "/" + "/".join(reversed(parts))
         match = BIND_ID.search(source)
-        if not match or match[2] != path.rsplit("/", 1)[-1]:
-            return
-        self.report["mounts"].append({"address": hex(self.address(mount)), "namespace": ns,
-            "path": path, "source_path": source, "container_id": match[1], "location": self.location(mount)})
+        if not match or match[1] != cid or match[2] != filename:
+            return None
+        return cid, path, source, directory
 
 
     def collect_mount_identity(self):
-        # ID 미확인 태스크의 비호스트 mount namespace를 조사하고, 오류·충돌 없이 유일한 ID가 확인되면 보완한다.
+        """ID 미확인 태스크의 비호스트 mount namespace를 조사하고, 오류·충돌 없이 유일한 ID가 확인되면 보완한다.
+
+        로직: 미식별 태스크를 mount namespace별로 묶어 표준 bind 원천을 조사한다. ID가 유일하고 순회가 완전할 때만 보완한다.
+        """
         unknown = [r for r in self.report["tasks"] if not r["container_ids"]]
         if not unknown or self.init is None:
             return
@@ -665,7 +837,10 @@ class Collector:
             task = self.tasks[int(unresolved[0]["address"], 16)]
             start, errors = len(self.report["mounts"]), len(self.report["errors"])
             def scan():
-                # 대상 mount namespace의 마운트를 한도 내 순회하며 표준 bind mount의 ID 근거를 수집한다.
+                """대상 mount namespace의 마운트를 한도 내 순회하며 표준 bind mount의 ID 근거를 수집한다.
+
+                로직: namespace의 마운트를 제한된 개수만 순회하며 각 마운트에서 bind ID 근거를 읽는다.
+                """
                 namespace = self.obj("mnt_namespace", int(ns, 16))
                 for mnt in self.bounded(namespace.get_mount_points()):
                     self.read("standard bind mount", mnt, lambda m=mnt: self.bind_mount_record(m, task, ns))
@@ -688,7 +863,10 @@ class Collector:
 
 
     def collect_identity(self):
-        # 관찰 태스크가 있으면 shim과 조건부 마운트 분석으로 컨테이너 식별 정보를 보완한다.
+        """관찰 태스크가 있으면 shim과 조건부 마운트 분석으로 컨테이너 식별 정보를 보완한다.
+
+        로직: 태스크가 없으면 건너뛰고, 있으면 shim 수집과 조건부 mount 식별을 차례로 수행한다.
+        """
         if not self.tasks:
             self.skipped["identity"] = "No observed process leaders to attribute"
             return
@@ -697,7 +875,10 @@ class Collector:
 
 
     def collect_selection(self):
-        # 태스크를 전체 컨테이너 ID별로 묶고 대표 선정 결과·연결 태스크·출처·충돌을 후보에 저장한다.
+        """태스크를 전체 컨테이너 ID별로 묶고 대표 선정 결과·연결 태스크·출처·충돌을 후보에 저장한다.
+
+        로직: 검증된 전체 ID로 태스크를 묶고 대표를 정해 후보별 출처·연관 태스크·충돌 상태를 저장한다.
+        """
         groups = {}
         for row in self.report["tasks"]:
             for cid in row["container_ids"]:
@@ -718,7 +899,10 @@ class Collector:
 
 
     def collect_details(self):
-        # 대표가 선정된 컨테이너에 대해 해당 프로세스의 PID·명령·시작 시각·실행 권한을 수집한다.
+        """대표가 선정된 컨테이너에 대해 해당 프로세스의 PID·명령·시작 시각·실행 권한을 수집한다.
+
+        로직: 선정된 대표 주소의 task를 찾아 시각과 cred를 읽는다. 대표가 없으면 권한을 추정하지 않는다.
+        """
         if not self.containers:
             self.skipped["details"] = "No task-linked container candidates"
             return
@@ -732,13 +916,19 @@ class Collector:
                 "effective_uid": None, "effective_caps": None}
             obj["representative"] = record
             def credentials():
-                # 대표 태스크의 cred를 확인하고 credential 위치·Effective UID·effective capability를 기록한다.
+                """대표 태스크의 cred를 확인하고 credential 위치·Effective UID·effective capability를 기록한다.
+
+                로직: cred 포인터를 역참조해 위치·euid·cap_effective를 각각 오류 격리 경로로 읽는다.
+                """
                 if not task.has_member("cred") or not task.cred:
                     raise Unsupported("Representative credentials unavailable")
                 cred = task.cred.dereference()
                 record["credential_location"] = self.location(cred)
                 def effective_uid():
-                    # euid를 val 필드가 있는 구조 또는 정수 형태에 맞춰 읽는다.
+                    """euid를 val 필드가 있는 구조 또는 정수 형태에 맞춰 읽는다.
+
+                    로직: euid에 val 멤버가 있으면 그 필드를 사용하고 아니면 값을 직접 정수로 읽는다.
+                    """
                     value = cred.member("euid")
                     return int(value.val) if value.has_member("val") else int(value)
                 record["effective_uid"] = self.read("cred.euid", cred, effective_uid)
@@ -747,92 +937,166 @@ class Collector:
             self.read("representative credentials", task, credentials)
 
 
-    def settings_roots(self):
-        # 호스트 mount namespace에서 접근 가능한 파일시스템 루트 dentry를 중복 없이 수집한다.
-        """Mounted filesystems reachable from the host; no global VFS/hash scan."""
-        if self.init is None:
-            raise Incomplete("Host task unavailable for settings")
-        ns = self.mount_namespace(self.init, "host")
-        if ns is None:
-            raise Incomplete("Host mount namespace unavailable for settings")
-        roots = {}
-        namespace = self.obj("mnt_namespace", int(ns["address"], 16))
-        def scan():
-            # 호스트의 마운트를 한도 내 순회하며 각 파일시스템의 루트를 수집한다.
-            for mount in self.bounded(namespace.get_mount_points()):
-                def root():
-                    # 마운트의 superblock에서 루트 dentry를 얻어 superblock 주소별로 저장한다.
-                    sb = mount.get_mnt_sb().dereference()
-                    if sb.s_root:
-                        roots[self.address(sb)] = sb.s_root.dereference()
-                self.read("settings filesystem root", mount, root)
-        self.read("settings mount namespace", namespace, scan)
-        return list(roots.values())
-
-
     def collect_settings(self):
-        # 관찰 태스크에 연결된 ID의 hostconfig.json을 탐색·복구하고 컨테이너별 설정 결과를 병합한다.
+        """검증된 bind mount 원천 디렉터리에서만 hostconfig.json을 조회한다.
+
+        로직: 컨테이너별 mount namespace에서 표준 bind 원천을 찾아 직계 자식만 제한 시간 내에 확인한다.
+        """
         if not self.containers:
             self.skipped["settings"] = "No task-linked IDs; hostconfig recovery not requested"
             return
-        seen, files = set(), set()
-        scope = {"container_ids": sorted(self.containers), "dentries_visited": 0,
-                 "source": "host-mounted filesystem roots; matching hostconfig.json only",
-                 "roots": 0}
+        scope = {"container_ids": sorted(self.containers),
+                 "source": "verified standard bind-mount source directories",
+                 "by_container": {}}
         self.report["settings_scope"] = scope
-        roots = self.read("settings roots", "host", self.settings_roots, [])
-        scope["roots"] = len(roots)
-        for root in roots:
-            def scan():
-                # 파일시스템 루트부터 dentry를 탐색하고, 대상 ID와 일치하는 hostconfig.json inode만 복구한다.
-                pending = [(root, "")]
-                while pending:
-                    dentry, path = pending.pop()
-                    address = self.address(dentry)
-                    if address in seen:
-                        continue
-                    if len(seen) >= LIMIT:
-                        raise Incomplete("Settings dentry traversal budget")
-                    seen.add(address)
-                    scope["dentries_visited"] = len(seen)
-                    directory_id = SETTINGS_DIR.search(path)
-                    if directory_id and directory_id[1] not in self.containers:
-                        continue
-                    match = SETTINGS_FILE.search(path)
-                    if match and match[1] in self.containers and dentry.d_inode:
-                        inode = dentry.d_inode.dereference()
-                        key = (int(dentry.d_inode), path)
-                        if key not in files:
-                            files.add(key)
-                            self.read("hostconfig inode", inode,
-                                lambda: self.recover_privileged(inode, path, match[1]))
-                        continue
-                    def children():
-                        # 하위 dentry 이름을 읽어 필요한 항목을 탐색 스택에 추가하고 불필요한 컨테이너 파일은 제외한다.
-                        for child in self.bounded(dentry.get_subdirs()):
-                            name = self.read("settings dentry name", child, lambda ch=child: ch.d_name.name_as_str())
-                            if name and name not in (".", ".."):
-                                if directory_id and "/" not in path[directory_id.end():] and name != "hostconfig.json":
-                                    continue
-                                pending.append((child, path + "/" + name))
-                    self.read("settings dentries", dentry, children)
-            self.read("hostconfig search", root, scan)
+        known_roots, unresolved = {}, []
+        for cid, container in self.containers.items():
+            deadline = time.monotonic() + SETTINGS_SECONDS
+            state = {"status": "UNRESOLVED", "mounts_examined": 0,
+                     "directories": [], "children_examined": 0,
+                     "search_complete": False}
+            scope["by_container"][cid] = state
+            anchors = {}
+            addresses = container["task_addresses"]
+            preferred = container["representative_task"]
+            if preferred in addresses:
+                addresses = [preferred] + [address for address in addresses if address != preferred]
+            examined_namespaces = set()
+            for address in addresses:
+                if anchors:
+                    break
+                task = self.tasks[int(address, 16)]
+                ns = self.read("settings task mount namespace", task,
+                    lambda t=task: self.mount_namespace(t))
+                if not ns or ns["address"] in examined_namespaces:
+                    continue
+                examined_namespaces.add(ns["address"])
+                namespace = self.read("settings mount namespace", ns,
+                    lambda: self.obj("mnt_namespace", int(ns["address"], 16)))
+                if namespace is None:
+                    state["status"] = "INCOMPLETE"
+                    continue
+                before = len(self.report["errors"])
+                def find_anchors():
+                    """한 namespace의 마운트에서 컨테이너 ID와 일치하는 표준 bind 원천을 찾는다.
+
+                    로직: 개수·시간 한도를 확인하고 검증된 디렉터리 주소를 중복 없이 기록한다.
+                    """
+                    for mount in namespace.get_mount_points():
+                        if time.monotonic() >= deadline or state["mounts_examined"] >= SETTINGS_MOUNT_LIMIT:
+                            raise Incomplete("Settings mount search budget")
+                        state["mounts_examined"] += 1
+                        source = self.read("settings standard bind mount", mount,
+                            lambda m=mount: self.standard_bind_source(m, task))
+                        if source and source[0] == cid:
+                            _, _, source_path, directory = source
+                            anchors[self.address(directory)] = (directory, source_path.rsplit("/", 1)[0])
+                self.read("settings mount search", namespace, find_anchors)
+                if len(self.report["errors"]) != before:
+                    state["status"] = "INCOMPLETE"
+            if not anchors:
+                if state["status"] != "INCOMPLETE":
+                    state["status"] = "NO_VERIFIED_ANCHOR"
+                unresolved.append(cid)
+                continue
+            state["directories"] = [path for _, path in anchors.values()]
+            if len(anchors) != 1:
+                state["status"] = "AMBIGUOUS_ANCHOR"
+                self.issue("settings directory", cid, Incomplete("Multiple source directories for one container ID"))
+                continue
+            directory, parent_path = next(iter(anchors.values()))
+            root = self.read("settings peer root", directory,
+                lambda: directory.d_parent.dereference())
+            if root is not None:
+                known_roots[self.address(root)] = (root, parent_path.rsplit("/", 1)[0])
+            else:
+                state["status"] = "INCOMPLETE"
+            self.lookup_settings_file(cid, directory, parent_path, state, deadline,
+                source_complete=state["status"] != "INCOMPLETE")
+        for cid in unresolved:
+            if not known_roots:
+                break
+            state = scope["by_container"][cid]
+            deadline = time.monotonic() + SETTINGS_SECONDS
+            found, complete = {}, True
+            for root, root_path in known_roots.values():
+                before = len(self.report["errors"])
+                def find_container():
+                    """다른 컨테이너가 검증한 containers 디렉터리에서 대상 ID만 조회한다.
+
+                    로직: 직계 자식을 제한 시간·개수 안에서 열거해 정확히 일치하는 ID를 찾는다.
+                    """
+                    for child in root.get_subdirs():
+                        if time.monotonic() >= deadline or state["children_examined"] >= SETTINGS_CHILD_LIMIT:
+                            raise Incomplete("Settings container directory budget")
+                        state["children_examined"] += 1
+                        if child.d_name.name_as_str() == cid:
+                            found[self.address(child)] = (child, root_path + "/" + cid)
+                self.read("settings container directory", root, find_container)
+                if len(self.report["errors"]) != before:
+                    complete = False
+            if not complete or len(found) != 1:
+                if len(found) > 1:
+                    state["status"] = "AMBIGUOUS_ANCHOR"
+                    self.issue("settings directory", cid, Incomplete("Container ID occurs in multiple verified roots"))
+                continue
+            directory, parent_path = next(iter(found.values()))
+            state["directories"] = [parent_path]
+            state["source"] = "peer_verified_root"
+            self.lookup_settings_file(cid, directory, parent_path, state, deadline,
+                source_complete=state["status"] != "INCOMPLETE")
         self.merge_settings()
 
 
+    def lookup_settings_file(self, cid, directory, parent_path, state, deadline, source_complete):
+        """검증된 컨테이너 디렉터리의 직계 자식에서 hostconfig.json만 복구한다.
+
+        로직: 자식 조회·파일 복구가 모두 끝난 경우에만 해당 ID의 설정 검색을 완료로 표시한다.
+        """
+        before = len(self.report["errors"])
+        def find_file():
+            """디렉터리 자식을 제한 시간·개수 안에서 열거하고 대상 inode를 복구한다.
+
+            로직: 이름이 hostconfig.json인 양수 dentry만 페이지 캐시 복구로 전달한다.
+            """
+            for child in directory.get_subdirs():
+                if time.monotonic() >= deadline or state["children_examined"] >= SETTINGS_CHILD_LIMIT:
+                    raise Incomplete("Settings child lookup budget")
+                state["children_examined"] += 1
+                if child.d_name.name_as_str() != "hostconfig.json" or not child.d_inode:
+                    continue
+                inode = child.d_inode.dereference()
+                self.read("hostconfig inode", inode,
+                    lambda i=inode: self.recover_privileged(i, parent_path + "/hostconfig.json", cid))
+        self.read("settings file lookup", directory, find_file)
+        if len(self.report["errors"]) != before or not source_complete:
+            state["status"] = "INCOMPLETE"
+            return
+        state["search_complete"] = True
+        state["status"] = "FOUND" if any(r["container_id"] == cid for r in self.report["cached_settings"]) else "NOT_FOUND"
+
+
     def merge_settings(self):
-        # 복구한 Privileged 값과 ID의 충돌을 검사해 컨테이너 설정 값·출처·충돌 상태를 반영한다.
+        """복구한 Privileged 값과 ID의 충돌을 검사해 컨테이너 설정 값·출처·충돌 상태를 반영한다.
+
+        로직: 같은 ID의 hostconfig 기록을 찾아 bool 값과 ID 충돌을 비교한다. 유일하고 충돌이 없을 때만 설정을 확정한다.
+        """
         for cid, obj in self.containers.items():
             rows = [(i, r) for i, r in enumerate(self.report["cached_settings"]) if r["container_id"] == cid]
             obj["settings_refs"] = [i for i, _ in rows]
-            values = {r["privileged"] for _, r in rows
-                      if type(r.get("privileged")) is bool and not r.get("identity_conflict")}
+            search = self.report.get("settings_scope", {}).get("by_container", {}).get(cid, {})
+            verified = [(i, r) for i, r in rows if r.get("complete") is True
+                        and r.get("json_parse") == "FULL" and not r.get("identity_conflict")
+                        and type(r.get("privileged")) is bool]
+            values = {r["privileged"] for _, r in verified}
             conflicts = [{"source": "hostconfig", "index": i, "reason": "Path/JSON IDs disagree"}
                          for i, r in rows if r.get("identity_conflict")]
             if len(values) > 1:
                 conflicts.append({"source": "hostconfig", "field": "Privileged", "values": sorted(values),
                                   "reason": "Recovered settings disagree"})
-            obj["configured_privileged"] = next(iter(values)) if len(values) == 1 and not conflicts else None
+            obj["configured_privileged"] = (next(iter(values))
+                if search.get("search_complete") and len(verified) == len(rows)
+                and len(values) == 1 and not conflicts else None)
             obj["conflicts"].extend(conflicts)
             if rows and "hostconfig" not in obj["sources"]:
                 obj["sources"].append("hostconfig")
@@ -841,19 +1105,19 @@ class Collector:
 
 
     def collect(self):
-        # tasks·identity·selection·details·settings 단계를 순서대로 실행하고 전체 수집 보고서를 반환한다.
+        """tasks·identity·selection·details·settings 단계를 순서대로 실행하고 전체 수집 보고서를 반환한다.
+
+        로직: 정해진 STAGES 순서로 collect_* 함수를 호출하고 누적 보고서를 반환한다.
+        """
         for stage in STAGES:
             self.stage_run(stage, getattr(self, "collect_" + stage))
         return self.report
 
 
     def read_vmemmap_base(self):
-        # vmemmap_base의 실제 타입을 검증해 읽고, 타입 정보가 없을 때만 대상 커널의 포인터 폭·바이트 순서를 사용한다.
-        """Read the declared unsigned word, or its ABI layout if untyped.
+        """vmemmap_base의 실제 타입을 검증해 읽고, 타입 정보가 없을 때만 대상 커널의 포인터 폭·바이트 순서를 사용한다.
 
-        The framework's native pointer format supplies width and byte order;
-        compiler-specific C integer type names are never looked up. An invalid
-        declared type or an unreadable value must not trigger the untyped path.
+        로직: 심볼 타입이 있으면 정수 폭·부호를 확인해 읽는다. 타입이 없을 때만 대상 ABI 형식으로 읽으며 타입 오류·읽기 실패에는 재시도하지 않는다.
         """
         word = self.kernel.get_type("pointer").vol.data_format
         if word.signed or word.length * 8 != self.layer.bits_per_register:
@@ -883,7 +1147,10 @@ class Collector:
 
 
     def recover_privileged(self, inode, path, cid):
-        # hostconfig.json의 캐시 페이지를 복구해 Privileged를 읽고, 누락 범위·파싱 상태·ID 충돌을 기록한다.
+        """hostconfig.json의 캐시 페이지를 복구해 Privileged를 읽고, 누락 범위·파싱 상태·ID 충돌을 기록한다.
+
+        로직: inode의 캐시 페이지를 모아 연속된 데이터만 JSON으로 해석한다. 누락·중복·ID 충돌을 기록하고 bool Privileged만 채택한다.
+        """
         if cid not in self.containers:
             return
         filename = "hostconfig.json"
@@ -900,11 +1167,17 @@ class Collector:
         pieces = {}
         page_size = self.layer.page_size
         def recover():
-            # inode의 페이지 캐시 항목을 한도 내 순회하고 각 페이지의 내용 읽기·검증을 수행한다.
+            """inode의 페이지 캐시 항목을 한도 내 순회하고 각 페이지의 내용 읽기·검증을 수행한다.
+
+            로직: 페이지 캐시 항목을 순회하면서 각 page의 데이터 검증 함수를 호출한다.
+            """
             for page_address in self.bounded(storage.get_entries(mapping.i_pages)):
                 page = self.obj("page", page_address)
                 def content():
-                    # 페이지의 mapping·파일 오프셋을 검증해 바이트를 읽고, 중복 데이터 충돌을 검사하며 페이지 해시를 기록한다.
+                    """페이지의 mapping·파일 오프셋을 검증해 바이트를 읽고, 중복 데이터 충돌을 검사하며 페이지 해시를 기록한다.
+
+                    로직: mapping과 파일 오프셋을 검사한 뒤 실제 페이지 바이트를 읽고 해시·충돌을 기록한다.
+                    """
                     if int(page.mapping) != int(inode.i_mapping):
                         raise ValueError("Cached page mapping backlink mismatch")
                     if page.has_member("index"):
@@ -974,11 +1247,16 @@ class Collector:
 
 
 def vertical_presentation(report):
-    # 컨테이너 요약을 ID순으로 정렬해 컨테이너당 하나의 category·value 세로 출력 블록으로 구성한다.
-    """One category/value block per container, with raw values only."""
+    """컨테이너 요약을 ID순으로 정렬해 컨테이너당 하나의 category·value 세로 출력 블록으로 구성한다.
+
+    로직: ID로 정렬한 컨테이너에서 대표·권한·출처 값을 추려 category/value 행을 만든다.
+    """
     rows = []
     def cell(value):
-        # 미확인 값은 하이픈으로 표시하고, 나머지 값은 줄바꿈·탭을 이스케이프한 문자열로 변환한다.
+        """미확인 값은 하이픈으로 표시하고, 나머지 값은 줄바꿈·탭을 이스케이프한 문자열로 변환한다.
+
+        로직: None·빈 값은 하이픈으로 바꾸고 문자열의 탭·줄바꿈을 한 줄 표시에 맞게 이스케이프한다.
+        """
         return "-" if value is None or value == "" else str(value).replace("\n", "\\n").replace("\t", "\\t")
     for obj in sorted(report["containers"], key=lambda c: c["id"]):
         if rows:
@@ -995,30 +1273,20 @@ def vertical_presentation(report):
     return [("category", str), ("value", str)], rows
 
 
-class Ps(interfaces.plugins.PluginInterface):
-    """Summarize task-linked Docker containers and representative credentials."""
-    _required_framework_version = (2, 28, 0)
-    _version = (1, 5, 1)
+def run_ps(context, kernel_name, open_file):
+    """통합 Docker 플러그인의 --ps 결과와 증거 파일을 생성한다.
 
-    @classmethod
-    def get_requirements(cls):
-        # 지원 커널 아키텍처와 --ps 실행 옵션을 Volatility 플러그인 요구사항으로 선언한다.
-        return [requirements.ModuleRequirement(name="kernel", description="Linux kernel", architectures=["Intel32", "Intel64"]),
-                requirements.BooleanRequirement(name="ps", description="One summary per task-linked Docker container", optional=True, default=False)]
-
-    def run(self):
-        # --ps 선택을 확인해 수집을 실행하고, 근거 JSON·경고를 출력한 뒤 세로형 TreeGrid 결과를 반환한다.
-        if not self.config.get("ps", False):
-            raise exceptions.VolatilityException("Select --ps to run the container summary")
-        report = Collector(self.context, self.config["kernel"]).collect()
-        with self.open("ps_evidence.json") as output:
-            output.write(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
-        if report["errors"]:
-            vollog.warning("ps: %d collection issues; review coverage in ps_evidence.json", len(report["errors"]))
-        unresolved = sum(c["representative"] is None for c in report["containers"])
-        if unresolved:
-            vollog.warning("ps: %d container candidates have no unambiguous representative", unresolved)
-        if not report["containers"]:
-            vollog.warning("ps: no task-linked Docker candidates in the searched process list; review coverage")
-        columns, rows = vertical_presentation(report)
-        return renderers.TreeGrid(columns, ((0, row) for row in rows))
+    로직: Collector로 수집한 보고서를 JSON으로 저장하고, 오류를 경고한 뒤 세로형 TreeGrid를 반환한다.
+    """
+    report = Collector(context, kernel_name).collect()
+    with open_file("ps_evidence.json") as output:
+        output.write(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
+    if report["errors"]:
+        vollog.warning("ps: %d collection issues; review coverage in ps_evidence.json", len(report["errors"]))
+    unresolved = sum(c["representative"] is None for c in report["containers"])
+    if unresolved:
+        vollog.warning("ps: %d container candidates have no unambiguous representative", unresolved)
+    if not report["containers"]:
+        vollog.warning("ps: no task-linked Docker candidates in the searched process list; review coverage")
+    columns, rows = vertical_presentation(report)
+    return renderers.TreeGrid(columns, ((0, row) for row in rows))
