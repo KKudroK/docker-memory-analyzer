@@ -25,11 +25,24 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
+.venv-*/
 venv/
 env/
 ENV/
 env.bak/
 venv.bak/
+
+# Python tool caches and coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# macOS metadata
+.DS_Store
 
 # Project specific
 dumps/
