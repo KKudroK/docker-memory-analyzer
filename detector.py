@@ -1,48 +1,46 @@
-"""Evidence-based Docker detection for stock Volatility 3 2.28.0.
+"""Presence checks for the unified Docker plugin's --detector option.
 
-Run: vol -p /path/to/plugins -f memory.lime detector.Detector
-No additional --detector switch or sibling plugin is required. The normal
-Volatility -s, --cache-path and -o options select symbols, cache and output.
+Run: vol -p /path/to/plugins -f memory.lime -r pretty linux.docker.Docker --detector
+This module is an internal backend, not a separately advertised CLI plugin.
 
-The detector inspects reachable tasks (including threads), cgroup v1/v2
-membership, mount namespaces and network namespaces. Docker-labelled evidence
-is distinguished from generic container hints. FOUND means an observation,
-not authenticated Docker identity or proof that a container is running.
-NOT_OBSERVED is scoped to completed traversals; failed or unsupported reads
-produce UNKNOWN when there is no positive observation. All observations and
-coverage are saved through Volatility's file handler as detector_evidence.json.
+Inspect network interfaces, Overlay mounts and containerd-shim processes.
+The moby runtime namespace refines a shim observation; no container IDs,
+cgroup membership, process inventory or lifecycle information are collected.
+Threads are traversed only to reach their mount/network namespaces.
 
-Kernel layouts are selected by symbol members. No framework file is replaced,
-no capability field is read, and no mount hash table symbol is required.
+FOUND is an observation, not authenticated Docker identity or running state.
+NOT_OBSERVED is limited to completed searches; incomplete reads without a
+positive observation produce UNKNOWN. detector_evidence.json (schema 3) keeps
+counts, coverage and bounded examples, not full object inventories or argv.
+Output contains per-check observations without an overall Docker assessment.
+Status definitions, sampling limits and interpretation notes are in README.md.
+No Volatility core files, capability fields or mount hash symbols are needed.
 """
 
 import datetime
 import json
 import logging
 import re
-import time
 
 from volatility3.framework import constants, exceptions, interfaces, objects, renderers
 from volatility3.framework.configuration import requirements
 
 
 vollog = logging.getLogger(__name__)
-VERSION = (1, 0, 1)
-DOCKER_SCOPE = re.compile(r"^docker-([0-9a-f]{64})\.scope$")
+VERSION = (3, 1, 0)
+EVIDENCE_SAMPLES = 3
+ERROR_SAMPLES_PER_STAGE = 3
 BRIDGE_NAME = re.compile(r"^br-[0-9a-f]{12}$")
 READ_ERRORS = (exceptions.VolatilityException, AttributeError, ValueError,
                TypeError, KeyError, IndexError, OverflowError, UnicodeError)
-STAGES = ("tasks", "runtime", "cgroups", "mounts", "network")
-# key, description, interpretation, prerequisite coverage
+STAGES = ("tasks", "runtime", "mounts", "network")
+# key, description, prerequisite coverage
 CHECKS = (
-    ("docker_process", "Docker daemon / proxy", "DOCKER_LABEL", ("tasks", "runtime")),
-    ("docker_cgroup", "Docker container cgroup", "DOCKER_LABEL", ("tasks", "cgroups")),
-    ("docker_shim", "Shim with namespace=moby", "DOCKER_LABEL", ("tasks", "runtime")),
-    ("containerd_shim", "Containerd shim process", "GENERIC_HINT", ("tasks", "runtime")),
-    ("docker_interface", "Docker-like interface name", "NAME_HINT", ("network",)),
-    ("veth", "Veth device (link kind)", "GENERIC_HINT", ("network",)),
-    ("overlay", "Overlay filesystem", "GENERIC_HINT", ("tasks", "mounts")),
-    ("legacy_mac", "Legacy 02:42 MAC prefix", "MAC_HINT", ("network",)),
+    ("docker_interface", "Docker-like interface name", ("network",)),
+    ("veth", "Veth device (link kind)", ("network",)),
+    ("overlay", "Overlay filesystem", ("tasks", "mounts")),
+    ("containerd_shim", "Containerd shim process", ("tasks", "runtime")),
+    ("docker_shim", "Shim with namespace=moby", ("tasks", "runtime")),
 )
 
 
@@ -54,23 +52,9 @@ class Incomplete(ValueError):
     """A traversal could not prove that it reached its natural end."""
 
 
-def docker_ids(path):
-    """Accept Docker-labelled complete IDs, never arbitrary 64-hex cgroups."""
-    parts = path.split("/")
-    found = set()
-    for index, part in enumerate(parts):
-        scope = DOCKER_SCOPE.fullmatch(part)
-        if scope:
-            found.add(scope[1])
-        if part == "docker" and index + 1 < len(parts):
-            candidate = parts[index + 1]
-            if re.fullmatch(r"[0-9a-f]{64}", candidate):
-                found.add(candidate)
-    return sorted(found)
-
-
 def argv_flags(argv):
-    """Preserve conflicting duplicate values instead of choosing one silently."""
+    # 명령행 인자에서 namespace 값을 모아 중복을 정리하고, 값이 누락되면 오류를 발생시킨다.
+    """Read only runtime namespace flags; never extract container IDs."""
     result = {}
     for index, arg in enumerate(argv[1:], 1):
         if arg == "--":
@@ -78,20 +62,21 @@ def argv_flags(argv):
         if not arg.startswith("-"):
             continue
         flag, separator, value = arg.lstrip("-").partition("=")
-        if flag not in ("namespace", "id"):
+        if flag != "namespace":
             continue
         if not separator:
             if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
-                continue
+                raise Incomplete("Runtime namespace option has no value")
             value = argv[index + 1]
+        if not value:
+            raise Incomplete("Runtime namespace option has an empty value")
         result.setdefault(flag, set()).add(value)
     return {key: sorted(values) for key, values in result.items()}
 
 
 def runtime_checks(comm, argv=None):
+    # 프로세스 이름과 namespace 인자를 확인해 일치하는 shim 검사 항목을 반환한다.
     found = []
-    if comm in ("dockerd", "docker-proxy"):
-        found.append("docker_process")
     # Linux comm is only TASK_COMM_LEN bytes; the full shim name is truncated.
     if comm and comm.startswith("containerd-shim"):
         found.append("containerd_shim")
@@ -100,46 +85,27 @@ def runtime_checks(comm, argv=None):
     return found
 
 
-def network_checks(name, kind, mac):
+def network_checks(name, kind):
+    # 인터페이스 이름과 link kind를 각각 검사해 일치하는 네트워크 검사 항목을 반환한다.
     found = []
     if name and (name.startswith("docker") or BRIDGE_NAME.fullmatch(name)):
         found.append("docker_interface")
     if kind == "veth":
         found.append("veth")
-    if mac and mac.lower().startswith("02:42:"):
-        found.append("legacy_mac")
     return found
 
 
 def summarize(report):
-    checks = []
-    for key, label, interpretation, prerequisites in CHECKS:
-        evidence = [i for i, item in enumerate(report["evidence"]) if item["check"] == key]
+    # 관찰 수와 선행 단계의 수집 상태로 항목별 Status, Coverage, 생략된 근거 수를 계산한다.
+    """Record each check's observation status and collection coverage."""
+    checks = report["checks"]
+    prerequisites_by_key = {key: prerequisites for key, _, prerequisites in CHECKS}
+    for check in checks:
         complete = all(report["coverage"].get(stage, {}).get("status") == "COMPLETE"
-                       for stage in prerequisites)
-        checks.append({"key": key, "check": label, "interpretation": interpretation,
-                       "status": "FOUND" if evidence else "NOT_OBSERVED" if complete else "UNKNOWN",
-                       "coverage": "COMPLETE" if complete else "PARTIAL",
-                       "evidence_indices": evidence, "count": len(evidence)})
-    if any(c["count"] and c["interpretation"] == "DOCKER_LABEL" for c in checks):
-        verdict = "DOCKER_EVIDENCE"
-    elif any(c["count"] for c in checks):
-        verdict = "HINTS_ONLY"
-    elif any(c["status"] == "UNKNOWN" for c in checks):
-        verdict = "UNKNOWN"
-    else:
-        verdict = "NOT_OBSERVED"
-    report["checks"] = checks
-    report["summary"] = {
-        "status": verdict,
-        "coverage": "COMPLETE" if all(c["coverage"] == "COMPLETE" for c in checks) else "PARTIAL",
-        "meaning": {
-            "DOCKER_EVIDENCE": "Docker-labelled process, cgroup or moby shim evidence observed; review sources.",
-            "HINTS_ONLY": "Container/network hints observed; Docker identity is not established.",
-            "UNKNOWN": "No positive indicators in available data; one or more searches were incomplete.",
-            "NOT_OBSERVED": "No configured indicators in the completed reachable-object searches.",
-        }[verdict],
-    }
+                       for stage in prerequisites_by_key[check["key"]])
+        check["status"] = "FOUND" if check["count"] else "NOT_OBSERVED" if complete else "UNKNOWN"
+        check["coverage"] = "COMPLETE" if complete else "PARTIAL"
+        check["omitted_evidence"] = check["count"] - len(check["evidence_indices"])
     return report
 
 
@@ -147,6 +113,7 @@ class Collector:
     """Collect from the supplied Volatility context; never launch another CLI."""
 
     def __init__(self, context, kernel_name, limit=100000, progress_callback=None):
+        # 커널 접근 환경과 순회 한도를 설정하고 관측값, 오류, 결과 보고서의 저장 공간을 초기화한다.
         if not 1 <= limit <= 1000000:
             raise ValueError("limit must be in 1..1000000")
         self.context = context
@@ -156,40 +123,42 @@ class Collector:
         self.progress_callback = progress_callback
         self.stage = "tasks"
         self.tasks = {}
+        self.leaders = []
         self.mount_namespaces = {}
         self.net_namespaces = {}
-        self.css_cache = {}
-        self.group_cache = {}
+        self.error_counts = {stage: 0 for stage in STAGES}
         self.report = {
-            "schema_version": 1,
-            "metadata": {"plugin": "detector.Detector", "plugin_version": ".".join(map(str, VERSION)),
+            "schema_version": 3,
+            "metadata": {"plugin": "linux.docker.Docker", "option": "--detector",
+                         "plugin_version": ".".join(map(str, VERSION)),
                          "volatility_version": constants.PACKAGE_VERSION,
                          "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                          "kernel_module": kernel_name, "kernel_layer": self.kernel.layer_name,
                          "symbol_table": self.kernel.symbol_table_name,
                          "isf_url": context.symbol_space[self.kernel.symbol_table_name].config.get("isf_url")},
             "limits": {"nodes_per_traversal": limit, "argv_bytes": 65536,
-                       "path_components": min(limit, 4096), "string_bytes": 4096},
-            "coverage": {}, "errors": [], "evidence": [], "tasks": [],
-            "cgroups": [], "mounts": [], "interfaces": [],
-            "limitations": [
-                "Reachable kernel objects and selected runtime argv only; no carving, page-cache or heap scan.",
-                "Task names, cgroup labels and the moby namespace can be imitated; they are evidence, not authentication.",
-                "Overlay, veth, interface names and MAC prefixes are not exclusive to Docker.",
-                "A daemon or residual mount does not establish that a Docker container is currently running.",
-                "Missing objects, unsupported layouts, traversal limits and acquisition smear can hide evidence.",
-                "Mount paths are relative to the mount namespace root, not necessarily the host or a task chroot.",
-            ],
+                       "string_bytes": 4096, "evidence_samples_per_check": EVIDENCE_SAMPLES,
+                       "error_samples_per_stage": ERROR_SAMPLES_PER_STAGE},
+            "checks": [{"key": key, "check": label,
+                        "count": 0, "evidence_indices": []} for key, label, _ in CHECKS],
+            "coverage": {}, "errors": [], "evidence": [],
         }
+        self.checks = {check["key"]: check for check in self.report["checks"]}
 
     def obj(self, typename, address):
+        # 커널 메모리의 절대 주소에서 지정한 타입의 객체를 생성한다.
         return self.kernel.object(typename, offset=int(address), absolute=True)
 
     def symbol(self, name, typename):
+        # 심볼 주소에 명시한 타입을 적용해 커널 모듈 기준의 객체를 생성한다.
         # ISF symbols may have addresses but no type metadata (e.g. some BTF ISFs).
         return self.kernel.object(typename, offset=self.kernel.get_symbol(name).address, absolute=False)
 
     def issue(self, operation, obj, exc):
+        # 현재 단계의 전체 오류 수를 늘리고, 저장 한도 안에서 오류 종류와 발생 위치를 기록한다.
+        self.error_counts[self.stage] += 1
+        if self.error_counts[self.stage] > ERROR_SAMPLES_PER_STAGE:
+            return
         address = hex(int(obj.vol.offset)) if hasattr(obj, "vol") else str(obj)
         kind = ("UNSUPPORTED" if isinstance(exc, (Unsupported, AttributeError, exceptions.SymbolError))
                 else "UNREADABLE" if isinstance(exc, exceptions.InvalidAddressException)
@@ -199,6 +168,7 @@ class Collector:
                                       "exception": type(exc).__name__, "detail": str(exc)})
 
     def read(self, operation, obj, function, default=None):
+        # 읽기 함수를 실행하고, 처리 대상 예외가 발생하면 오류를 기록한 뒤 기본값을 반환한다.
         try:
             return function()
         except READ_ERRORS as exc:
@@ -206,11 +176,18 @@ class Collector:
             return default
 
     def evidence(self, check, obj, detail):
+        # 검사 항목의 관찰 수를 늘리고, 저장 한도 안에서 객체 주소와 관측 근거를 보관한다.
+        result = self.checks[check]
+        result["count"] += 1
+        if len(result["evidence_indices"]) >= EVIDENCE_SAMPLES:
+            return
+        result["evidence_indices"].append(len(self.report["evidence"]))
         self.report["evidence"].append({"check": check, "stage": self.stage,
                                         "address": hex(int(obj.vol.offset)),
                                         "layer": self.kernel.layer_name, "detail": detail})
 
     def string(self, pointer, maximum=4096):
+        # 포인터 위치에서 길이 한도 안의 NUL 종료 문자열을 읽고 엄격한 UTF-8로 해석한다.
         if not pointer:
             raise Incomplete("NULL string pointer")
         address, data = int(pointer), bytearray()
@@ -228,6 +205,7 @@ class Collector:
         raise Incomplete("Unterminated or over-limit string")
 
     def array_string(self, array):
+        # 크기가 유효한 문자 배열인지 확인하고 NUL로 끝나는 UTF-8 문자열을 반환한다.
         if not isinstance(array, objects.Array) or not 0 < array.vol.count <= 4096:
             raise Unsupported("Name is not a bounded character array")
         raw = self.layer.read(int(array.vol.offset), array.vol.count, pad=False)
@@ -237,6 +215,7 @@ class Collector:
         return raw[:end].decode("utf-8", errors="strict")
 
     def walk(self, head, typename, member):
+        # 연결 목록의 종료, 역방향 연결, 반복 방문과 순회 한도를 검사하며 객체를 차례로 반환한다.
         """Validate termination and backlinks; never silently exhaust a bad list."""
         offset = self.kernel.get_type(typename).relative_child_offset(member)
         end, previous = int(head.vol.offset), int(head.vol.offset)
@@ -254,35 +233,38 @@ class Collector:
         if int(head.prev) != previous:
             raise Incomplete("List tail disagrees with forward traversal")
 
-    def namespace(self, namespace, kind, task_row=None):
+    def namespace(self, namespace, kind):
+        # namespace를 메모리 주소별로 등록하고 객체, 주소, inode 정보를 반환한다.
         address = int(namespace.vol.offset)
         target = self.mount_namespaces if kind == "mount" else self.net_namespaces
         if address not in target:
             def inode():
+                # namespace 구조에 따라 ns.inum 또는 proc_inum에서 inode 값을 읽는다.
                 if namespace.has_member("ns"):
                     return int(namespace.ns.inum)
                 if namespace.has_member("proc_inum"):
                     return int(namespace.proc_inum)
                 raise Unsupported("Namespace inode layout unavailable")
             target[address] = {"object": namespace, "address": hex(address),
-                               "inode": self.read(kind + ".namespace_inode", namespace, inode),
-                               "tids": [], "container_ids": []}
-        record = target[address]
-        if task_row is not None:
-            record["tids"].append(task_row["tid"])
-            task_row[kind + "_namespace"] = hex(address)
-        return record
+                               "inode": self.read(kind + ".namespace_inode", namespace, inode)}
+        return target[address]
 
     def collect_tasks(self):
+        # process leader와 thread를 수집하고 각 task의 mount 및 net namespace를 확보한다.
         init = self.symbol("init_task", "task_struct")
         self.tasks[int(init.vol.offset)] = init
 
         def leaders():
+            # init_task의 연결 목록을 순회하여 process leader 객체를 주소별로 저장한다.
             for task in self.walk(init.tasks, "task_struct", "tasks"):
                 self.tasks[int(task.vol.offset)] = task
         self.read("tasks.list", init, leaders)
-        for leader in list(self.tasks.values()):
+        self.leaders = list(self.tasks.values())
+        # A thread may expose a namespace its leader does not use. This is
+        # internal discovery only; no thread inventory or membership is saved.
+        for leader in self.leaders:
             def threads():
+                # 현재 leader의 thread 목록 구조를 선택해 같은 프로세스의 task 객체를 모은다.
                 if not leader.signal:
                     return
                 if leader.has_member("thread_node") and leader.signal.has_member("thread_head"):
@@ -294,34 +276,31 @@ class Collector:
                 for task in self.walk(head, "task_struct", member):
                     self.tasks[int(task.vol.offset)] = task
             self.read("tasks.threads", leader, threads)
-        proxies = {}
+        proxies = set()
         for task in self.tasks.values():
-            row = {"address": hex(int(task.vol.offset)), "container_ids": []}
-            for field, source in (("tid", "pid"), ("pid", "tgid")):
-                row[field] = self.read("task." + source, task, lambda s=source: int(task.member(s)))
-            row["comm"] = self.read("task.comm", task, lambda: self.array_string(task.comm))
-            self.report["tasks"].append(row)
-
             def namespaces():
+                # 현재 task의 nsproxy를 확인하고 아직 처리하지 않은 proxy의 mount 및 net namespace를 등록한다.
                 if not task.nsproxy:
                     return  # NULL is valid for exiting tasks and some kernel tasks.
                 address = int(task.nsproxy)
-                if address not in proxies:
-                    proxy = task.nsproxy.dereference()
-                    proxies[address] = {}
-                    for kind, member in (("mount", "mnt_ns"), ("net", "net_ns")):
-                        def get_namespace(m=member):
-                            ptr = proxy.member(m)
-                            if not ptr:
-                                raise Incomplete("NULL namespace in non-NULL nsproxy")
-                            return ptr.dereference()
-                        proxies[address][kind] = self.read("task." + member, task, get_namespace)
-                for kind, ns in proxies[address].items():
+                if address in proxies:
+                    return
+                proxy = task.nsproxy.dereference()
+                proxies.add(address)
+                for kind, member in (("mount", "mnt_ns"), ("net", "net_ns")):
+                    def get_namespace(m=member):
+                        # 선택한 nsproxy 멤버의 포인터를 검사하고 namespace 객체를 역참조해 반환한다.
+                        ptr = proxy.member(m)
+                        if not ptr:
+                            raise Incomplete("NULL namespace in non-NULL nsproxy")
+                        return ptr.dereference()
+                    ns = self.read("task." + member, task, get_namespace)
                     if ns is not None:
-                        self.namespace(ns, kind, row)
+                        self.namespace(ns, kind)
             self.read("task.namespaces", task, namespaces)
 
     def argv(self, task):
+        # 프로세스의 argv 메모리를 읽고 길이, NUL 종료, UTF-8을 확인해 명령행 인자 목록을 반환한다.
         if not task.mm:
             raise Incomplete("Runtime task has no userspace memory descriptor")
         start, end = int(task.mm.arg_start), int(task.mm.arg_end)
@@ -336,134 +315,32 @@ class Collector:
         return raw[:-1].decode("utf-8", errors="strict").split("\0")
 
     def collect_runtime(self):
-        for row in self.report["tasks"]:
-            # One argv observation per process; names themselves remain observable
-            # even if a process's argv pages are not resident.
-            if row["tid"] != row["pid"] or row["comm"] is None:
+        # leader의 shim 이름과 runtime namespace를 검사하고 PID, comm 등의 관측값을 저장한다.
+        for task in self.leaders:
+            comm = self.read("runtime.comm", task, lambda: self.array_string(task.comm))
+            if "containerd_shim" not in runtime_checks(comm):
                 continue
-            task = self.tasks[int(row["address"], 16)]
-            for check in runtime_checks(row["comm"]):
-                self.evidence(check, task, {"pid": row["pid"], "comm": row["comm"], "source": "task_struct.comm"})
-            if row["comm"].startswith("containerd-shim"):
-                args = self.read("runtime.argv", task, lambda: self.argv(task))
-                if args is None:
-                    continue
-                flags = argv_flags(args)
-                row["runtime_argv"] = args
-                row["runtime_flags"] = flags
-                if len(flags.get("namespace", [])) > 1 or len(flags.get("id", [])) > 1:
-                    self.issue("runtime.flags", task, Incomplete("Conflicting duplicate shim flags"))
-                if "docker_shim" in runtime_checks(row["comm"], args):
-                    ids = [value for value in flags.get("id", []) if re.fullmatch(r"[0-9a-f]{64}", value)]
-                    self.evidence("docker_shim", task, {"pid": row["pid"], "comm": row["comm"],
-                                                      "argv": args, "container_id_candidates": ids})
-
-    def cgroup_path(self, group):
-        modern = group.has_member("kn")
-        if modern and not group.kn:
-            raise Incomplete("Cgroup has NULL kernfs node")
-        node = group.kn.dereference() if modern else group
-        parts, seen = [], set()
-        while True:
-            address = int(node.vol.offset)
-            if address in seen or len(seen) >= min(self.limit, 4096):
-                raise Incomplete("Cgroup ancestry cycle or depth limit")
-            seen.add(address)
-            parent = node.parent if node.has_member("parent") else node.member("__parent")
-            if not parent:
-                return "/" + "/".join(reversed(parts))
-            if node.has_member("name"):
-                name = self.string(node.name)
-            elif not modern and node.has_member("name_copy") and node.name_copy:
-                name = self.array_string(node.name_copy.name)
-            else:
-                raise Unsupported("Cgroup name layout unavailable")
-            if not name or "/" in name:
-                raise Incomplete("Invalid cgroup path component")
-            parts.append(name)
-            node = parent.dereference()
-
-    def css_groups(self, css):
-        groups, supported = {}, False
-        if css.has_member("dfl_cgrp"):
-            supported = True
-            def default_group():
-                if css.dfl_cgrp:
-                    groups[int(css.dfl_cgrp)] = css.dfl_cgrp.dereference()
-            self.read("cgroup.default", css, default_group)
-        if css.has_member("subsys"):
-            supported = True
-            def subsystem_groups():
-                array = css.subsys
-                if not isinstance(array, objects.Array) or not 0 <= array.vol.count <= 256:
-                    raise Unsupported("css_set.subsys is not a bounded array")
-                for index in range(array.vol.count):
-                    def state_group():
-                        state = array[index]
-                        if state and state.cgroup:
-                            groups[int(state.cgroup)] = state.cgroup.dereference()
-                    self.read("cgroup.subsys", css, state_group)
-            self.read("cgroup.subsystems", css, subsystem_groups)
-        # A named v1 hierarchy can have no controllers, so it need not appear
-        # in subsys[]. The links enumerate membership in those hierarchies too.
-        if css.has_member("cgrp_links"):
-            supported = True
-            def linked_groups():
-                for link in self.walk(css.cgrp_links, "cgrp_cset_link", "cgrp_link"):
-                    def linked_group():
-                        if int(link.cset) != int(css.vol.offset):
-                            raise Incomplete("Cgroup link belongs to another css_set")
-                        if not link.cgrp:
-                            raise Incomplete("NULL cgroup in css_set membership link")
-                        groups[int(link.cgrp)] = link.cgrp.dereference()
-                    self.read("cgroup.link", link, linked_group)
-            self.read("cgroup.links", css, linked_groups)
-        elif supported:
-            self.issue("cgroup.links", css, Unsupported(
-                "css_set.cgrp_links is not described; named v1 membership may be missing"))
-        if not supported:
-            raise Unsupported("No supported css_set membership layout is described")
-        return groups
-
-    def collect_cgroups(self):
-        for row in self.report["tasks"]:
-            task = self.tasks[int(row["address"], 16)]
-
-            def membership():
-                if not task.has_member("cgroups"):
-                    raise Unsupported("task_struct.cgroups is not described")
-                if not task.cgroups:
-                    return
-                css_address = int(task.cgroups)
-                if css_address not in self.css_cache:
-                    self.css_cache[css_address] = self.css_groups(task.cgroups.dereference())
-                paths, ids = [], set()
-                for address, group in self.css_cache[css_address].items():
-                    if address not in self.group_cache:
-                        path = self.read("cgroup.path", group, lambda: self.cgroup_path(group))
-                        record = {"address": hex(address), "path": path,
-                                  "container_ids": docker_ids(path) if path is not None else [], "tids": []}
-                        self.group_cache[address] = record
-                        self.report["cgroups"].append(record)
-                        if record["container_ids"]:
-                            self.evidence("docker_cgroup", group, {"path": path, "container_ids": record["container_ids"]})
-                    record = self.group_cache[address]
-                    record["tids"].append(row["tid"])
-                    if record["path"] is not None:
-                        paths.append(record["path"])
-                    ids.update(record["container_ids"])
-                row["cgroup_paths"] = sorted(set(paths))
-                row["container_ids"] = sorted(ids)
-                # Namespace membership is context, not proof that every object
-                # in a shared namespace belongs to this Docker container.
-                for kind, mapping in (("mount", self.mount_namespaces), ("net", self.net_namespaces)):
-                    address = row.get(kind + "_namespace")
-                    if address:
-                        ns = mapping[int(address, 16)]
-                        ns["container_ids"] = sorted(set(ns["container_ids"]) | ids)
-            self.read("task.cgroups", task, membership)
+            pid = self.read("runtime.pid", task, lambda: int(task.tgid))
+            tid = self.read("runtime.tid", task, lambda: int(task.pid))
+            if pid is not None and tid is not None and pid != tid:
+                self.issue("runtime.leader", task, Incomplete("Task list entry is not a process leader"))
+                continue
+            # Preserve the name observation even when argv cannot be read.
+            self.evidence("containerd_shim", task, {"pid": pid, "comm": comm})
+            args = self.read("runtime.argv", task, lambda: self.argv(task))
+            if args is None:
+                continue
+            flags = self.read("runtime.namespace", task, lambda: argv_flags(args))
+            if flags is None:
+                continue
+            namespaces = flags.get("namespace", [])
+            if len(namespaces) > 1:
+                self.issue("runtime.namespace", task, Incomplete("Conflicting runtime namespaces"))
+            if namespaces == ["moby"]:
+                self.evidence("docker_shim", task, {"pid": pid, "comm": comm, "runtime_namespace": "moby"})
 
     def mount_points(self, namespace):
+        # namespace의 RB tree나 연결 목록에서 mount를 순회하고 소속, 개수, root의 일관성을 확인한다.
         expected = (self.read("mounts.count", namespace, lambda: int(namespace.nr_mounts))
                     if namespace.has_member("nr_mounts") else None)
         expected_root = (self.read("mounts.root", namespace, lambda: int(namespace.root))
@@ -519,45 +396,16 @@ class Collector:
                 self.issue("mounts.root", namespace, Incomplete(
                     "Namespace has mounts but a NULL root mount"))
 
-    def mount_path(self, mount):
-        """Bounded namespace-root path, independent of mount hash tables."""
-        current = mount
-        vfsmount = current.mnt if current.has_member("mnt") else current
-        dentry = vfsmount.mnt_root.dereference()
-        parts, seen = [], set()
-        for _ in range(min(self.limit, 4096)):
-            pair = (int(current.vol.offset), int(dentry.vol.offset))
-            if pair in seen:
-                raise Incomplete("Mount/dentry path cycle")
-            seen.add(pair)
-            vfsmount = current.mnt if current.has_member("mnt") else current
-            if int(dentry.vol.offset) == int(vfsmount.mnt_root):
-                if not current.mnt_parent:
-                    raise Incomplete("NULL mount parent")
-                if int(current.mnt_parent) == int(current.vol.offset):
-                    return "/" + "/".join(reversed(parts))
-                dentry = current.mnt_mountpoint.dereference()
-                current = current.mnt_parent.dereference()
-                continue
-            length = int(dentry.d_name.len)
-            if not 0 < length <= 255 or not dentry.d_name.name:
-                raise Incomplete("Invalid dentry name")
-            name = self.layer.read(int(dentry.d_name.name), length, pad=False).decode("utf-8", errors="strict")
-            if "/" in name or "\0" in name:
-                raise Incomplete("Invalid dentry component")
-            parts.append(name)
-            if not dentry.d_parent:
-                raise Incomplete("NULL dentry parent")
-            dentry = dentry.d_parent.dereference()
-        raise Incomplete("Mount path depth limit")
-
     def collect_mounts(self):
+        # 확보한 mount namespace를 순회하여 Overlay 계열 파일시스템의 관측값을 수집한다.
         if not self.mount_namespaces:
             raise Incomplete("No reachable mount namespace")
         for ns in self.mount_namespaces.values():
             def scan():
+                # 현재 namespace의 mount별 파일시스템 유형을 읽고 Overlay 조건에 일치하는 근거를 저장한다.
                 for mount in self.mount_points(ns["object"]):
                     def fs_type():
+                        # mount의 superblock에서 파일시스템 이름을 읽고 FUSE이면 subtype을 조합한다.
                         vf = mount.mnt if mount.has_member("mnt") else mount
                         sb = vf.mnt_sb
                         name = self.string(sb.s_type.name, 256)
@@ -565,6 +413,7 @@ class Collector:
                             # /proc/mounts joins s_type->name and s_subtype;
                             # the kernel type name itself is only "fuse".
                             def subtype():
+                                # FUSE subtype을 읽으며, 멤버가 없으면 오류를 발생시키고 NULL이면 빈 문자열을 반환한다.
                                 if not sb.has_member("s_subtype"):
                                     raise Unsupported("FUSE superblock subtype is not described")
                                 return self.string(sb.s_subtype, 256) if sb.s_subtype else ""
@@ -573,22 +422,17 @@ class Collector:
                                 name += "." + suffix
                         return name
                     fstype = self.read("mounts.fs_type", mount, fs_type)
-                    row = {"address": hex(int(mount.vol.offset)), "namespace": ns["address"],
-                           "namespace_inode": ns["inode"], "fstype": fstype,
-                           "namespace_container_id_candidates": ns["container_ids"]}
-                    self.report["mounts"].append(row)
                     if fstype in ("overlay", "overlayfs", "fuse.overlayfs"):
-                        # Path failure does not erase a successful type read.
-                        row["path"] = self.read("mounts.path", mount, lambda: self.mount_path(mount))
-                        row["path_scope"] = "mount_namespace_root"
-                        self.evidence("overlay", mount, dict(row))
+                        self.evidence("overlay", mount, {"namespace_inode": ns["inode"], "fstype": fstype})
             self.read("mounts.namespace", ns["object"], scan)
 
     def collect_network(self):
+        # 전역 목록, init_net, task에서 확보한 net namespace의 장치를 조사해 이름과 link kind 관측값을 수집한다.
         if self.kernel.has_symbol("init_net"):
             self.read("network.init_net", "init_net", lambda: self.namespace(self.symbol("init_net", "net"), "net"))
 
         def global_namespaces():
+            # net_namespace_list를 순회하여 발견한 네트워크 namespace를 등록한다.
             head = self.symbol("net_namespace_list", "list_head")
             for ns in self.walk(head, "net", "list"):
                 self.namespace(ns, "net")
@@ -597,91 +441,80 @@ class Collector:
             raise Incomplete("No reachable network namespace")
         for ns in self.net_namespaces.values():
             def devices():
+                # 현재 net namespace의 장치 이름과 종류를 각각 읽고 일치하는 검사 항목의 근거를 저장한다.
                 for dev in self.walk(ns["object"].dev_base_head, "net_device", "dev_list"):
                     name = self.read("network.name", dev, lambda: self.array_string(dev.name))
 
                     def kind():
+                        # 장치의 rtnl_link_ops에서 link kind를 읽고 포인터가 NULL이면 빈 문자열을 반환한다.
                         if not dev.has_member("rtnl_link_ops"):
                             raise Unsupported("net_device.rtnl_link_ops is not described")
                         return self.string(dev.rtnl_link_ops.kind, 256) if dev.rtnl_link_ops else ""
 
-                    def mac():
-                        length = int(dev.addr_len)
-                        if not 0 <= length <= 32:
-                            raise Incomplete("Hardware address length outside 0..32")
-                        if length == 0:
-                            return ""
-                        addr = dev.dev_addr
-                        if isinstance(addr, objects.Array):
-                            address = int(addr.vol.offset)
-                        elif isinstance(addr, objects.Pointer) and addr:
-                            address = int(addr)
-                        else:
-                            raise Unsupported("Hardware address storage is unavailable")
-                        return ":".join(f"{byte:02x}" for byte in self.layer.read(address, length, pad=False))
-
                     link_kind = self.read("network.kind", dev, kind)
-                    mac_addr = self.read("network.mac", dev, mac)
-                    row = {"address": hex(int(dev.vol.offset)), "namespace": ns["address"],
-                           "namespace_inode": ns["inode"], "name": name, "kind": link_kind,
-                           "mac": mac_addr, "namespace_container_id_candidates": ns["container_ids"]}
-                    self.report["interfaces"].append(row)
-                    for check in network_checks(name, link_kind, mac_addr):
-                        self.evidence(check, dev, dict(row))
+                    for check in network_checks(name, link_kind):
+                        self.evidence(check, dev, {"namespace_inode": ns["inode"], "name": name, "kind": link_kind})
             self.read("network.devices", ns["object"], devices)
 
     def collect(self):
+        # 수집 단계를 차례로 실행해 진행률, 오류 수와 완전성을 기록하고 항목별 결과를 정리한다.
         for index, stage in enumerate(STAGES):
             self.stage = stage
-            started, errors = time.monotonic(), len(self.report["errors"])
             if self.progress_callback:
                 self.progress_callback(index * 100 / len(STAGES), "Detector: " + stage)
             self.read(stage, stage, getattr(self, "collect_" + stage))
-            count = len(self.report["errors"]) - errors
+            count = self.error_counts[stage]
             self.report["coverage"][stage] = {"status": "PARTIAL" if count else "COMPLETE",
-                                               "errors": count, "seconds": round(time.monotonic() - started, 6)}
-        self.report["namespaces"] = {
-            kind: [{key: value for key, value in ns.items() if key != "object"} for ns in mapping.values()]
-            for kind, mapping in (("mount", self.mount_namespaces), ("net", self.net_namespaces))}
+                                               "errors": count,
+                                               "omitted_errors": max(0, count - ERROR_SAMPLES_PER_STAGE)}
         if self.progress_callback:
             self.progress_callback(100, "Detector: completed")
         return summarize(self.report)
 
 
 def presentation(report):
-    columns = [("Check", str), ("Status", str), ("Interpretation", str),
-               ("Coverage", str), ("Count", int), ("Evidence", str)]
-    summary = report["summary"]
-    rows = [("Overall", summary["status"], "ASSESSMENT", summary["coverage"],
-             len(report["evidence"]), summary["meaning"])]
+    # 관측 근거를 여덟 칼럼의 표로 변환하고 검사 항목의 첫 행과 추가 관측값의 하위 행을 구성한다.
+    """Render each observation in columns under its check's count and status."""
+    columns = [("Check", str), ("Status", str), ("Coverage", str),
+               ("Count", int), ("PID", int), ("Name", str),
+               ("Kind", str), ("Namespace", str)]
+    rows = []
+
+    def value(detail, *keys, as_text=False):
+        # 관측 필드의 표시 값을 선택하고 미적용 필드와 읽지 못한 값을 구분하며 필요하면 문자열로 변환한다.
+        for key in keys:
+            if key in detail:
+                observed = detail[key]
+                if observed is None:
+                    return renderers.NotAvailableValue()
+                return str(observed) if as_text else observed
+        return renderers.NotApplicableValue()
+
     for check in report["checks"]:
-        samples = []
-        for index in check["evidence_indices"][:3]:
-            item = report["evidence"][index]
-            detail = item["detail"]
-            sample = {key: detail[key] for key in ("pid", "comm", "path", "namespace_inode", "name", "kind", "mac")
-                      if key in detail}
-            if check["key"] == "docker_shim":
-                sample["namespace"] = "moby"
-            samples.append(json.dumps(sample, ensure_ascii=False, separators=(",", ":")))
-        text = "; ".join(samples)
-        if check["count"] > 3:
-            text += f"; +{check['count'] - 3} (detector_evidence.json)"
-        if not text:
-            text = "No match in completed searches" if check["status"] == "NOT_OBSERVED" else "See coverage/errors in detector_evidence.json"
-        rows.append((check["check"], check["status"], check["interpretation"],
-                     check["coverage"], check["count"], text))
+        samples = [report["evidence"][index]["detail"] for index in check["evidence_indices"]]
+        # A check with no observations still needs a status/coverage row.
+        for index, detail in enumerate(samples or [{}]):
+            header = ((check["check"], check["status"], check["coverage"], check["count"])
+                      if index == 0 else ("", "", "", renderers.NotApplicableValue()))
+            observation = (value(detail, "pid"), value(detail, "name", "comm"),
+                           value(detail, "kind", "fstype"),
+                           value(detail, "namespace_inode", "runtime_namespace", as_text=True))
+            rows.append((0 if index == 0 else 1, header + observation))
     return columns, rows
 
 
 class Detector(interfaces.plugins.PluginInterface):
-    """Detect Docker-labelled evidence and distinguish generic container hints."""
+    """Backend for linux.docker.Docker --detector; presence checks only."""
 
+    # Volatility's discovery skips hidden classes. The Docker dispatcher loads
+    # this backend directly and supplies its context, settings and file handler.
+    hidden = True
     _required_framework_version = (2, 28, 0)
     _version = VERSION
 
     @classmethod
     def get_requirements(cls):
+        # Linux 커널 모듈, 지원 아키텍처와 순회 한도 등 플러그인 실행에 필요한 설정을 선언한다.
         return [
             requirements.ModuleRequirement(name="kernel", description="Linux kernel with matching ISF",
                                            architectures=["Intel32", "Intel64"]),
@@ -690,13 +523,15 @@ class Detector(interfaces.plugins.PluginInterface):
         ]
 
     def run(self):
+        # 순회 한도를 확인한 뒤 관측값을 수집하고 JSON 근거 파일과 TreeGrid 출력 표를 생성한다.
         limit = self.config.get("limit", 100000)
         if not 1 <= limit <= 1000000:
             raise exceptions.VolatilityException("--limit must be in 1..1000000")
         report = Collector(self.context, self.config["kernel"], limit, self._progress_callback).collect()
         with self.open("detector_evidence.json") as handle:
             handle.write(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
-        if report["errors"]:
-            vollog.warning("Detector completed with %d collection issues; review detector_evidence.json", len(report["errors"]))
+        errors = sum(stage["errors"] for stage in report["coverage"].values())
+        if errors:
+            vollog.warning("Detector completed with %d collection issues; review bounded examples in detector_evidence.json", errors)
         columns, rows = presentation(report)
-        return renderers.TreeGrid(columns, ((0, row) for row in rows))
+        return renderers.TreeGrid(columns, iter(rows))
