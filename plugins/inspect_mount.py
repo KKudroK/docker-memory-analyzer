@@ -135,6 +135,47 @@ def _object_readable(obj) -> bool:
         return False
 
 
+def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = False) -> str:
+    """Read a bounded C string only when its NUL terminator was captured.
+
+    pointer_to_string() may return a readable prefix without a terminator.
+    Never use that prefix as a complete name or a container-identity source.
+    Chunk reads are unpadded; on a boundary fault, retry single bytes only
+    until the terminator or the actual missing byte, preserving short strings
+    immediately before an unreadable page.
+    """
+    address = _object_address(pointer)
+    if not address or max_bytes <= 0:
+        raise ValueError("null string pointer or invalid string bound")
+    layer = pointer._context.layers[pointer.vol.native_layer_name]
+    value = bytearray()
+    while len(value) < max_bytes:
+        count = min(64, max_bytes - len(value))
+        try:
+            block = layer.read(address + len(value), count, pad=False)
+        except exceptions.InvalidAddressException:
+            block = layer.read(address + len(value), 1, pad=False)
+            count = 1
+        if len(block) != count:
+            raise ValueError("short unpadded string read")
+        end = block.find(b"\x00")
+        if end >= 0:
+            value.extend(block[:end])
+            if not value and not allow_empty:
+                raise ValueError("empty kernel string")
+            return bytes(value).decode("utf-8", errors="strict")
+        value.extend(block)
+    raise ValueError("kernel string has no NUL terminator within its bound")
+
+
+def _read_mount_devname(mnt) -> str:
+    """Read the entire source label, not upstream's 255-byte prefix."""
+    pointer = mnt.mnt_devname
+    if not pointer:
+        return "none"
+    return _read_kernel_cstring(pointer, allow_empty=True) or "none"
+
+
 def _read_dentry_name(dentry) -> Tuple[str, str]:
     """Bound qstr reads before decoding, preserving valid filename whitespace."""
 
@@ -173,7 +214,7 @@ def _walk_mount_path(
     A namespace covering-mount index additionally rejects paths hidden by a
     different mount; without that index this proves topology, not visibility.
     The container-side mountinfo path needs topology only.  Host-source and
-    propagation proofs additionally require readable, linked inodes.
+    propagation proofs additionally require readable inodes and linked names.
     """
 
     parts: List[str] = []
@@ -199,8 +240,8 @@ def _walk_mount_path(
 
             if require_live_inode:
                 inode = dentry.d_inode
-                if not (inode and _object_readable(inode)) or int(inode.i_nlink) <= 0:
-                    return "", "INCOMPLETE:missing-or-unlinked-inode"
+                if not (inode and _object_readable(inode)):
+                    return "", "INCOMPLETE:missing-inode"
 
             if covering_mounts is not None:
                 covers = covering_mounts.get(key, set())
@@ -243,6 +284,14 @@ def _walk_mount_path(
                 # Reaching its filesystem root without its mount root proves
                 # that this candidate is not an ancestor of the source.
                 return "", "OUTSIDE_ROOT" if crossed_mount else "OUTSIDE_MOUNT"
+
+            if require_live_inode and not _object_address(dentry.d_hash.pprev):
+                # d_unlinked(): a non-root, unhashed name cannot be used to
+                # walk to its former parent.  A positive i_nlink may belong
+                # to another hardlink.  Conversely, the mount-root crossing
+                # above can expose this inode through a live bind alias even
+                # when its original name is unlinked and i_nlink is zero.
+                return "", "UNLINKED"
 
             name, name_issue = _read_dentry_name(dentry)
             if name_issue:
@@ -355,7 +404,7 @@ def _cgroup_path(cgroup) -> str:
                 return "/" + "/".join(reversed(parts))
             if not parent or not _object_readable(parent):
                 raise ValueError("kernfs ancestry ended before hierarchy root")
-            name = utility.pointer_to_string(node.name, count=256)
+            name = _read_kernel_cstring(node.name, max_bytes=256)
             # kernfs names are individual components, at most NAME_MAX bytes.
             # Never normalize corrupt names into a different valid path.
             if not name or len(name) >= 256 or "/" in name or name in {".", ".."}:
@@ -562,7 +611,7 @@ def _cgroup_memberships(task, issues_out=None) -> Tuple[CgroupMembership, ...]:
                 subsystem = css.ss.dereference()
                 field = "legacy_name" if subsystem.has_member("legacy_name") and subsystem.legacy_name else "name"
                 if subsystem.has_member(field) and subsystem.member(field):
-                    controller = utility.pointer_to_string(subsystem.member(field), count=64)
+                    controller = _read_kernel_cstring(subsystem.member(field), max_bytes=64)
             if not controller or len(controller) >= 64:
                 raise ValueError("invalid controller name")
             entry["controllers"].add(controller)
@@ -989,7 +1038,10 @@ def _read_mount_info(
         "mount-options", lambda: list(mnt.get_flags_opts()), []
     )
     mnt_type = read_field("fs-type", lambda: superblock.get_type(), "-")
-    devname = read_field("devname", lambda: mnt.get_devname() or "none", "-")
+    if not isinstance(mnt_type, str) or not mnt_type:
+        issues.append("fs-type")
+        mnt_type = "-"
+    devname = read_field("devname", lambda: _read_mount_devname(mnt), "-")
     sb_access = read_field("superblock-access", lambda: superblock.get_flags_access(), "")
     sb_opts = ([sb_access] if sb_access else []) + read_field(
         "superblock-options", lambda: list(superblock.get_flags_opts()), []
@@ -1070,7 +1122,7 @@ class ContainerMounts(plugins.PluginInterface):
     """Find container-backed mount namespaces and inspect their mounts."""
 
     _required_framework_version = (2, 13, 0)
-    _version = (0, 5, 0)
+    _version = (0, 6, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -1101,7 +1153,7 @@ class ContainerMounts(plugins.PluginInterface):
             ),
             requirements.BooleanRequirement(
                 name="extended",
-                description="Add mount IDs, flags, cgroup membership and read-status fields",
+                description="Add Mount ID, Read Status and Host Path Status (10 columns total)",
                 optional=True,
                 default=False,
             ),
@@ -1448,17 +1500,36 @@ class ContainerMounts(plugins.PluginInterface):
                     error_counts[issue] = error_counts.get(issue, 0) + 1
                 if data is None:
                     continue
-                is_task_root = (
-                    _object_address(mnt.get_vfsmnt_current()) == representative.root_key[0]
-                    and _object_address(mnt.get_mnt_root()) == representative.root_key[1]
-                )
-                is_internal_root = (
+                internal_root_candidate = (
                     int(data.mnt_id) == int(data.parent_id)
                     and str(data.mnt_type) in INTERNAL_NAMESPACE_ROOT_FSTYPES
-                    and not is_task_root
                 )
+                is_internal_root = False
+                root_identity_unknown = False
+                if internal_root_candidate:
+                    try:
+                        # Only sentinel candidates need this identity check.
+                        # Path/root fields are optional: a second failed read
+                        # must not discard the mount data already recovered.
+                        mount_key = (
+                            _object_address(mnt.get_vfsmnt_current()),
+                            _object_address(mnt.get_mnt_root()),
+                        )
+                        if not all(mount_key):
+                            raise ValueError("null mount root identity")
+                        is_internal_root = mount_key != representative.root_key
+                    except (
+                        AttributeError, IndexError, TypeError, ValueError,
+                        exceptions.InvalidAddressException, exceptions.VolatilityException,
+                    ):
+                        root_identity_unknown = True
+                        error_counts["root-identity"] = error_counts.get("root-identity", 0) + 1
                 if is_internal_root:
                     source = SourceResolution((), PATH_UNRESOLVED)
+                elif root_identity_unknown:
+                    # Do not guess whether an unreadable root is a sentinel
+                    # or the task's real root; retain its other fields.
+                    source = SourceResolution((), PATH_PARTIAL)
                 else:
                     if mount_address not in path_cache:
                         path_cache[mount_address] = resolver.resolve(mnt)
@@ -1533,7 +1604,7 @@ class ContainerMounts(plugins.PluginInterface):
                         mount_cache=mount_cache, path_cache=path_cache,
                     )
                 records, read_status = view_cache[view_key]
-                runtime, container_id, pod_id, evidence = self._view_metadata(group, manual)
+                _runtime, container_id, _pod_id, evidence = self._view_metadata(group, manual)
                 emitted_views += 1
                 if read_status != "COMPLETE":
                     vollog.warning(
@@ -1557,10 +1628,6 @@ class ContainerMounts(plugins.PluginInterface):
                         "reported aliases may be incomplete (see --extended)",
                         representative.pid, partial_paths,
                     )
-                cgroups = " | ".join(sorted({
-                    membership.display() for item in group
-                    for membership in item.cgroup_memberships
-                }))
                 for record in records:
                     _writable, mode = _mount_access(record.data)
                     # No per-path classifier or filtering runs here.
@@ -1572,17 +1639,8 @@ class ContainerMounts(plugins.PluginInterface):
                     )
                     if extended:
                         row += (
-                            runtime or "-",
-                            representative.ns_pid if representative.ns_pid is not None else -1,
-                            representative.pid_ns_id if representative.pid_ns_id is not None else -1,
-                            cgroups or "-", pod_id or "-", evidence or "-",
-                            read_status, record.host_path_status,
-                            int(record.data.mnt_id), int(record.data.parent_id),
-                            str(record.data.st_dev), str(record.data.devname),
-                            record.mount_root or "-",
-                            ",".join(str(v) for v in record.data.mnt_opts),
-                            " ".join(str(v) for v in record.data.fields),
-                            ",".join(str(v) for v in record.data.sb_opts),
+                            int(record.data.mnt_id), read_status,
+                            record.host_path_status,
                         )
                     yield 0, row
         if not emitted_views:
@@ -1601,11 +1659,6 @@ class ContainerMounts(plugins.PluginInterface):
         extended = bool(self.config.get("extended", False))
         if extended:
             columns.extend([
-                ("Runtime", str), ("NS PID", int), ("PID NS", int),
-                ("Cgroups", str), ("Pod ID", str), ("Selection Evidence", str),
-                ("Read Status", str), ("Host Path Status", str),
-                ("Mount ID", int), ("Parent ID", int), ("Device", str),
-                ("Devname", str), ("Mount Root", str), ("Mount Options", str),
-                ("Propagation", str), ("Superblock Options", str),
+                ("Mount ID", int), ("Read Status", str), ("Host Path Status", str),
             ])
         return renderers.TreeGrid(columns, self._generator(extended))
