@@ -15,12 +15,29 @@ import logging
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from volatility3.framework import exceptions, interfaces, renderers
+from volatility3.framework import exceptions, interfaces
 from volatility3.framework.configuration import requirements
 from volatility3.framework.interfaces import plugins
 from volatility3.framework.objects import utility
 from volatility3.framework.symbols import linux
 from volatility3.plugins.linux import mountinfo, pslist
+from volatility3.plugins.linux._vertical import vertical_grid
+
+from volatility3.plugins.linux._artifacts import mounts as mount_readers
+from volatility3.plugins.linux._artifacts.cgroups import (
+    CgroupMembership,
+    _cgroup_path,
+    _cgroup_hierarchy,
+    _linked_cgroups,
+    _cgroup_memberships,
+)
+from volatility3.plugins.linux._artifacts.core import (
+    _object_address,
+    _object_readable,
+    _read_kernel_cstring,
+)
+from volatility3.plugins.linux._artifacts.namespaces import _pid_namespace_values
+from volatility3.plugins.linux._artifacts.tasks import list_tasks
 
 
 vollog = logging.getLogger(__name__)
@@ -42,20 +59,6 @@ class Identity:
     identifier: str
     id_kind: str
     evidence: str
-
-
-@dataclass(frozen=True)
-class CgroupMembership:
-    """One task membership in a cgroup v1 or v2 hierarchy."""
-
-    version: str
-    controllers: Tuple[str, ...]
-    path: str
-    cgroup_address: int
-
-    def display(self) -> str:
-        owner = ",".join(self.controllers) if self.controllers else "unified"
-        return f"{self.version}:{owner}={self.path}"
 
 
 # Parse only task cgroup naming conventions here.  A mounted runtime storage
@@ -99,73 +102,6 @@ RUNTIME_SUPERVISORS: Tuple[Tuple[str, str], ...] = (
 
 
 INTERNAL_NAMESPACE_ROOT_FSTYPES = frozenset({"nullfs", "rootfs"})
-
-
-def _object_address(obj) -> int:
-    """Return a pointer target or struct address without assuming its wrapper."""
-
-    try:
-        return int(obj)
-    except (TypeError, ValueError):
-        return int(obj.vol.offset)
-
-
-def _object_readable(obj) -> bool:
-    """Validate pointer targets and embedded structs with their own layer APIs.
-
-    Pointer.is_readable() checks the pointed-to object.  Embedded StructType
-    objects (for example mount.mnt and list heads) do not provide that method;
-    their storage range must be checked in their layer instead.  Do not treat
-    an absent pointer-only method as unreadable memory.
-    """
-
-    try:
-        if obj is None:
-            return False
-        pointer_check = getattr(obj, "is_readable", None)
-        if callable(pointer_check):
-            return bool(obj) and bool(pointer_check())
-        return bool(obj._context.layers[obj.vol.layer_name].is_valid(
-            int(obj.vol.offset), int(obj.vol.size)
-        ))
-    except (
-        AttributeError, KeyError, IndexError, TypeError, ValueError,
-        exceptions.InvalidAddressException, exceptions.VolatilityException,
-    ):
-        return False
-
-
-def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = False) -> str:
-    """Read a bounded C string only when its NUL terminator was captured.
-
-    pointer_to_string() may return a readable prefix without a terminator.
-    Never use that prefix as a complete name or a container-identity source.
-    Chunk reads are unpadded; on a boundary fault, retry single bytes only
-    until the terminator or the actual missing byte, preserving short strings
-    immediately before an unreadable page.
-    """
-    address = _object_address(pointer)
-    if not address or max_bytes <= 0:
-        raise ValueError("null string pointer or invalid string bound")
-    layer = pointer._context.layers[pointer.vol.native_layer_name]
-    value = bytearray()
-    while len(value) < max_bytes:
-        count = min(64, max_bytes - len(value))
-        try:
-            block = layer.read(address + len(value), count, pad=False)
-        except exceptions.InvalidAddressException:
-            block = layer.read(address + len(value), 1, pad=False)
-            count = 1
-        if len(block) != count:
-            raise ValueError("short unpadded string read")
-        end = block.find(b"\x00")
-        if end >= 0:
-            value.extend(block[:end])
-            if not value and not allow_empty:
-                raise ValueError("empty kernel string")
-            return bytes(value).decode("utf-8", errors="strict")
-        value.extend(block)
-    raise ValueError("kernel string has no NUL terminator within its bound")
 
 
 def _read_mount_devname(mnt) -> str:
@@ -328,334 +264,6 @@ def _comm_matches(comm: str, signature: str) -> bool:
         return False
     visible_signature = signature[:15]
     return comm == signature or comm == visible_signature
-
-
-def _pid_namespace_values(task) -> Tuple[Optional[int], Optional[int]]:
-    """Return (namespace inode, PID as seen in the innermost PID namespace)."""
-
-    try:
-        if task.has_member("thread_pid") and task.thread_pid:
-            pid_pointer = task.thread_pid
-        elif task.has_member("pids") and task.pids[0].pid:
-            # Modern kernels commonly expose thread_pid(task) as a macro over
-            # task->pids[PIDTYPE_PID].pid rather than a task_struct member.
-            pid_pointer = task.pids[0].pid
-        else:
-            return None, None
-        pid_object = pid_pointer.dereference()
-        level = int(pid_object.level)
-        # pid.numbers[] is a flexible-array member.  BTF/DWARF ISFs commonly
-        # describe it with count 0 even though the dump contains level + 1
-        # struct upid entries immediately after struct pid.  Recast it with
-        # the runtime length before indexing the innermost namespace entry.
-        if level < 0 or level > 32:
-            return None, None
-        numbers = pid_object.numbers.cast(
-            "array",
-            count=level + 1,
-            subtype=pid_object.numbers.vol.subtype,
-        )
-        upid = numbers[level]
-        ns_id = int(upid.ns.ns.inum)
-        return ns_id, int(upid.nr)
-    except (AttributeError, IndexError, TypeError, ValueError, exceptions.InvalidAddressException):
-        return None, None
-
-
-def _cgroup_path(cgroup) -> str:
-    """Return a full kernfs path, or no path when ancestry is incomplete.
-
-    A NULL parent is a terminator only at cgroup.root.cgrp.kn.  In particular,
-    an unreadable parent is not a root and must not turn a suffix into an
-    apparently absolute path.  kernfs used ``parent`` before ``__parent``.
-    """
-
-    try:
-        if (
-            not cgroup
-            or not _object_readable(cgroup)
-            or not cgroup.has_member("kn")
-            or not cgroup.kn
-            or not _object_readable(cgroup.kn)
-        ):
-            return ""
-        node = cgroup.kn.dereference()
-        root_node = cgroup.root.cgrp.kn
-        if not root_node or not _object_readable(root_node):
-            raise ValueError("unreadable hierarchy root kernfs node")
-        root_address = _object_address(root_node)
-    except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException):
-        vollog.warning("Incomplete cgroup path: hierarchy root/node is unavailable")
-        return ""
-
-    parts: List[str] = []
-    seen = set()
-    for _ in range(256):
-        try:
-            address = _object_address(node)
-            if address in seen:
-                raise ValueError("cyclic kernfs ancestry")
-            seen.add(address)
-            parent_member = "__parent" if node.has_member("__parent") else "parent"
-            parent = node.member(parent_member)
-            if address == root_address:
-                if parent:
-                    raise ValueError("hierarchy root has a non-NULL parent")
-                return "/" + "/".join(reversed(parts))
-            if not parent or not _object_readable(parent):
-                raise ValueError("kernfs ancestry ended before hierarchy root")
-            name = _read_kernel_cstring(node.name, max_bytes=256)
-            # kernfs names are individual components, at most NAME_MAX bytes.
-            # Never normalize corrupt names into a different valid path.
-            if not name or len(name) >= 256 or "/" in name or name in {".", ".."}:
-                raise ValueError("invalid or truncated kernfs name")
-            parts.append(name)
-            node = parent.dereference()
-        except (
-            AttributeError,
-            TypeError,
-            exceptions.InvalidAddressException,
-            ValueError,
-        ) as exc:
-            vollog.warning("Incomplete cgroup path: %s", exc)
-            return ""
-    vollog.warning("Incomplete cgroup path: kernfs ancestry exceeds 256 nodes")
-    return ""
-
-
-def _cgroup_hierarchy(cgroup, default_root_address=None):
-    """Identify a hierarchy by its root, never by its effective CSS address.
-
-    The default (v2) hierarchy owns hierarchy ID 0.  All active legacy roots
-    have positive IDs.  Unknown or inconsistent metadata is not called v1.
-    """
-
-    if not cgroup or not _object_readable(cgroup):
-        raise ValueError("unreadable cgroup")
-    root = cgroup.root
-    if not root or not _object_readable(root):
-        raise ValueError("unreadable cgroup hierarchy root")
-    root_address = _object_address(root)
-    hierarchy_id = int(root.hierarchy_id)
-    if hierarchy_id < 0:
-        raise ValueError("invalid cgroup hierarchy ID")
-    is_default = hierarchy_id == 0
-    if default_root_address is not None and (
-        is_default != (root_address == default_root_address)
-    ):
-        raise ValueError("inconsistent cgroup default hierarchy root/ID")
-    return ("v2" if is_default else "v1"), root_address, root, hierarchy_id
-
-
-def _linked_cgroups(css_set, issues):
-    """Walk actual cgroup memberships, including controllerless v1 roots.
-
-    Volatility's generic list walker silently terminates on unreadable links.
-    This bounded walk reports that distinction and validates link ownership.
-    """
-
-    groups = []
-    try:
-        head = css_set.cgrp_links
-        context = head._context
-        type_name = head.vol.type_name.split("!", 1)[0] + "!cgrp_cset_link"
-        offset = context.symbol_space.get_type(type_name).relative_child_offset(
-            "cgrp_link"
-        )
-        head_address = _object_address(head)
-        previous = head_address
-        link_pointer = head.next
-        seen = {head_address}
-        for _ in range(4096):
-            link_address = _object_address(link_pointer)
-            if link_address == head_address:
-                if _object_address(head.prev) != previous:
-                    raise ValueError("cgrp_links tail disagrees with forward walk")
-                return groups, True
-            if not link_pointer or not _object_readable(link_pointer):
-                raise ValueError("unreadable cgrp_links entry")
-            if link_address in seen:
-                raise ValueError("cyclic cgrp_links outside list head")
-            seen.add(link_address)
-            link = context.object(
-                type_name, layer_name=head.vol.layer_name,
-                offset=link_address - offset,
-            )
-            if _object_address(link.cset) != _object_address(css_set):
-                raise ValueError("cgrp_links entry points to another css_set")
-            if _object_address(link.cgrp_link.prev) != previous:
-                raise ValueError("cgrp_links backlink mismatch")
-            groups.append(link.cgrp)
-            previous = link_address
-            link_pointer = link.cgrp_link.next
-        raise ValueError("cgrp_links exceeds 4096 entries")
-    except (
-        AttributeError, KeyError, TypeError, ValueError,
-        exceptions.SymbolError, exceptions.InvalidAddressException,
-    ) as exc:
-        issues.add(f"membership list incomplete ({type(exc).__name__}: {exc})")
-        return groups, False
-
-
-def _cgroup_memberships(task, issues_out=None) -> Tuple[CgroupMembership, ...]:
-    """Read actual memberships; effective v2 ancestor CSSes are not v1.
-
-    cgrp_links is authoritative across hierarchies, dfl_cgrp is the actual v2
-    membership, and subsys[] provides legacy controller names.  A subsys-only
-    fallback is accepted solely with a proven v1 root when links are missing.
-    Paths are absolute in their hierarchy, not cgroup-namespace-relative.
-    issues_out, when supplied, receives stable partial/conflict markers as
-    well as diagnostics so callers cannot promote incomplete IDs to verified.
-    """
-
-    issues = set()
-
-    def report_issues():
-        if not issues:
-            return
-        issues.add("cgroup-metadata-partial")
-        if issues_out is not None:
-            issues_out.update(issues)
-        try:
-            pid = int(task.pid)
-        except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException):
-            pid = "?"
-        vollog.warning("Incomplete cgroup metadata for PID %s: %s", pid, "; ".join(sorted(issues)))
-
-    try:
-        css_set = task.cgroups
-        if not css_set or not _object_readable(css_set):
-            raise ValueError("missing or unreadable css_set")
-    except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException) as exc:
-        issues.add(f"task cgroup metadata unavailable ({exc})")
-        report_issues()
-        return ()
-
-    default_root_address = None
-    groups, links_complete = _linked_cgroups(css_set, issues)
-    unified_cgroup = None
-    try:
-        if css_set.has_member("dfl_cgrp") and css_set.dfl_cgrp:
-            unified_cgroup = css_set.dfl_cgrp
-            version, root_address, _, _ = _cgroup_hierarchy(unified_cgroup)
-            if version != "v2":
-                raise ValueError("dfl_cgrp does not belong to hierarchy 0")
-            default_root_address = root_address
-            groups.append(unified_cgroup)
-    except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException) as exc:
-        issues.add(f"default membership unavailable ({exc})")
-
-    # One css_set must have one actual membership per hierarchy.  Reject a
-    # conflicting root entirely, rather than choosing the first ID/path.
-    entries: Dict[int, Dict[str, object]] = {}
-    conflicting_roots = set()
-    def add_group(cgroup):
-        version, root_address, root, hierarchy_id = _cgroup_hierarchy(
-            cgroup, default_root_address
-        )
-        address = _object_address(cgroup)
-        if root_address in entries and entries[root_address]["address"] != address:
-            conflicting_roots.add(root_address)
-            issues.add("cgroup-id-conflict")
-            issues.add("multiple memberships in the same hierarchy")
-            return
-        entries.setdefault(root_address, {
-            "version": version, "root": root, "hierarchy_id": hierarchy_id,
-            "address": address, "cgroup": cgroup, "controllers": set(),
-        })
-
-    for cgroup in groups:
-        try:
-            add_group(cgroup)
-        except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException) as exc:
-            issues.add(f"hierarchy unavailable ({exc})")
-
-    try:
-        subsystems = css_set.subsys if css_set.has_member("subsys") else ()
-        subsystem_count = len(subsystems)
-    except (AttributeError, TypeError, exceptions.InvalidAddressException):
-        subsystems = ()
-        subsystem_count = 0
-        issues.add("controller array unreadable")
-    if subsystem_count > 256:
-        issues.add("controller array exceeds 256 entries")
-    for index in range(min(subsystem_count, 256)):
-        try:
-            css_pointer = subsystems[index]
-            if not css_pointer:
-                continue
-            if not _object_readable(css_pointer):
-                raise ValueError("unreadable controller state")
-            css = css_pointer.dereference()
-            cgroup = css.cgroup
-            version, root_address, _, _ = _cgroup_hierarchy(
-                cgroup, default_root_address
-            )
-            # v2 effective CSS may belong to any ancestor of dfl_cgrp.  Its
-            # address differs from the membership without becoming a v1 root.
-            if version == "v2":
-                continue
-            if root_address not in entries:
-                if links_complete:
-                    issues.add("controller hierarchy absent from membership list")
-                    continue
-                add_group(cgroup)
-            entry = entries[root_address]
-            if entry["address"] != _object_address(cgroup):
-                conflicting_roots.add(root_address)
-                issues.add("cgroup-id-conflict")
-                issues.add("legacy controller disagrees with actual membership")
-                continue
-            controller = f"subsys-{index}"
-            if css.has_member("ss") and css.ss and _object_readable(css.ss):
-                subsystem = css.ss.dereference()
-                field = "legacy_name" if subsystem.has_member("legacy_name") and subsystem.legacy_name else "name"
-                if subsystem.has_member(field) and subsystem.member(field):
-                    controller = _read_kernel_cstring(subsystem.member(field), max_bytes=64)
-            if not controller or len(controller) >= 64:
-                raise ValueError("invalid controller name")
-            entry["controllers"].add(controller)
-        except (
-            AttributeError,
-            IndexError,
-            TypeError,
-            ValueError,
-            exceptions.InvalidAddressException,
-        ) as exc:
-            issues.add(f"controller {index} unavailable ({exc})")
-
-    memberships: List[CgroupMembership] = []
-    for root_address, entry in sorted(entries.items()):
-        if root_address in conflicting_roots:
-            continue
-        path = _cgroup_path(entry["cgroup"])
-        if not path:
-            issues.add("one or more hierarchy paths incomplete")
-            continue
-        if entry["version"] == "v1":
-            try:
-                root = entry["root"]
-                if root.has_member("name"):
-                    name = utility.array_to_string(root.name)
-                    if name:
-                        entry["controllers"].add("name=" + name)
-            except (AttributeError, TypeError, ValueError, exceptions.InvalidAddressException):
-                issues.add("legacy hierarchy name unreadable")
-            if not entry["controllers"]:
-                entry["controllers"].add(f"hierarchy-{entry['hierarchy_id']}")
-        memberships.append(
-            CgroupMembership(
-                version=str(entry["version"]),
-                controllers=tuple(sorted(entry["controllers"])),
-                path=path,
-                cgroup_address=int(entry["address"]),
-            )
-        )
-    # Keep the internal default-root membership even alongside v1.  '/' alone
-    # cannot distinguish a visible hybrid v2 root from an unused default root;
-    # this output does not infer which cgroup filesystems were mounted.
-    report_issues()
-    return tuple(memberships)
 
 
 def _cgroup_identity(
@@ -1323,157 +931,9 @@ class ContainerMounts(plugins.PluginInterface):
         """Equivalent root/ownership views use the lowest readable host PID."""
         return min(observations, key=lambda item: item.pid)
 
-    @staticmethod
-    def _list_mount_points(mnt_ns, max_nodes: int = 100000) -> Tuple[List[object], str]:
-        """Collect a legacy namespace list only after proving return to its head.
+    _list_mount_points = staticmethod(mount_readers.list_mount_points)
 
-        Upstream list_head.to_list() silently stops at unreadable/repeated
-        links.  Treating that exhaustion as success could hide a covering host
-        mount, so validate both link directions and namespace ownership here.
-        On corruption the already validated prefix remains available as PARTIAL.
-        """
-
-        points: List[object] = []
-        try:
-            if not (mnt_ns and _object_readable(mnt_ns) and mnt_ns.has_member("list")):
-                raise ValueError("missing or unreadable legacy namespace list")
-            head = mnt_ns.list
-            if not _object_readable(head):
-                raise ValueError("unreadable legacy namespace list head")
-            context = head._context
-            table_name = head.vol.type_name.split("!", 1)[0]
-            mount_type = table_name + "!mount"
-            if not context.symbol_space.has_type(mount_type):
-                mount_type = table_name + "!vfsmount"
-            member_offset = context.symbol_space.get_type(mount_type).relative_child_offset(
-                "mnt_list"
-            )
-            namespace_address = _object_address(mnt_ns)
-            head_address = _object_address(head)
-            previous = head_address
-            link_pointer = head.next
-            seen = {head_address}
-            while True:
-                link_address = _object_address(link_pointer)
-                if link_address == head_address:
-                    if _object_address(head.prev) != previous:
-                        raise ValueError("legacy mount-list tail disagrees with forward walk")
-                    return points, "COMPLETE"
-                if len(points) >= max_nodes:
-                    raise ValueError("legacy mount list exceeds node limit")
-                if not link_pointer or not _object_readable(link_pointer):
-                    raise ValueError("unreadable legacy mount-list entry")
-                if link_address in seen:
-                    raise ValueError("cyclic legacy mount list outside its head")
-                seen.add(link_address)
-                link = link_pointer.dereference()
-                if _object_address(link.prev) != previous:
-                    raise ValueError("legacy mount-list backlink mismatch")
-                mount_address = link_address - member_offset
-                if mount_address < 0:
-                    raise ValueError("invalid legacy mount container address")
-                mnt = context.object(
-                    mount_type, layer_name=head.vol.layer_name,
-                    native_layer_name=head.vol.native_layer_name,
-                    offset=mount_address,
-                )
-                if mnt.has_member("mnt_ns") and _object_address(mnt.mnt_ns) != namespace_address:
-                    raise ValueError("legacy mount belongs to another namespace")
-                points.append(mnt)
-                previous = link_address
-                link_pointer = link.next
-        except (
-            AttributeError, KeyError, IndexError, TypeError, ValueError,
-            exceptions.InvalidAddressException, exceptions.VolatilityException,
-        ) as exc:
-            return points, f"PARTIAL:list-walk:{type(exc).__name__}:{exc}"
-
-    @staticmethod
-    def _mount_points(mnt_ns) -> Tuple[List[object], str]:
-        """Collect namespace mounts without losing every sibling to one bad RB node.
-
-        Volatility 3's upstream extension recursively walks the kernel >= 6.8
-        RB tree.  An unreadable node raises out of the generator and discards
-        the rest of the walk.  The iterative guard below uses the same
-        LinuxUtilities.container_of primitive but records skipped nodes and
-        continues with every child pointer that was readable.
-        """
-
-        points: List[object] = []
-        skipped_nodes = 0
-        try:
-            is_rb_tree = (
-                mnt_ns.has_member("mounts")
-                and str(mnt_ns.mounts.vol.type_name).endswith("!rb_root")
-            )
-        except (AttributeError, exceptions.InvalidAddressException):
-            is_rb_tree = False
-
-        if not is_rb_tree:
-            return ContainerMounts._list_mount_points(mnt_ns)
-
-        try:
-            vmlinux = linux.LinuxUtilities.get_module_from_volobj_type(
-                mnt_ns._context, mnt_ns
-            )
-            stack = [mnt_ns.mounts.rb_node]
-        except (AttributeError, exceptions.InvalidAddressException) as exc:
-            return points, f"PARTIAL:rb-root:{type(exc).__name__}"
-
-        seen_nodes = set()
-        while stack:
-            node_pointer = stack.pop()
-            try:
-                node_address = int(node_pointer)
-                if not node_address:
-                    continue
-                if node_address in seen_nodes:
-                    skipped_nodes += 1
-                    continue
-                if len(seen_nodes) >= 100000:
-                    skipped_nodes += 1
-                    break
-                seen_nodes.add(node_address)
-                if not _object_readable(node_pointer):
-                    skipped_nodes += 1
-                    continue
-                node = node_pointer.dereference()
-
-                # Read child pointers before decoding the containing mount so a
-                # bad mount object cannot hide otherwise readable subtrees.
-                for member in ("rb_right", "rb_left"):
-                    try:
-                        child = node.member(member)
-                        if child:
-                            stack.append(child)
-                    except (AttributeError, exceptions.InvalidAddressException):
-                        skipped_nodes += 1
-
-                mnt = linux.LinuxUtilities.container_of(
-                    node_pointer, "mount", "mnt_node", vmlinux
-                )
-                if mnt is None or (
-                    hasattr(mnt, "has_member") and mnt.has_member("mnt_ns")
-                    and _object_address(mnt.mnt_ns) != _object_address(mnt_ns)
-                ):
-                    # A readable RB node can still describe an unrelated mount
-                    # after corruption or a bad layout interpretation.  Child
-                    # pointers are already queued, so preserve those subtrees.
-                    skipped_nodes += 1
-                    continue
-                points.append(mnt)
-            except (
-                AttributeError,
-                TypeError,
-                ValueError,
-                exceptions.InvalidAddressException,
-                exceptions.VolatilityException,
-            ):
-                skipped_nodes += 1
-                continue
-
-        status = "COMPLETE" if skipped_nodes == 0 else f"PARTIAL:rb-nodes={skipped_nodes}"
-        return points, status
+    _mount_points = staticmethod(mount_readers.mount_points)
 
     @classmethod
     def _collect_mounts(
@@ -1590,7 +1050,7 @@ class ContainerMounts(plugins.PluginInterface):
         manual = self._requested_pids() is not None
         vmlinux = self.context.modules[self.config["kernel"]]
         init_task = vmlinux.object_from_symbol("init_task")
-        tasks = list(pslist.PsList.list_tasks(self.context, self.config["kernel"]))
+        tasks = list(list_tasks(self.context, self.config["kernel"]))
         namespaces = self._collect_namespaces(tasks, init_task)
         resolver = HostMountResolver(init_task)
         mount_cache, path_cache, view_cache = {}, {}, {}
@@ -1662,4 +1122,4 @@ class ContainerMounts(plugins.PluginInterface):
             columns.extend([
                 ("Mount ID", int), ("Read Status", str), ("Host Path Status", str),
             ])
-        return renderers.TreeGrid(columns, self._generator(extended))
+        return vertical_grid(columns, self._generator(extended))

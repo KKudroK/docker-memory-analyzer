@@ -26,6 +26,23 @@ from volatility3.framework import constants, exceptions, objects, renderers
 from volatility3.framework.objects import utility
 from volatility3.framework.symbols import linux
 
+from volatility3.plugins.linux._artifacts.cgroups import (
+    CgroupPathPolicy,
+    effective_cgroups,
+    effective_cgroup_path,
+)
+from volatility3.plugins.linux._artifacts.core import (
+    CollectionSession,
+    pointer_string,
+    bounded,
+    Unsupported,
+    Incomplete,
+)
+from volatility3.plugins.linux._artifacts.credentials import kernel_id, capability_mask
+from volatility3.plugins.linux._artifacts.mounts import stock_mount_points
+from volatility3.plugins.linux._artifacts.namespaces import namespace_inum, inventory_pid_chain
+from volatility3.plugins.linux._artifacts.tasks import read_argv, INVENTORY_ARGV, audit_task_list
+
 vollog = logging.getLogger(__name__)
 LIMIT = 100000
 FILE_LIMIT = 16 * 1024 * 1024
@@ -44,14 +61,6 @@ STAGE_SCOPES = {
     "details": "selected representative start time and credentials only",
     "settings": "Privileged from verified container bind-mount directories; bounded lookup",
 }
-
-
-class Unsupported(ValueError):
-    """A layout cannot be interpreted without guessing."""
-
-
-class Incomplete(ValueError):
-    """An otherwise supported traversal could not be completed."""
 
 
 class DuplicateJSONKey(ValueError):
@@ -138,92 +147,6 @@ def json_object(raw):
     return obj
 
 
-def capability_mask(value):
-    """실제 val/cap 필드의 타입·크기를 검증해 capability 비트마스크를 읽고, 미지원 구조는 오류로 알린다.
-
-    로직: val 또는 cap 필드를 골라 부호·폭·배열 길이를 검증하고 비트마스크로 결합한다. 알 수 없는 구조를 0으로 처리하지 않는다.
-    """
-    fields = [name for name in ("val", "cap") if value.has_member(name)]
-    if len(fields) != 1:
-        raise Unsupported("Capability needs one val/cap member")
-    name = fields[0]
-    offset, template = value.vol.members[name]
-    if offset < 0 or offset + template.size > value.vol.size:
-        raise Unsupported("Capability exceeds its structure")
-    def unsigned(t, sizes):
-        """타입이 포인터가 아닌 부호 없는 정수이며 허용된 크기인지 검사한다.
-
-        로직: 객체 타입·부호·크기를 확인해 허용된 정수 타입인지 반환한다.
-        """
-        return (issubclass(t.vol.object_class, objects.Integer)
-                and not issubclass(t.vol.object_class, objects.Pointer)
-                and t.size in sizes and not t.vol.data_format.signed)
-    if issubclass(template.vol.object_class, objects.Array):
-        if name != "cap" or template.vol.count not in (1, 2) or not unsigned(template.vol.subtype, (4,)):
-            raise Unsupported("Unsupported capability array")
-        return sum(int(word) << (32 * i) for i, word in enumerate(value.member(name)))
-    if not unsigned(template, (8,) if name == "val" else (4, 8)):
-        raise Unsupported("Unsupported capability integer")
-    return int(value.member(name))
-
-
-def audit_task_list(head, read_link, limit=LIMIT):
-    """태스크 연결 목록을 양방향으로 검사하고, 도달한 노드·연결 불일치·순회 중단 내역을 반환한다.
-
-    로직: 정방향과 역방향을 따로 순회해 역연결을 검사하고 발견 노드를 합친다. 합집합이 완전한 목록이라는 뜻은 아니다.
-    """
-    result = {"head": hex(head), "directions": {}, "issues": []}
-    cache = {}
-
-    def link(address, field):
-        """노드의 연결 포인터를 읽고 결과를 캐시해 같은 주소·필드의 중복 읽기를 줄인다.
-
-        로직: 주소와 필드를 키로 읽기 결과를 저장한 뒤 재요청에는 캐시 값을 사용한다.
-        """
-        key = address, field
-        if key not in cache:
-            cache[key] = read_link(address, field)
-        return cache[key]
-
-    for direction, field, opposite in (("forward", "next", "prev"),
-                                        ("backward", "prev", "next")):
-        nodes, seen, previous = [], set(), head
-        closed = False
-        try:
-            current = link(head, field)
-            while current != head:
-                if not current or current in seen or len(seen) >= limit:
-                    raise Incomplete("Null/cycle/traversal budget before returning to head")
-                seen.add(current)
-                nodes.append(current)
-                try:
-                    actual = link(current, opposite)
-                    if actual != previous:
-                        result["issues"].append({"direction": direction, "kind": "RECIPROCAL_MISMATCH",
-                            "node": hex(current), "field": opposite,
-                            "expected": hex(previous), "actual": hex(actual)})
-                except (exceptions.VolatilityException, ValueError, AttributeError) as exc:
-                    result["issues"].append({"direction": direction, "kind": "UNREADABLE_BACKLINK",
-                        "node": hex(current), "detail": str(exc)})
-                previous, current = current, link(current, field)
-            closed = True
-            if link(head, opposite) != previous:
-                result["issues"].append({"direction": direction, "kind": "HEAD_TAIL_MISMATCH",
-                    "expected": hex(previous), "actual": hex(link(head, opposite))})
-        except (exceptions.VolatilityException, ValueError, AttributeError) as exc:
-            result["issues"].append({"direction": direction, "kind": "TRAVERSAL_STOPPED", "detail": str(exc)})
-        result["directions"][direction] = {"nodes": nodes, "closed": closed, "count": len(nodes)}
-    forward = set(result["directions"]["forward"]["nodes"])
-    backward = set(result["directions"]["backward"]["nodes"])
-    result["forward_only"] = sorted(forward - backward)
-    result["backward_only"] = sorted(backward - forward)
-    if forward != backward:
-        result["issues"].append({"kind": "DIRECTION_SET_MISMATCH",
-            "forward_only": len(forward - backward), "backward_only": len(backward - forward)})
-    result["status"] = "PARTIAL" if result["issues"] else "CONSISTENT"
-    return result
-
-
 def select_representative(rows, cid):
     """ID 충돌이 없는 태스크에서 namespace PID 1 또는 직접 shim 자식으로 유일한 대표를 선정한다.
 
@@ -270,15 +193,13 @@ def shim_arguments(args):
     return cid, next(iter(namespaces), None)
 
 
-class Collector:
+class Collector(CollectionSession):
     def __init__(self, context, kernel_name):
         """분석 context와 커널 계층을 연결하고, 수집 결과·출처·오류·중복 방지 저장소를 초기화한다.
 
         로직: 커널 모듈·메모리 계층을 조회하고 단계별 증거·오류를 담을 보고서와 조회용 사전을 만든다.
         """
-        self.context = context
-        self.kernel = context.modules[kernel_name]
-        self.layer = context.layers[self.kernel.layer_name]
+        super().__init__(context, kernel_name)
         self.stage = "tasks"
         self.report = {"schema_version": 5, "method": "One summary per task-linked Docker container",
             "provenance": {"plugin_version": "1.5.2", "volatility_version": constants.PACKAGE_VERSION,
@@ -431,40 +352,12 @@ class Collector:
             return default
 
 
-    def obj(self, name, address):
-        """지정한 절대 메모리 주소에서 해당 타입의 커널 객체를 생성한다.
-
-        로직: 커널 모듈의 object API에 타입과 절대 오프셋을 전달한다.
-        """
-        return self.kernel.object(name, offset=int(address), absolute=True)
-
-
-    def symbol(self, name, typename):
-        """커널 심볼의 주소를 조회하고 모듈 기준 주소 이동을 반영해 지정 타입의 객체를 생성한다.
-
-        로직: 심볼 주소를 찾은 뒤 모듈 상대 오프셋으로 해당 타입의 객체를 생성한다.
-        """
-        sym = self.kernel.get_symbol(name)
-        return self.kernel.object(typename, offset=sym.address, absolute=False)
-
-
     def string(self, ptr):
-        """포인터가 가리키는 문자열을 길이 제한 내에서 읽으며, NULL이면 빈 문자열을 반환한다.
-
-        로직: NULL 포인터는 빈 문자열로 처리하고, 나머지는 최대 길이를 지정해 읽는다.
-        """
-        return utility.pointer_to_string(ptr, 4096) if ptr else ""
+        return pointer_string(ptr)
 
 
     def bounded(self, iterator):
-        """순회 원소를 차례로 전달하되, 허용 개수를 넘으면 불완전한 수집으로 처리한다.
-
-        로직: 반복자를 열거하다가 LIMIT에 도달하면 Incomplete 예외로 순회를 중단한다.
-        """
-        for index, value in enumerate(iterator):
-            if index >= LIMIT:
-                raise Incomplete("Traversal budget exceeded")
-            yield value
+        return bounded(iterator, LIMIT)
 
 
     def namespace(self, ptr, kind, entity=None):
@@ -478,7 +371,7 @@ class Collector:
         address = self.address(obj)
         key = (kind, address)
         if key not in self.namespaces:
-            number = int(obj.ns.inum) if obj.has_member("ns") else int(obj.proc_inum)
+            number = namespace_inum(obj)
             row = {"address": hex(address), "kind": kind, "inum": number, "tasks": []}
             self.namespaces[key] = (obj, row)
             self.report["namespaces"].append(row)
@@ -489,77 +382,21 @@ class Collector:
 
 
     def pid_chain(self, task):
-        """태스크의 PID 구조를 따라 각 PID namespace 계층의 PID와 네임스페이스 정보를 수집한다.
-
-        로직: thread_pid 또는 pids에서 PID를 찾아 계층 깊이를 검증하고 upid 배열을 순회한다.
-        """
-        if task.has_member("thread_pid"):
-            pid = task.thread_pid
-        elif task.has_member("pids"):
-            pid = task.pids[0].pid
-        else:
-            raise Unsupported("task PID link unavailable")
-        if not pid:
-            return []
-        level = int(pid.level)
-        if not 0 <= level <= 32:
-            raise ValueError("PID namespace depth outside bounds")
-        start = pid.numbers.vol.offset
-        width = self.kernel.get_type("upid").size
-        result = []
-        for index in range(level + 1):
-            upid = self.obj("upid", start + index * width)
-            ns = self.namespace(upid.ns, "pid")
-            result.append({"level": index, "nr": int(upid.nr), "namespace": ns,
-                           "address": hex(upid.vol.offset)})
-        return result
+        return inventory_pid_chain(self, task)
 
 
     def task_cgroups(self, task):
-        """태스크의 css_set에서 기본·subsystem cgroup을 찾아 주소로 중복을 제거하고 정보를 수집한다.
-
-        로직: css_set의 dfl_cgrp·subsys 포인터에서 cgroup을 모아 주소별로 중복 제거한다.
-        """
-        if not task.has_member("cgroups"):
-            raise Unsupported("task.cgroups absent")
+        if not task.has_member('cgroups'):
+            raise Unsupported('task.cgroups absent')
         if not task.cgroups:
             return []
-        css = task.cgroups.dereference()
-        groups = {}
-        if css.has_member("dfl_cgrp") and css.dfl_cgrp:
-            groups[int(css.dfl_cgrp)] = css.dfl_cgrp.dereference()
-        if css.has_member("subsys"):
-            for ptr in self.bounded(css.subsys):
-                if ptr and ptr.cgroup:
-                    groups[int(ptr.cgroup)] = ptr.cgroup.dereference()
-        return [self.cgroup(group, "task") for group in groups.values()]
+        groups = effective_cgroups(task.cgroups.dereference(), states=self.bounded)
+        return [self.cgroup(group, 'task') for group in groups]
 
 
     def cgroup_path(self, group):
-        """cgroup 또는 kernfs의 부모 연결을 따라 전체 경로와 추적 정보를 만들고 순환·순회 한도를 검사한다.
-
-        로직: 부모 노드를 거슬러 이름을 모으고 추적 주소를 기록한다. 순환과 탐색 한도를 검사한다.
-        """
-        node = group.kn.dereference() if group.has_member("kn") and group.kn else group
-        if group.has_member("kn") and not group.kn:
-            raise ValueError("NULL kernfs node")
-        modern = group.has_member("kn")
-        parts, seen, trace = [], set(), []
-        while node:
-            address = self.address(node)
-            if address in seen or len(seen) >= LIMIT:
-                raise Incomplete("cgroup parent cycle/budget")
-            seen.add(address)
-            if node.has_member("name"):
-                parts.append(self.string(node.name))
-            elif node.has_member("name_copy"):
-                parts.append(self.string(node.name_copy))
-            else:
-                raise Unsupported("cgroup name layout unavailable")
-            parent = node.member("__parent") if node.has_member("__parent") else node.parent if node.has_member("parent") else node.self.parent.cgroup if not modern and node.self.parent else None
-            trace.append({"location": self.location(node), "name": parts[-1], "parent": hex(int(parent)) if parent else "0x0"})
-            node = parent.dereference() if parent else None
-        return "/" + "/".join(p for p in reversed(parts) if p), trace
+        return effective_cgroup_path(group, self.string, LIMIT,
+            policy=CgroupPathPolicy.INVENTORY, location=self.location)
 
 
     def task_list(self, head, member, kind):
@@ -614,19 +451,7 @@ class Collector:
 
 
     def argv(self, task):
-        """프로세스 주소 공간의 인자 영역을 읽고 NULL 구분자로 나누어 명령행 인자 목록을 반환한다.
-
-        로직: arg_start·arg_end 길이를 검증하고 프로세스 계층에서 바이트를 읽어 NULL 단위로 나눈다.
-        """
-        if not task.mm:
-            return []
-        start, end = int(task.mm.arg_start), int(task.mm.arg_end)
-        if not 0 <= end - start <= FILE_LIMIT:
-            raise Incomplete("Command line length outside budget")
-        layer_name = task.add_process_layer()
-        if layer_name is None:
-            raise Incomplete("No process address space")
-        return self.context.layers[layer_name].read(start, end - start).decode("utf-8", errors="replace").rstrip("\0").split("\0")
+        return read_argv(self.context, task, INVENTORY_ARGV, limit=FILE_LIMIT)
 
 
     def stage_run(self, name, function):
@@ -842,7 +667,7 @@ class Collector:
                 로직: namespace의 마운트를 제한된 개수만 순회하며 각 마운트에서 bind ID 근거를 읽는다.
                 """
                 namespace = self.obj("mnt_namespace", int(ns, 16))
-                for mnt in self.bounded(namespace.get_mount_points()):
+                for mnt in self.bounded(stock_mount_points(namespace)):
                     self.read("standard bind mount", mnt, lambda m=mnt: self.bind_mount_record(m, task, ns))
             self.read("mount identity namespace", ns, scan)
             evidence = self.report["mounts"][start:]
@@ -930,7 +755,7 @@ class Collector:
                     로직: euid에 val 멤버가 있으면 그 필드를 사용하고 아니면 값을 직접 정수로 읽는다.
                     """
                     value = cred.member("euid")
-                    return int(value.val) if value.has_member("val") else int(value)
+                    return kernel_id(value, require_member_api=True)
                 record["effective_uid"] = self.read("cred.euid", cred, effective_uid)
                 record["effective_caps"] = self.read("cred.cap_effective", cred,
                     lambda: hex(capability_mask(cred.cap_effective)))
@@ -982,7 +807,7 @@ class Collector:
 
                     로직: 개수·시간 한도를 확인하고 검증된 디렉터리 주소를 중복 없이 기록한다.
                     """
-                    for mount in namespace.get_mount_points():
+                    for mount in stock_mount_points(namespace):
                         if time.monotonic() >= deadline or state["mounts_examined"] >= SETTINGS_MOUNT_LIMIT:
                             raise Incomplete("Settings mount search budget")
                         state["mounts_examined"] += 1

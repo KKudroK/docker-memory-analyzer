@@ -20,8 +20,20 @@ import json
 import logging
 import re
 
-from volatility3.framework import constants, exceptions, interfaces, objects, renderers
+from volatility3.framework import constants, exceptions, interfaces, objects
 from volatility3.framework.configuration import requirements
+from volatility3.plugins.linux._vertical import vertical_grid
+
+from volatility3.plugins.linux._artifacts import mounts as mount_readers, network as network_readers
+from volatility3.plugins.linux._artifacts.core import (
+    CollectionSession,
+    strict_string,
+    strict_array_string,
+    Unsupported,
+    Incomplete,
+)
+from volatility3.plugins.linux._artifacts.namespaces import namespace_inum
+from volatility3.plugins.linux._artifacts.tasks import walk_list, read_argv, PRESENCE_ARGV
 
 
 vollog = logging.getLogger(__name__)
@@ -40,14 +52,6 @@ CHECKS = (
     ("containerd_shim", "Containerd shim process", "GENERIC_HINT", ("tasks", "runtime")),
     ("docker_shim", "Shim with namespace=moby", "DOCKER_LABEL", ("tasks", "runtime")),
 )
-
-
-class Unsupported(ValueError):
-    """The ISF does not describe a supported layout."""
-
-
-class Incomplete(ValueError):
-    """A traversal could not prove that it reached its natural end."""
 
 
 def argv_flags(argv):
@@ -123,16 +127,14 @@ def summarize(report):
     return report
 
 
-class Collector:
+class Collector(CollectionSession):
     """Collect from the supplied Volatility context; never launch another CLI."""
 
     def __init__(self, context, kernel_name, limit=100000, progress_callback=None):
         """커널 접근 환경과 순회 한도를 설정하고, 단계별 오류와 관측 결과의 저장 공간을 준비한다."""
         if not 1 <= limit <= 1000000:
             raise ValueError("limit must be in 1..1000000")
-        self.context = context
-        self.kernel = context.modules[kernel_name]
-        self.layer = context.layers[self.kernel.layer_name]
+        super().__init__(context, kernel_name)
         self.limit = limit
         self.progress_callback = progress_callback
         self.stage = "tasks"
@@ -167,14 +169,6 @@ class Collector:
         }
         self.checks = {check["key"]: check for check in self.report["checks"]}
 
-    def obj(self, typename, address):
-        """절대 커널 주소에 지정한 타입을 적용해 객체를 생성한다."""
-        return self.kernel.object(typename, offset=int(address), absolute=True)
-
-    def symbol(self, name, typename):
-        """심볼 주소에 지정한 타입을 적용해 커널 모듈 기준 객체를 생성한다."""
-        # ISF symbols may have addresses but no type metadata (e.g. some BTF ISFs).
-        return self.kernel.object(typename, offset=self.kernel.get_symbol(name).address, absolute=False)
 
     def issue(self, operation, obj, exc):
         """현재 단계의 오류를 유형별로 기록한다. 전체 수를 세되 예시 저장 수는 제한한다."""
@@ -209,50 +203,13 @@ class Collector:
                                         "layer": self.kernel.layer_name, "detail": detail})
 
     def string(self, pointer, maximum=4096):
-        """포인터에서 문자열을 읽는다. 길이와 NUL 종료를 확인한 뒤 UTF-8로 변환한다."""
-        if not pointer:
-            raise Incomplete("NULL string pointer")
-        address, data = int(pointer), bytearray()
-        # Require a real terminator. Some generic string helpers return a
-        # readable prefix when a later page is absent; that is not a full name.
-        while len(data) < maximum:
-            cursor = address + len(data)
-            size = min(32, maximum - len(data), 4096 - (cursor & 4095))
-            block = self.layer.read(cursor, size, pad=False)
-            end = block.find(b"\0")
-            if end >= 0:
-                data.extend(block[:end])
-                return data.decode("utf-8", errors="strict")
-            data.extend(block)
-        raise Incomplete("Unterminated or over-limit string")
+        return strict_string(self.layer, pointer, maximum)
 
     def array_string(self, array):
-        """문자 배열의 타입·길이·NUL 종료를 확인한 뒤 UTF-8 문자열로 변환한다."""
-        if not isinstance(array, objects.Array) or not 0 < array.vol.count <= 4096:
-            raise Unsupported("Name is not a bounded character array")
-        raw = self.layer.read(int(array.vol.offset), array.vol.count, pad=False)
-        end = raw.find(b"\0")
-        if end < 0:
-            raise Incomplete("Unterminated character array")
-        return raw[:end].decode("utf-8", errors="strict")
+        return strict_array_string(self.layer, array)
 
     def walk(self, head, typename, member):
-        """연결 목록을 순회한다. 역방향 링크와 종료 지점, 반복 방문, 노드 수 한도를 검사한다."""
-        offset = self.kernel.get_type(typename).relative_child_offset(member)
-        end, previous = int(head.vol.offset), int(head.vol.offset)
-        link, seen = int(head.next), set()
-        while link != end:
-            if not link or link in seen or len(seen) >= self.limit:
-                raise Incomplete("NULL link, non-head cycle or traversal limit")
-            seen.add(link)
-            node = self.obj(typename, link - offset)
-            entry = node.member(member)
-            if int(entry.prev) != previous:
-                raise Incomplete("List backlink mismatch")
-            yield node
-            previous, link = link, int(entry.next)
-        if int(head.prev) != previous:
-            raise Incomplete("List tail disagrees with forward traversal")
+        return walk_list(self, head, typename, member, check_backlinks=True)
 
     def namespace(self, namespace, kind):
         """namespace를 주소별로 중복 없이 등록하고 inode를 읽어 저장된 항목을 반환한다."""
@@ -261,11 +218,7 @@ class Collector:
         if address not in target:
             def inode():
                 """namespace 레이아웃에 따라 ns.inum 또는 proc_inum을 읽는다."""
-                if namespace.has_member("ns"):
-                    return int(namespace.ns.inum)
-                if namespace.has_member("proc_inum"):
-                    return int(namespace.proc_inum)
-                raise Unsupported("Namespace inode layout unavailable")
+                return namespace_inum(namespace, missing_error=Unsupported("Namespace inode layout unavailable"))
             target[address] = {"object": namespace, "address": hex(address),
                                "inode": self.read(kind + ".namespace_inode", namespace, inode)}
         return target[address]
@@ -321,19 +274,7 @@ class Collector:
             self.read("task.namespaces", task, namespaces)
 
     def argv(self, task):
-        """프로세스 메모리에서 argv를 읽는다. 길이와 끝 NUL을 확인해 인자 목록으로 나눈다."""
-        if not task.mm:
-            raise Incomplete("Runtime task has no userspace memory descriptor")
-        start, end = int(task.mm.arg_start), int(task.mm.arg_end)
-        if not start or not 0 < end - start <= 65536:
-            raise Incomplete("Runtime argv missing or outside byte limit")
-        layer = task.add_process_layer()
-        if layer is None:
-            raise Incomplete("Runtime process layer unavailable")
-        raw = self.context.layers[layer].read(start, end - start, pad=False)
-        if not raw.endswith(b"\0"):
-            raise Incomplete("Runtime argv is not NUL-terminated")
-        return raw[:-1].decode("utf-8", errors="strict").split("\0")
+        return read_argv(self.context, task, PRESENCE_ARGV)
 
     def collect_runtime(self):
         """leader의 이름으로 shim을 찾는다. 이름 근거를 저장하고 argv의 moby namespace를 확인한다."""
@@ -361,61 +302,7 @@ class Collector:
                 self.evidence("docker_shim", task, {"pid": pid, "comm": comm, "runtime_namespace": "moby"})
 
     def mount_points(self, namespace):
-        """namespace의 RB tree나 목록에서 mount를 순회하고 소속·개수·root의 일관성을 검사한다."""
-        expected = (self.read("mounts.count", namespace, lambda: int(namespace.nr_mounts))
-                    if namespace.has_member("nr_mounts") else None)
-        expected_root = (self.read("mounts.root", namespace, lambda: int(namespace.root))
-                         if namespace.has_member("root") else None)
-        observed = set()
-        if namespace.has_member("mounts") and namespace.mounts.has_member("rb_node"):
-            root = namespace.mounts.rb_node
-            offset = self.kernel.get_type("mount").relative_child_offset("mnt_node")
-            stack, seen = [int(root)], set()
-            while stack:
-                address = stack.pop()
-                if not address:
-                    continue
-                if address in seen:
-                    self.issue("mounts.tree", namespace, Incomplete("Repeated RB node"))
-                    continue
-                if len(seen) >= self.limit:
-                    raise Incomplete("Mount RB tree node limit")
-                seen.add(address)
-                node = self.obj("rb_node", address)
-                for field in ("rb_right", "rb_left"):
-                    child = self.read("mounts." + field, node, lambda f=field: int(node.member(f)))
-                    if child:
-                        stack.append(child)
-                mount = self.obj("mount", address - offset)
-                valid = self.read("mounts.owner", mount,
-                                  lambda: int(mount.mnt_ns) == int(namespace.vol.offset))
-                if valid:
-                    observed.add(int(mount.vol.offset))
-                    yield mount
-                elif valid is False:
-                    self.issue("mounts.owner", mount, Incomplete("Mount belongs to another namespace"))
-        elif namespace.has_member("list"):
-            typename = "mount" if self.kernel.has_type("mount") else "vfsmount"
-            for mount in self.walk(namespace.list, typename, "mnt_list"):
-                if mount.has_member("mnt_ns") and int(mount.mnt_ns) != int(namespace.vol.offset):
-                    self.issue("mounts.owner", mount, Incomplete("Mount belongs to another namespace"))
-                    continue
-                observed.add(int(mount.vol.offset))
-                yield mount
-        else:
-            raise Unsupported("Mount namespace has neither supported RB tree nor list")
-        # A NULL/truncated tree can terminate normally despite missing mounts.
-        # Cross-check available namespace metadata before declaring completion.
-        if expected is not None and expected != len(observed):
-            self.issue("mounts.count", namespace, Incomplete(
-                f"Namespace declares {expected} mounts, observed {len(observed)}"))
-        if expected_root is not None:
-            if expected_root and expected_root not in observed:
-                self.issue("mounts.root", namespace, Incomplete(
-                    "Namespace root mount is absent from the traversal"))
-            elif not expected_root and observed:
-                self.issue("mounts.root", namespace, Incomplete(
-                    "Namespace has mounts but a NULL root mount"))
+        return mount_readers.checked_mount_points(self, namespace)
 
     def collect_mounts(self):
         """발견한 mount namespace를 조사하고 Overlay 계열 파일시스템의 관측 근거를 수집한다."""
@@ -463,14 +350,13 @@ class Collector:
         for ns in self.net_namespaces.values():
             def devices():
                 """현재 net namespace의 장치를 순회하고 이름·link kind 검사 결과를 근거로 저장한다."""
-                for dev in self.walk(ns["object"].dev_base_head, "net_device", "dev_list"):
+                for dev in network_readers.devices(self, ns["object"]):
                     name = self.read("network.name", dev, lambda: self.array_string(dev.name))
 
                     def kind():
                         """rtnl_link_ops에서 link kind를 읽고 포인터가 NULL이면 빈 문자열을 반환한다."""
-                        if not dev.has_member("rtnl_link_ops"):
-                            raise Unsupported("net_device.rtnl_link_ops is not described")
-                        return self.string(dev.rtnl_link_ops.kind, 256) if dev.rtnl_link_ops else ""
+                        return network_readers.link_kind(dev, lambda ptr: self.string(ptr, 256),
+                            missing_error=Unsupported("net_device.rtnl_link_ops is not described"))
 
                     link_kind = self.read("network.kind", dev, kind)
                     for check in network_checks(name, link_kind):
@@ -549,4 +435,4 @@ class Detector(interfaces.plugins.PluginInterface):
         if errors:
             vollog.warning("Detector completed with %d collection issues; review bounded examples in detector_evidence.json", errors)
         columns, rows = presentation(report)
-        return renderers.TreeGrid(columns, ((0, row) for row in rows))
+        return vertical_grid(columns, ((0, row) for row in rows))

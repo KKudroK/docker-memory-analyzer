@@ -243,6 +243,8 @@ vol --offline -p "$PLUGIN_DIR" -s "$SYMBOLS" -f "$DUMP" \
 
 ### 4.6 표와 로그 저장
 
+다섯 분석 옵션의 화면 표는 모두 **`category` / `value` 두 열**로 표시됩니다. `ps`는 컨테이너별로, 나머지 기능은 기존 표의 각 관측 행별로 하나의 세로 블록을 만들고 빈 행으로 블록을 구분합니다. `--extended`나 `--view`는 해당 블록에 표시할 항목을 바꿉니다.
+
 `-o`는 플러그인이 만드는 근거 파일의 저장 위치입니다. 화면의 표를 저장하려면 리디렉션을 사용합니다. 다음은 마운트 표를 JSON으로, 진행 메시지와 경고를 로그로 저장하는 예입니다.
 
 ```bash
@@ -270,7 +272,7 @@ python -m json.tool "$OUTPUT_DIR/mounts/rows.json"
 | inspect-networks | `--dump-evidence`를 지정하면 `network_evidence.json` |
 | inspect-caps | `containercaps-audit.json`; `--view analyst`이면 `containercaps-analyst.json` 추가 |
 
-표의 JSON과 근거 JSON은 서로 다릅니다. 값을 읽은 출처나 오류를 확인할 때는 근거 파일을 사용합니다. 재분석 결과를 구분하려면 `OUTPUT_DIR`를 새 디렉터리로 바꾸고 4.1의 디렉터리 생성 명령을 다시 실행합니다.
+`-r json`의 표도 `category` / `value` 행으로 저장됩니다. 기존 가로형 열 이름을 JSON 키로 사용하던 스크립트는 출력 형식 변경에 맞춰 수정해야 합니다. 근거 JSON의 내용은 그대로이며, 값을 읽은 출처나 오류를 확인할 때 사용합니다. 재분석 결과를 구분하려면 `OUTPUT_DIR`를 새 디렉터리로 바꾸고 4.1의 디렉터리 생성 명령을 다시 실행합니다.
 
 ### 공통 명령어 규칙
 
@@ -344,10 +346,10 @@ vol --offline -p "$PLUGIN_DIR" -s "$SYMBOLS" -f "$DUMP" \
 | 추가 옵션 | 용도 |
 |---|---|
 | `--pids PID [PID ...]` | 양의 정수 호스트 PID를 하나 이상 지정하여 대상 선택 |
-| `--extended` | `Mount ID`, `Read Status`, `Host Path Status` 열 추가 |
+| `--extended` | 각 마운트 블록에 `Mount ID`, `Read Status`, `Host Path Status` 항목 추가 |
 | `--mounts-extended` | `--extended`의 호환 별칭 |
 
-`Container Path`, `Host Paths`, `FS Type`, `RO/RW`를 함께 확인합니다. 호스트 경로가 비어 있거나 여러 개로 복구되면 확장 열의 상태를 확인합니다. `RO/RW`는 마운트 모드이며 해당 프로세스의 최종 파일 접근 권한 전체를 뜻하지 않습니다.
+`Container Path`, `Host Paths`, `FS Type`, `RO/RW`를 함께 확인합니다. 호스트 경로가 비어 있거나 여러 개로 복구되면 확장 항목의 상태를 확인합니다. `RO/RW`는 마운트 모드이며 해당 프로세스의 최종 파일 접근 권한 전체를 뜻하지 않습니다.
 
 ### 네트워크 확인: `--inspect-networks`
 
@@ -403,7 +405,7 @@ vol --offline -p "$PLUGIN_DIR" -s "$SYMBOLS" -f "$DUMP" \
 
 컨테이너 태스크의 capabilities, UID, user namespace, seccomp, `no_new_privs`를 확인할 때 사용합니다. 기본값은 스레드를 포함하는 `raw` 보기입니다.
 
-원시 관측 열을 확인합니다.
+원시 관측 항목을 확인합니다.
 
 ```bash
 vol --offline -p "$PLUGIN_DIR" -s "$SYMBOLS" -f "$DUMP" \
@@ -421,7 +423,7 @@ vol --offline -p "$PLUGIN_DIR" -s "$SYMBOLS" -f "$DUMP" \
 
 | 추가 옵션 | 용도 |
 |---|---|
-| `--view raw` | 기본값. 태스크별 관측값과 capability 집합 |
+| `--view raw` | 기본값. 태스크별 관측값과 capability 집합을 세로 블록으로 표시 |
 | `--view analyst` | 분석용 요약과 별도 analyst JSON 생성 |
 | `--container ID` | 6~64자리 16진수 ID 또는 고유 접두사 **하나**로 표시 대상 제한 |
 | `--leaders` | 프로세스 리더만 수집 |
