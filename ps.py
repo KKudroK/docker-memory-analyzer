@@ -41,7 +41,8 @@ from volatility3.plugins.linux._artifacts.core import (
 from volatility3.plugins.linux._artifacts.credentials import kernel_id, capability_mask
 from volatility3.plugins.linux._artifacts.mounts import stock_mount_points
 from volatility3.plugins.linux._artifacts.namespaces import namespace_inum, inventory_pid_chain
-from volatility3.plugins.linux._artifacts.tasks import read_argv, INVENTORY_ARGV, audit_task_list
+from volatility3.plugins.linux._artifacts.tasks import read_argv, INVENTORY_ARGV, audit_task_list, shim_arguments
+from volatility3.plugins.linux._artifacts.timing import read_kernel_boot, read_process_start_ns
 
 vollog = logging.getLogger(__name__)
 LIMIT = 100000
@@ -173,26 +174,6 @@ def select_representative(rows, cid):
                   "no unique namespace init or attributed direct shim child"}
 
 
-def shim_arguments(args):
-    """shim 명령행의 분리된 ID·namespace 인자를 해석하고 누락·충돌·ID 형식을 검사한다.
-
-    로직: ID·namespace 플래그의 다음 인자를 모아 값의 개수와 컨테이너 ID 형식을 검사한다.
-    """
-    ids, namespaces = set(), set()
-    for index, arg in enumerate(args):
-        if arg not in ("-id", "--id", "-namespace", "--namespace"):
-            continue
-        if index + 1 == len(args) or args[index + 1].startswith("-"):
-            raise ValueError("Shim flag has no value")
-        (ids if arg in ("-id", "--id") else namespaces).add(args[index + 1])
-    if len(ids) != 1 or len(namespaces) > 1:
-        raise ValueError("Missing or conflicting shim ID/namespace flags")
-    cid = next(iter(ids))
-    if not CID.fullmatch(cid):
-        raise ValueError("Invalid shim container ID")
-    return cid, next(iter(namespaces), None)
-
-
 class Collector(CollectionSession):
     def __init__(self, context, kernel_name):
         """분석 context와 커널 계층을 연결하고, 수집 결과·출처·오류·중복 방지 저장소를 초기화한다.
@@ -228,77 +209,17 @@ class Collector(CollectionSession):
 
 
     def process_start(self, task):
-        """검증된 커널 시간 구조와 태스크의 실제 시작 필드로 UTC 시작 시각을 계산한다.
-
-        로직: ISF의 tk_core 구조를 검증해 부팅 시각을 얻고, 존재하는 시작 필드의 나노초 값을 더한다.
-        """
         if self.boot is None:
             self.boot = self.kernel_boot_ns()
-        for field in ("start_boottime", "real_start_time", "start_time"):
-            if not task.has_member(field):
-                continue
-            value = task.member(field)
-            if value.has_member("tv_sec") and value.has_member("tv_nsec"):
-                start_ns = int(value.tv_sec) * 1000000000 + int(value.tv_nsec)
-            elif issubclass(type(value), objects.Integer) and value.vol.size == 8:
-                start_ns = int(value)
-            else:
-                raise Unsupported("Unsupported process start field: " + field)
-            if start_ns < 0:
-                raise Unsupported("Negative process start time")
-            return utc(*divmod(self.boot + start_ns, 1000000000))
-        raise Unsupported("No supported process start field")
+        return utc(*divmod(read_process_start_ns(task, self.boot), 1000000000))
 
 
     def kernel_boot_ns(self):
-        """심볼의 실제 구조를 검증해 커널의 부팅 기준 UTC 시각을 나노초로 읽는다.
-
-        로직: tk_core가 void이면 timekeeper 멤버를 가진 유일한 구조체를 찾고 필드 폭을 확인한다.
-        """
-        for symbol_name in ("timekeeper_data", "tk_core", "tk_core_mono", "timekeeper"):
-            if not self.kernel.has_symbol(symbol_name):
-                continue
-            if symbol_name == "timekeeper" and self.kernel.has_type("timekeeper"):
-                type_name = "timekeeper"
-            elif self.kernel.has_type("tk_data") and self.kernel.get_type("tk_data").has_member("timekeeper"):
-                type_name = "tk_data"
-            else:
-                candidates = []
-                table = self.context.symbol_space[self.kernel.symbol_table_name]
-                for candidate_name in table.types:
-                    if candidate_name == "timekeeper":
-                        continue
-                    template = self.kernel.get_type(candidate_name)
-                    if not template.has_member("timekeeper"):
-                        continue
-                    member = template.child_template("timekeeper")
-                    if member.vol.type_name.split(constants.BANG)[-1] == "timekeeper":
-                        candidates.append(candidate_name)
-                if len(candidates) != 1:
-                    raise Unsupported("No unique tk_core timekeeper layout")
-                type_name = candidates[0]
-            container = self.symbol(symbol_name, type_name)
-            keeper = container if type_name == "timekeeper" else container.timekeeper
-            if not keeper.has_member("offs_real") or not keeper.has_member("offs_boot"):
-                raise Unsupported("Timekeeper has no boot offsets")
-            def offset_ns(field):
-                """timekeeper 오프셋이 64비트 정수인지 검사하고 값을 읽는다.
-
-                로직: 구형 tv64 필드 또는 현재 64비트 정수를 허용한다.
-                """
-                value = keeper.member(field)
-                if value.has_member("tv64"):
-                    value = value.tv64
-                if not issubclass(type(value), objects.Integer) or value.vol.size != 8:
-                    raise Unsupported("Unsupported timekeeper offset: " + field)
-                return int(value)
-            boot = offset_ns("offs_real") - offset_ns("offs_boot")
-            if boot <= 0:
-                raise Unsupported("Invalid kernel boot time")
-            self.report["boot_time_source"] = {"symbol": symbol_name,
-                "layout": type_name, "location": self.location(keeper), "nanoseconds": boot}
-            return boot
-        raise Unsupported("No supported timekeeper symbol")
+        source = read_kernel_boot(self)
+        self.report["boot_time_source"] = {"symbol": source.symbol,
+            "layout": source.layout, "location": self.location(source.keeper),
+            "nanoseconds": source.nanoseconds}
+        return source.nanoseconds
 
 
     def address(self, obj):

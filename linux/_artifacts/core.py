@@ -5,8 +5,28 @@
 No report schema or container attribution belongs here. Callers retain their
 exception boundaries, so a failed read never silently becomes an empty value.
 """
+from dataclasses import dataclass
 from volatility3.framework import exceptions, objects
 from volatility3.framework.objects import utility
+
+READ_ERRORS = (
+    AttributeError, IndexError, KeyError, TypeError, ValueError,
+    exceptions.InvalidAddressException, exceptions.VolatilityException,
+)
+
+
+@dataclass(frozen=True)
+class CStringErrors:
+    invalid_bound: str = "null string pointer or invalid string bound"
+    short_read: str = "short unpadded string read"
+    empty: str = "empty kernel string"
+    unterminated: str = "kernel string has no NUL terminator within its bound"
+
+
+KERNEL_STRING_ERRORS = CStringErrors()
+FILE_STRING_ERRORS = CStringErrors(
+    "invalid string address/bound", "short string read", "empty string", "unterminated string",
+)
 
 class Unsupported(ValueError):
     """A layout cannot be interpreted without guessing."""
@@ -125,7 +145,8 @@ def _object_readable(obj) -> bool:
         return False
 
 
-def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = False) -> str:
+def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = False,
+                         errors=KERNEL_STRING_ERRORS) -> str:
     """Read a bounded C string only when its NUL terminator was captured.
 
     pointer_to_string() may return a readable prefix without a terminator.
@@ -136,7 +157,7 @@ def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = 
     """
     address = _object_address(pointer)
     if not address or max_bytes <= 0:
-        raise ValueError("null string pointer or invalid string bound")
+        raise ValueError(errors.invalid_bound)
     layer = pointer._context.layers[pointer.vol.native_layer_name]
     value = bytearray()
     while len(value) < max_bytes:
@@ -147,15 +168,35 @@ def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = 
             block = layer.read(address + len(value), 1, pad=False)
             count = 1
         if len(block) != count:
-            raise ValueError("short unpadded string read")
+            raise ValueError(errors.short_read)
         end = block.find(b"\x00")
         if end >= 0:
             value.extend(block[:end])
             if not value and not allow_empty:
-                raise ValueError("empty kernel string")
+                raise ValueError(errors.empty)
             return bytes(value).decode("utf-8", errors="strict")
         value.extend(block)
-    raise ValueError("kernel string has no NUL terminator within its bound")
+    raise ValueError(errors.unterminated)
+
+
+def read_file_cstring(pointer, max_bytes=4096, *, allow_empty=False):
+    """Same bounded reader, retaining the file collector's diagnostic text."""
+    return _read_kernel_cstring(pointer, max_bytes, allow_empty=allow_empty, errors=FILE_STRING_ERRORS)
+
+
+def containing_object(owner, link, type_name, member):
+    """Resolve an embedded link using its owner's symbol table and layers."""
+    context = owner._context
+    table = owner.vol.type_name.split("!", 1)[0]
+    qualified = table + "!" + type_name
+    displacement = context.symbol_space.get_type(qualified).relative_child_offset(member)
+    address = _object_address(link) - displacement
+    if address <= 0:
+        raise ValueError("invalid containing object")
+    return context.object(
+        qualified, offset=address, layer_name=owner.vol.layer_name,
+        native_layer_name=owner.vol.native_layer_name,
+    )
 
 
 class CollectionSession:

@@ -540,30 +540,25 @@ class Collector(CollectionSession):
         self.append_tasks(leader.get_threads(), seen)
 
     def collect_namespaces(self):
-        """Find all network namespaces using net_namespace_list."""
-        seen_nets = set()
+        """Resolve relocated symbols and register namespaces through one reader."""
         self.nets = {}
+        self.init_net_address = None
         if self.kernel.has_symbol('net_namespace_list'):
-            list_head_addr = self.kernel.get_symbol('net_namespace_list').address
-            list_head = self.obj('list_head', list_head_addr)
-
-            def add_net(net):
-                addr = int(net.vol.offset)
-                if addr not in self.nets:
-                    inode = self.read('net.inum', net, lambda: int(net.ns.inum))
-                    self.nets[addr] = {'address': hex(addr), 'inode': inode, 'object': net}
+            list_head = 'net_namespace_list'
             try:
+                # ISF symbol addresses need the module's relocation offset.
+                # Supplying the type also supports BTF symbols without type metadata.
+                list_head = self.symbol('net_namespace_list', 'list_head')
                 for net in self.walk(list_head, 'net', 'list'):
-                    self.read('net', net, add_net, args=(net,))
+                    self.read('net', net, self.namespace, args=(net, 'net_namespace_list'))
             except Exception as exc:
                 self.issue('net_namespace_list', list_head, exc)
         if self.kernel.has_symbol('init_net'):
-            init_net_addr = self.kernel.get_symbol('init_net').address
-            if init_net_addr not in self.nets:
-                init_net = self.obj('net', init_net_addr)
-                inode = self.read('net.inum', init_net, lambda: int(init_net.ns.inum))
-                self.nets[init_net_addr] = {'address': hex(init_net_addr), 'inode': inode, 'object': init_net}
-        self.init_net_address = hex(self.kernel.get_symbol('init_net').address) if self.kernel.has_symbol('init_net') else None
+            init_net = self.read('init_net', 'init_net', self.symbol, args=('init_net', 'net'))
+            if init_net is not None:
+                # Use the same relocated, layer-masked object address as task pointers.
+                self.init_net_address = hex(int(init_net.vol.offset))
+                self.read('net', init_net, self.namespace, args=(init_net, 'init_net'))
 
     def collect_tasks(self):
         self.discover_tasks()
@@ -674,10 +669,7 @@ class Collector(CollectionSession):
             if proxy:
                 net = self.read('nsproxy.net_ns', proxy, lambda: proxy.net_ns.dereference() if proxy.net_ns else None)
                 if net:
-                    addr = int(net.vol.offset)
-                    if addr not in self.nets:
-                        inode = self.read('net.inum', net, lambda: int(net.ns.inum))
-                        self.nets[addr] = {'address': hex(addr), 'inode': inode, 'object': net}
+                    self.read('net', net, self.namespace, args=(net, 'task.nsproxy.net_ns'))
         members = {task.get('namespace') for task in tasks if identity_member_id(task)}
         unsupported = []
         for ns in self.nets.values():
@@ -840,7 +832,7 @@ def plugin_namespace_inode(nets, address):
 class InspectNetworks(interfaces.plugins.PluginInterface):
     hidden = True  # Exposed through linux.docker.Docker --inspect-networks.
     _required_framework_version = (2, 22, 0)
-    _version = (11, 0, 0)
+    _version = (11, 0, 1)
 
     @classmethod
     def get_requirements(cls):

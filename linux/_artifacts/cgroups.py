@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple
 from volatility3.framework import exceptions
 from volatility3.framework.objects import utility
 from .core import (Unsupported, Incomplete, UnsupportedLayoutError, require_fields,
-                   _object_address, _object_readable, _read_kernel_cstring)
+                   _object_address, _object_readable, _read_kernel_cstring, READ_ERRORS, read_file_cstring)
 
 # Preserve the diagnostic channel consumed by existing mount logs.
 vollog = logging.getLogger('volatility3.plugins.inspect_mount')
@@ -92,7 +92,9 @@ def _cgroup_path(cgroup) -> str:
     return ""
 
 
-def _cgroup_hierarchy(cgroup, default_root_address=None):
+def _cgroup_hierarchy(cgroup, default_root_address=None, *, errors=(
+        "unreadable cgroup hierarchy root", "invalid cgroup hierarchy ID",
+        "inconsistent cgroup default hierarchy root/ID")):
     """Identify a hierarchy by its root, never by its effective CSS address.
 
     The default (v2) hierarchy owns hierarchy ID 0.  All active legacy roots
@@ -103,16 +105,16 @@ def _cgroup_hierarchy(cgroup, default_root_address=None):
         raise ValueError("unreadable cgroup")
     root = cgroup.root
     if not root or not _object_readable(root):
-        raise ValueError("unreadable cgroup hierarchy root")
+        raise ValueError(errors[0])
     root_address = _object_address(root)
     hierarchy_id = int(root.hierarchy_id)
     if hierarchy_id < 0:
-        raise ValueError("invalid cgroup hierarchy ID")
+        raise ValueError(errors[1])
     is_default = hierarchy_id == 0
     if default_root_address is not None and (
         is_default != (root_address == default_root_address)
     ):
-        raise ValueError("inconsistent cgroup default hierarchy root/ID")
+        raise ValueError(errors[2])
     return ("v2" if is_default else "v1"), root_address, root, hierarchy_id
 
 
@@ -596,3 +598,222 @@ def effective_cgroup_path(group, string, limit, *, policy, location=None):
             break
         node = parent.dereference()
     return '/' + '/'.join(p for p in reversed(parts) if p), trace
+
+
+# Actual-membership-only strategy for file views. Unlike _cgroup_memberships,
+# it never promotes subsys-only legacy groups when membership links are lost.
+# Duplicate hierarchy IDs, controller names and string components are checked
+# under the file reader's original stricter contract and diagnostic labels.
+def _file_cgroup_hierarchy(cgroup, default_root=None):
+    return _cgroup_hierarchy(cgroup, default_root, errors=(
+        "unreadable cgroup root", "negative hierarchy ID", "default hierarchy address/ID mismatch"))
+
+
+def read_membership_path(cgroup):
+    """해당 계층의 kernfs 루트에 도달한 완전한 경로만 반환한다."""
+    _, _, root, _ = _file_cgroup_hierarchy(cgroup)
+    node = cgroup.kn
+    root_node = root.cgrp.kn
+    if not root_node or not _object_readable(root_node):
+        raise ValueError("unreadable hierarchy kernfs root")
+    root_address = _object_address(root_node)
+    parts, seen = [], set()
+    for _ in range(256):
+        if not node or not _object_readable(node):
+            raise ValueError("unreadable kernfs ancestor")
+        address = _object_address(node)
+        if address in seen:
+            raise ValueError("cyclic kernfs ancestry")
+        seen.add(address)
+        parent = node.member("__parent" if node.has_member("__parent") else "parent")
+        if address == root_address:
+            if _object_address(parent):
+                raise ValueError("hierarchy root has a parent")
+            return "/" + "/".join(reversed(parts))
+        if not parent or not _object_readable(parent):
+            raise ValueError("kernfs ancestry ended before hierarchy root")
+        name = read_file_cstring(node.name, max_bytes=256)
+        if (not name or name in {".", ".."} or "/" in name
+                or len(name.encode("utf-8")) > 255
+                or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+            raise ValueError("invalid kernfs component")
+        parts.append(name)
+        node = parent
+    raise ValueError("kernfs ancestry exceeds 256 nodes")
+
+
+def _file_cgroup_path(cgroup):
+    try:
+        return read_membership_path(cgroup)
+    except READ_ERRORS:
+        return ""
+
+
+def _file_cgroup_links(css_set, issues):
+    """포인터 대상, 역방향 연결, css_set 소유자를 함께 검증한다."""
+    groups = []
+    try:
+        head = css_set.cgrp_links
+        if not _object_readable(head):
+            raise ValueError("unreadable membership list head")
+        context = head._context
+        type_name = head.vol.type_name.split("!", 1)[0] + "!cgrp_cset_link"
+        field_offset = context.symbol_space.get_type(type_name).relative_child_offset("cgrp_link")
+        head_address = _object_address(head)
+        previous, pointer, seen = head_address, head.next, {head_address}
+        for index in range(4097):
+            address = _object_address(pointer)
+            if address == head_address:
+                if _object_address(head.prev) != previous:
+                    raise ValueError("membership list tail mismatch")
+                return groups
+            if index == 4096:
+                raise ValueError("membership list exceeds 4096 entries")
+            if not pointer or not _object_readable(pointer):
+                raise ValueError("unreadable membership link")
+            if address in seen:
+                raise ValueError("cyclic membership list")
+            seen.add(address)
+            link = context.object(
+                type_name, layer_name=head.vol.layer_name,
+                offset=address - field_offset,
+            )
+            if not _object_readable(link):
+                raise ValueError("unreadable cgrp_cset_link")
+            if _object_address(link.cset) != _object_address(css_set):
+                raise ValueError("membership link belongs to another css_set")
+            if _object_address(link.cgrp_link.prev) != previous:
+                raise ValueError("membership backlink mismatch")
+            groups.append(link.cgrp)
+            previous, pointer = address, link.cgrp_link.next
+    except READ_ERRORS as exc:
+        issues.add(f"membership-list:{type(exc).__name__}:{exc}")
+    return groups
+
+
+def read_link_memberships(task, issues_out=None, *, logger=None):
+    """v1/v2 실제 소속을 읽고 누락·충돌을 별도 표시한다."""
+    issues, entries, conflicting_roots = set(), {}, set()
+
+    def finish(memberships):
+        if issues:
+            issues.add("cgroup-metadata-partial")
+            if issues_out is not None:
+                issues_out.update(issues)
+            (logger or logging.getLogger(__name__)).debug("Partial task cgroups: %s", "; ".join(sorted(issues)))
+        return tuple(memberships)
+
+    try:
+        css_set = task.cgroups
+        if not css_set or not _object_readable(css_set):
+            raise ValueError("missing or unreadable css_set")
+    except READ_ERRORS as exc:
+        issues.add(f"task-cgroups:{type(exc).__name__}:{exc}")
+        return finish(())
+
+    groups = _file_cgroup_links(css_set, issues)
+    default_root = None
+    try:
+        if css_set.has_member("dfl_cgrp"):
+            default_cgroup = css_set.dfl_cgrp
+            version, root_address, _, _ = _file_cgroup_hierarchy(default_cgroup)
+            if version != "v2":
+                raise ValueError("dfl_cgrp is not hierarchy zero")
+            default_root = root_address
+            groups.append(default_cgroup)
+    except READ_ERRORS as exc:
+        issues.add(f"default-cgroup:{type(exc).__name__}:{exc}")
+
+    hierarchy_roots = {}
+    for cgroup in groups:
+        try:
+            version, root_address, root, hierarchy_id = _file_cgroup_hierarchy(cgroup)
+            address = _object_address(cgroup)
+            if root_address in entries and entries[root_address]["address"] != address:
+                conflicting_roots.add(root_address)
+                issues.add("cgroup-id-conflict")
+                continue
+            if hierarchy_id in hierarchy_roots and hierarchy_roots[hierarchy_id] != root_address:
+                conflicting_roots.update((root_address, hierarchy_roots[hierarchy_id]))
+                issues.add("cgroup-id-conflict")
+            hierarchy_roots[hierarchy_id] = root_address
+            entries.setdefault(root_address, {
+                "version": version, "root": root, "hierarchy_id": hierarchy_id,
+                "address": address, "cgroup": cgroup, "controllers": set(),
+            })
+        except READ_ERRORS as exc:
+            issues.add(f"cgroup-hierarchy:{type(exc).__name__}:{exc}")
+
+    # subsys[]는 v1 컨트롤러 이름에만 사용한다. v2 effective CSS는 소속이 아니다.
+    try:
+        subsystems = css_set.subsys if css_set.has_member("subsys") else ()
+        subsystem_count = len(subsystems)
+    except READ_ERRORS as exc:
+        subsystems, subsystem_count = (), 0
+        issues.add(f"controller-array:{type(exc).__name__}:{exc}")
+    if subsystem_count > 256:
+        issues.add("controller-array-limit")
+    for index in range(min(subsystem_count, 256)):
+        try:
+            css = subsystems[index]
+            if not css:
+                continue
+            if not _object_readable(css):
+                raise ValueError("unreadable controller state")
+            version, root_address, _, _ = _file_cgroup_hierarchy(css.cgroup, default_root)
+            if version == "v2":
+                continue
+            if root_address not in entries:
+                issues.add("controller-without-actual-membership")
+                continue
+            entry = entries[root_address]
+            if entry["address"] != _object_address(css.cgroup):
+                conflicting_roots.add(root_address)
+                issues.add("cgroup-id-conflict")
+                continue
+            controller = f"subsys-{index}"
+            if css.has_member("ss") and css.ss:
+                subsystem = css.ss
+                if not _object_readable(subsystem):
+                    raise ValueError("unreadable controller descriptor")
+                field = ("legacy_name" if subsystem.has_member("legacy_name")
+                         and subsystem.legacy_name else "name")
+                controller = read_file_cstring(subsystem.member(field), max_bytes=64)
+            if (not controller or "/" in controller or "," in controller
+                    or any(ord(char) < 32 or ord(char) == 127 for char in controller)):
+                raise ValueError("invalid controller name")
+            entry["controllers"].add(controller)
+        except READ_ERRORS as exc:
+            issues.add(f"controller-{index}:{type(exc).__name__}:{exc}")
+
+    memberships = []
+    for root_address, entry in sorted(entries.items()):
+        if root_address in conflicting_roots:
+            continue
+        try:
+            path = _file_cgroup_path(entry["cgroup"])
+            if not path:
+                raise ValueError("incomplete hierarchy kernfs path")
+        except READ_ERRORS as exc:
+            issues.add(f"cgroup-path:{type(exc).__name__}:{exc}")
+            continue
+        controllers = entry["controllers"]
+        if entry["version"] == "v1":
+            try:
+                root = entry["root"]
+                name = utility.array_to_string(root.name) if root.has_member("name") else ""
+                if name:
+                    if ("/" in name or "," in name or "\ufffd" in name
+                            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+                        raise ValueError("invalid named hierarchy")
+                    controllers.add("name=" + name)
+            except READ_ERRORS as exc:
+                issues.add(f"hierarchy-name:{type(exc).__name__}:{exc}")
+            if not controllers:
+                controllers.add(f"hierarchy-{entry['hierarchy_id']}")
+        memberships.append(CgroupMembership(
+            entry["version"], tuple(sorted(controllers)), path, entry["address"],
+        ))
+    if not entries:
+        issues.add("actual-memberships-unavailable")
+    return finish(memberships)

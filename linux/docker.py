@@ -2,10 +2,10 @@
 
 Usage: vol -p plugins -s symbols -f memory.lime linux.docker.Docker --detector
 Select exactly one of --detector, --ps, --inspect-mounts, --inspect-networks,
-or --inspect-caps. Analysis-specific settings are accepted only with their
-corresponding selector. Native collectors, defaults, TreeGrid schemas and
+--inspect-caps, --container-tasks or --inspect-files. Analysis-specific settings
+are accepted only with their corresponding selector. Native collectors, defaults, TreeGrid schemas and
 evidence files are preserved. The analysis modules are internal backends;
-linux.docker.Docker is the only public entry point for these five analyses.
+linux.docker.Docker is the only public entry point for these seven analyses.
 The official Volatility framework and core Linux plugins are not replaced.
 """
 
@@ -27,40 +27,47 @@ BACKENDS = {
     "inspect-networks": ("inspect_networks", "InspectNetworks"),
     # Keep the existing filename; importlib can load its hyphenated name.
     "inspect-caps": ("inspect-caps", "ContainerCaps"),
+    "container-tasks": ("container_tasks", "ContainerTasks"),
+    "inspect-files": ("inspect_files", "InspectFiles"),
 }
 
 # Public option -> {analysis selector: native backend setting}.
 SETTINGS = {
     "limit": {"detector": "limit"},
-    "pids": {"inspect-mounts": "pids"},
-    "extended": {"inspect-mounts": "extended"},
+    "pids": {"inspect-mounts": "pids", "inspect-files": "pids"},
+    "extended": {"inspect-mounts": "extended", "inspect-files": "extended"},
     "mounts-extended": {"inspect-mounts": "extended"},
     "dump-evidence": {"inspect-networks": "dump-evidence"},
-    "container": {"inspect-networks": "container", "inspect-caps": "container"},
+    "container": {"inspect-networks": "container", "inspect-caps": "container",
+                  "container-tasks": "container", "inspect-files": "container"},
     "leaders": {"inspect-caps": "leaders"},
     "unresolved": {"inspect-caps": "unresolved"},
-    "view": {"inspect-networks": "view", "inspect-caps": "view"},
+    "view": {"inspect-networks": "view", "inspect-caps": "view", "inspect-files": "view"},
+    "triage": {"container-tasks": "triage"},
+    "unlinked-only": {"inspect-files": "unlinked-only"},
+    "full-id": {"inspect-files": "full-id"},
+    "max-fds": {"inspect-files": "max-fds"},
 }
 
 VIEWS = {
     "inspect-networks": ["sockets", "relations", "containers", "interfaces", "conntrack", "diagnostics"],
     "inspect-caps": ["raw", "analyst"],
+    "inspect-files": ["files", "hosts", "details"],
 }
 
 
 class Docker(interfaces.plugins.PluginInterface):
-    """Docker v2: detector, process inventory, mounts, networks or capabilities.
+    """Analyze container presence, inventory, mounts, networks, capabilities, tasks or files.
 
-    Select exactly one analysis. --extended/--mounts-extended adds mount
-    columns. --container and --view apply to networks or capabilities;
-    capabilities accept one container prefix, networks accept several.
-    --leaders/--unresolved apply to capabilities only. Network --dump-evidence
-    saves evidence for the selected view; --view diagnostics runs all retained
-    network collectors. Evidence files use Volatility's -o directory.
+    Select exactly one analysis. --container accepts several prefixes for
+    networks and one for capabilities, tasks or files. --extended adds mount
+    fields or selects the files details view. --triage selects the task
+    membership conflict/unresolved tree. Task evidence is always saved to
+    containertasks-audit.json. Evidence files use Volatility's -o directory.
     """
 
     _required_framework_version = (2, 28, 0)
-    _version = (2, 1, 0)
+    _version = (2, 2, 0)
 
     @classmethod
     def get_requirements(cls):
@@ -74,6 +81,8 @@ class Docker(interfaces.plugins.PluginInterface):
             "inspect-mounts": "Inspect container mount paths, host aliases and access modes",
             "inspect-networks": "Inspect container sockets, sharing relations and network context (Intel64)",
             "inspect-caps": "Inspect Docker task capabilities and security context (Intel64)",
+            "container-tasks": "Inspect container tasks/threads and cross-check cgroup membership with shim ancestry (Intel64)",
+            "inspect-files": "Inspect container open file descriptors, file paths and unlinked names",
         }
         result.extend(requirements.BooleanRequirement(
             name=name, description=description, optional=True, default=False,
@@ -85,23 +94,33 @@ class Docker(interfaces.plugins.PluginInterface):
             requirements.IntRequirement(name="limit", optional=True, default=None,
                 description="[detector] Nodes per traversal (1..1000000); default 100000"),
             requirements.ListRequirement(name="pids", element_type=int, min_elements=1,
-                optional=True, default=None, description="[mounts] Inspect these host PIDs"),
+                optional=True, default=None,
+                description="[mounts, files] Inspect these host PIDs; files selects TGIDs and includes their thread file tables"),
             requirements.BooleanRequirement(name="extended", optional=True, default=None,
-                description="[mounts] Add Mount ID, Read Status and Host Path Status"),
+                description="[mounts] Add mount status fields; [files] Alias for --view details"),
             requirements.BooleanRequirement(name="mounts-extended", optional=True, default=None,
                 description="[mounts] Alias for --extended"),
             requirements.BooleanRequirement(name="dump-evidence", optional=True, default=None,
                 description="[networks] Save evidence for the selected --view to network_evidence.json"),
             requirements.ListRequirement(name="container", element_type=str, min_elements=1,
                 optional=True, default=None,
-                description="[networks, caps] Container ID prefix(es); caps accepts one 6-64 hex prefix"),
+                description="[networks, caps, tasks, files] ID prefix(es); caps/tasks/files accept one 6-64 hex prefix"),
             requirements.BooleanRequirement(name="leaders", optional=True, default=None,
                 description="[caps] Collect process leaders only; default includes threads"),
             requirements.BooleanRequirement(name="unresolved", optional=True, default=None,
                 description="[caps] Show unresolved task membership; cannot combine with --container"),
-            requirements.ChoiceRequirement(name="view", choices=VIEWS["inspect-networks"] + VIEWS["inspect-caps"],
+            requirements.ChoiceRequirement(name="view", choices=list(dict.fromkeys(
+                view for choices in VIEWS.values() for view in choices)),
                 optional=True, default=None,
-                description="[networks, caps] Output view; defaults: networks=sockets, caps=raw"),
+                description="[networks, caps, files] Output view; defaults: networks=sockets, caps=raw, files=files"),
+            requirements.BooleanRequirement(name="triage", optional=True, default=None,
+                description="[tasks] Show conflict/unresolved tasks with threads and ancestor/shim lineage"),
+            requirements.BooleanRequirement(name="unlinked-only", optional=True, default=None,
+                description="[files] Show only UNLINKED names; excludes anonymous/never-linked temporary files"),
+            requirements.BooleanRequirement(name="full-id", optional=True, default=None,
+                description="[files] Show complete container IDs, including in JSON output"),
+            requirements.IntRequirement(name="max-fds", optional=True, default=None,
+                description="[files] Slots per file table (1..1048576); default 65536; truncation is reported"),
         ])
         return result
 
@@ -133,9 +152,16 @@ class Docker(interfaces.plugins.PluginInterface):
             pids = overrides["pids"]
             if not isinstance(pids, list) or not pids or any(type(pid) is not int or pid <= 0 for pid in pids):
                 raise exceptions.VolatilityException("--pids requires one or more positive host PIDs")
+        if "max-fds" in overrides:
+            limit = overrides["max-fds"]
+            if type(limit) is not int or not 1 <= limit <= 1048576:
+                raise exceptions.VolatilityException("--max-fds must be in 1..1048576")
         if "view" in overrides and overrides["view"] not in VIEWS[action]:
             raise exceptions.VolatilityException(
                 f"--view for --{action} must be one of: " + ", ".join(VIEWS[action]))
+        if (action == "inspect-files" and overrides.get("extended")
+                and overrides.get("view") not in (None, "details")):
+            raise exceptions.VolatilityException("--extended for --inspect-files is an alias for --view details")
         if "container" in overrides:
             prefixes = overrides["container"]
             # Accept the earlier single-string JSON configuration as well.
@@ -143,9 +169,9 @@ class Docker(interfaces.plugins.PluginInterface):
                 prefixes = [prefixes]
             if not isinstance(prefixes, list) or not prefixes or any(not isinstance(p, str) or not p for p in prefixes):
                 raise exceptions.VolatilityException("--container requires one or more ID prefixes")
-            if action == "inspect-caps":
+            if action in ("inspect-caps", "container-tasks", "inspect-files"):
                 if len(prefixes) != 1 or not re.fullmatch(r"[0-9a-fA-F]{6,64}", prefixes[0]):
-                    raise exceptions.VolatilityException("--inspect-caps accepts one --container prefix of 6-64 hex characters")
+                    raise exceptions.VolatilityException(f"--{action} accepts one --container prefix of 6-64 hex characters")
                 if overrides.get("unresolved"):
                     raise exceptions.VolatilityException("--unresolved cannot be combined with --container")
                 overrides["container"] = prefixes[0]
