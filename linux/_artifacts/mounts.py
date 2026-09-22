@@ -4,7 +4,7 @@
 from typing import List, Tuple
 from volatility3.framework import exceptions
 from volatility3.framework.symbols import linux
-from .core import Unsupported, Incomplete, _object_address, _object_readable
+from .core import Unsupported, Incomplete, _object_address, _object_readable, READ_ERRORS, containing_object
 
 
 def list_mount_points(mnt_ns, max_nodes: int = 100000) -> Tuple[List[object], str]:
@@ -220,3 +220,114 @@ def checked_mount_points(reader, namespace):
 def stock_mount_points(namespace):
     """Stock extension traversal; callers retain their own bounds and errors."""
     return namespace.get_mount_points()
+
+
+# File views retain their stronger object-readability checks and status labels.
+def mount_current(mnt):
+    """현대 커널은 mount.mnt, 옛 커널은 vfsmount 자체가 현재 마운트다."""
+    if mnt.has_member("mnt"):
+        return mnt.mnt
+    if str(getattr(mnt.vol, "type_name", "")).endswith("!vfsmount"):
+        return mnt
+    return mnt.get_vfsmnt_current()
+
+
+def file_mount_points(namespace, max_nodes=100000):
+    """구형 연결 리스트와 6.8 이후 RB 트리를 각각 상한/순환 검사하며 읽는다."""
+    result, issues = [], 0
+    try:
+        if not _object_readable(namespace):
+            raise ValueError("unreadable namespace")
+        owner_address = _object_address(namespace)
+        table = namespace.vol.type_name.split("!", 1)[0]
+        context = namespace._context
+        if namespace.has_member("list"):
+            # 리스트의 끝처럼 보이는 지점이 아니라, 정확히 head로 복귀해야 완료다.
+            head = namespace.list
+            if not _object_readable(head):
+                raise ValueError("unreadable list head")
+            head_address = _object_address(head)
+            previous, seen, cursor = head_address, {head_address}, head.next
+            kind = "mount" if context.symbol_space.has_type(table + "!mount") else "vfsmount"
+            while _object_address(cursor) != head_address:
+                address = _object_address(cursor)
+                if address in seen or len(result) >= max_nodes or not _object_readable(cursor):
+                    raise ValueError("incomplete mount list")
+                seen.add(address)
+                if _object_address(cursor.prev) != previous:
+                    raise ValueError("mount list backlink mismatch")
+                mnt = containing_object(namespace, cursor, kind, "mnt_list")
+                if not _object_readable(mnt):
+                    raise ValueError("unreadable mount")
+                if mnt.has_member("mnt_ns") and _object_address(mnt.mnt_ns) != owner_address:
+                    raise ValueError("mount namespace mismatch")
+                result.append(mnt)
+                previous, cursor = address, cursor.next
+            if _object_address(head.prev) != previous:
+                raise ValueError("mount list tail mismatch")
+            return result, "COMPLETE"
+
+        if not (namespace.has_member("mounts")
+                and str(namespace.mounts.vol.type_name).endswith("!rb_root")):
+            raise ValueError("unsupported mount namespace layout")
+        # 자식을 mount 해석보다 먼저 큐에 넣어 한 손상 객체가 형제까지 지우지 않게 한다.
+        pending, seen = [namespace.mounts.rb_node], set()
+        while pending:
+            cursor = pending.pop()
+            try:
+                address = _object_address(cursor)
+                if not address:
+                    continue
+                if address in seen:
+                    issues += 1
+                    continue
+                if len(seen) >= max_nodes:
+                    issues += 1
+                    break
+                seen.add(address)
+                if not _object_readable(cursor):
+                    issues += 1
+                    continue
+                node = cursor.dereference()
+                for child_name in ("rb_right", "rb_left"):
+                    try:
+                        child = node.member(child_name)
+                        if _object_address(child):
+                            pending.append(child)
+                    except READ_ERRORS:
+                        issues += 1
+                mnt = containing_object(namespace, cursor, "mount", "mnt_node")
+                if not _object_readable(mnt):
+                    raise ValueError("unreadable mount")
+                if mnt.has_member("mnt_ns") and _object_address(mnt.mnt_ns) != owner_address:
+                    raise ValueError("mount namespace mismatch")
+                result.append(mnt)
+            except READ_ERRORS:
+                issues += 1
+        return result, "COMPLETE" if not issues else f"PARTIAL:mount-nodes={issues}"
+    except READ_ERRORS as exc:
+        return result, "PARTIAL:mount-list:" + type(exc).__name__
+
+
+def namespace_covering(mnt_ns):
+    """프로세스 경로 위에 다른 마운트가 덮여 있는지 확인할 인덱스."""
+    result, complete, known = {}, True, set()
+    mount_list, status = file_mount_points(mnt_ns)
+    complete = status == "COMPLETE"
+    for mnt in mount_list:
+        try:
+            current = _object_address(mount_current(mnt))
+            parent = _object_address(mnt.get_vfsmnt_parent())
+            if not current or not parent:
+                raise ValueError("null mount")
+            known.add(current)
+            if current != parent:
+                point = mnt.get_mnt_mountpoint()
+                if not _object_readable(point):
+                    raise ValueError("unreadable mountpoint")
+                result.setdefault((parent, _object_address(point)), set()).add(current)
+        except READ_ERRORS:
+            complete = False
+    if any(parent not in known for parent, _ in result):
+        complete = False
+    return result, complete

@@ -24,6 +24,9 @@ from volatility3.plugins.linux import mountinfo, pslist
 from volatility3.plugins.linux._vertical import vertical_grid
 
 from volatility3.plugins.linux._artifacts import mounts as mount_readers
+from volatility3.plugins.linux._artifacts.paths import (
+    MOUNT_PATH, SourceResolution, read_dentry_name, walk_mount_path,
+)
 from volatility3.plugins.linux._artifacts.cgroups import (
     CgroupMembership,
     _cgroup_path,
@@ -101,6 +104,19 @@ RUNTIME_SUPERVISORS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+
+
+def _read_dentry_name(dentry):
+    return read_dentry_name(dentry, policy=MOUNT_PATH)
+
+
+def _walk_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt, *, max_depth=4096,
+                     covering_mounts=None, require_live_inode=True):
+    return walk_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt,
+                           max_depth=max_depth, covering_mounts=covering_mounts,
+                           require_live_inode=require_live_inode, policy=MOUNT_PATH)
+
+
 INTERNAL_NAMESPACE_ROOT_FSTYPES = frozenset({"nullfs", "rootfs"})
 
 
@@ -110,136 +126,6 @@ def _read_mount_devname(mnt) -> str:
     if not pointer:
         return "none"
     return _read_kernel_cstring(pointer, allow_empty=True) or "none"
-
-
-def _read_dentry_name(dentry) -> Tuple[str, str]:
-    """Bound qstr reads before decoding, preserving valid filename whitespace."""
-
-    qname = dentry.d_name
-    declared_length = int(qname.len) if qname.has_member("len") else None
-    if declared_length is not None and not 1 <= declared_length <= 255:
-        return "", "invalid-name"
-    name = qname.name_as_str()
-    if (
-        not name or name in {".", ".."} or "/" in name
-        or "\x00" in name or "\ufffd" in name
-        or any(ord(char) < 32 or ord(char) == 127 for char in name)
-        or len(name.encode("utf-8")) > 255
-    ):
-        return "", "invalid-name"
-    if declared_length is not None and declared_length != len(name.encode("utf-8")):
-        return "", "truncated-name"
-    return name, ""
-
-
-def _walk_mount_path(
-    root_dentry,
-    root_vfsmnt,
-    dentry,
-    vfsmnt,
-    *,
-    max_depth: int = 4096,
-    covering_mounts=None,
-    require_live_inode: bool = True,
-) -> Tuple[str, str]:
-    """Build a path only after reaching the exact (mount, dentry) root.
-
-    Upstream do_get_path() can return a plausible suffix when an unreadable
-    parent stops its walk.  Here an incomplete walk never becomes a path.
-    Each comparison uses pointer targets, not pointer-field storage offsets.
-    A namespace covering-mount index additionally rejects paths hidden by a
-    different mount; without that index this proves topology, not visibility.
-    The container-side mountinfo path needs topology only.  Host-source and
-    propagation proofs additionally require readable inodes and linked names.
-    """
-
-    parts: List[str] = []
-    seen = set()
-    # When leaving a child mount, its attachment at the parent dentry is the
-    # one covering edge that belongs to this route rather than obscuring it.
-    allowed_cover = None
-    crossed_mount = False
-    try:
-        if not all(
-            obj and _object_readable(obj)
-            for obj in (root_dentry, root_vfsmnt, dentry, vfsmnt)
-        ):
-            return "", "INCOMPLETE:unreadable-root-or-source"
-        root_key = (_object_address(root_vfsmnt), _object_address(root_dentry))
-        for _ in range(max_depth):
-            if not (dentry and _object_readable(dentry) and vfsmnt and _object_readable(vfsmnt)):
-                return "", "INCOMPLETE:unreadable-route"
-            key = (_object_address(vfsmnt), _object_address(dentry))
-            if key in seen:
-                return "", "INCOMPLETE:cycle"
-            seen.add(key)
-
-            if require_live_inode:
-                inode = dentry.d_inode
-                if not (inode and _object_readable(inode)):
-                    return "", "INCOMPLETE:missing-inode"
-
-            if covering_mounts is not None:
-                covers = covering_mounts.get(key, set())
-                if len(covers) > 1:
-                    # Sibling attachments do not encode which stacked mount
-                    # wins lookup; a different valid alias cannot settle it.
-                    return "", "INCOMPLETE:stacked-attachment"
-                if covers and covers != {allowed_cover}:
-                    return "", "COVERED"
-                if allowed_cover is not None and allowed_cover not in covers:
-                    return "", "INCOMPLETE:missing-attachment"
-            allowed_cover = None
-
-            if key == root_key:
-                return "/" + "/".join(reversed(parts)), "COMPLETE"
-
-            mount_root = vfsmnt.get_mnt_root()
-            if not (mount_root and _object_readable(mount_root)):
-                return "", "INCOMPLETE:unreadable-mount-root"
-            if key[1] == _object_address(mount_root):
-                parent_mnt = vfsmnt.get_vfsmnt_parent()
-                mountpoint = vfsmnt.get_mnt_mountpoint()
-                if not (
-                    parent_mnt and _object_readable(parent_mnt)
-                    and mountpoint and _object_readable(mountpoint)
-                ):
-                    return "", "INCOMPLETE:unreadable-attachment"
-                if _object_address(parent_mnt) == key[0]:
-                    return "", "OUTSIDE_ROOT"
-                allowed_cover = key[0]
-                crossed_mount = True
-                dentry, vfsmnt = mountpoint, parent_mnt
-                continue
-
-            parent = dentry.d_parent
-            if not (parent and _object_readable(parent)):
-                return "", "INCOMPLETE:unreadable-parent"
-            if _object_address(parent) == key[1]:
-                # A same-superblock bind mount may cover a disjoint subtree.
-                # Reaching its filesystem root without its mount root proves
-                # that this candidate is not an ancestor of the source.
-                return "", "OUTSIDE_ROOT" if crossed_mount else "OUTSIDE_MOUNT"
-
-            if require_live_inode and not _object_address(dentry.d_hash.pprev):
-                # d_unlinked(): a non-root, unhashed name cannot be used to
-                # walk to its former parent.  A positive i_nlink may belong
-                # to another hardlink.  Conversely, the mount-root crossing
-                # above can expose this inode through a live bind alias even
-                # when its original name is unlinked and i_nlink is zero.
-                return "", "UNLINKED"
-
-            name, name_issue = _read_dentry_name(dentry)
-            if name_issue:
-                return "", f"INCOMPLETE:{name_issue}"
-            parts.append(name)
-            dentry = parent
-    except (
-        AttributeError, IndexError, TypeError, ValueError,
-        exceptions.InvalidAddressException, exceptions.VolatilityException,
-    ) as exc:
-        return "", f"INCOMPLETE:{type(exc).__name__}"
-    return "", "INCOMPLETE:depth-limit"
 
 
 def _path_identities(path: str) -> Tuple[Identity, ...]:
@@ -341,12 +227,6 @@ class TaskObservation:
     identity: Optional[Identity]
     runtime: str
     evidence: Tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class SourceResolution:
-    paths: Tuple[str, ...]
-    status: str
 
 
 @dataclass

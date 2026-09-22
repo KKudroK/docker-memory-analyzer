@@ -1,8 +1,10 @@
 """Task-list strategies and argv readers, with explicit legacy policies."""
 from dataclasses import dataclass
+import re
 from volatility3.framework import exceptions
+from volatility3.framework.objects import utility
 from volatility3.plugins.linux import pslist
-from .core import Incomplete
+from .core import Incomplete, READ_ERRORS, _object_address, _object_readable
 
 def audit_task_list(head, read_link, limit=100000):
     """태스크 연결 목록을 양방향으로 검사하고, 도달한 노드·연결 불일치·순회 중단 내역을 반환한다.
@@ -137,3 +139,86 @@ def read_argv(context, task, policy, *, limit=None):
     if policy.strip_trailing_nuls:
         value = value.rstrip('\0')
     return value.split('\0')
+
+
+def shim_arguments(args):
+    """shim 명령행의 분리된 ID·namespace 인자를 해석하고 누락·충돌·ID 형식을 검사한다.
+
+    로직: ID·namespace 플래그의 다음 인자를 모아 값의 개수와 컨테이너 ID 형식을 검사한다.
+    """
+    ids, namespaces = set(), set()
+    for index, arg in enumerate(args):
+        if arg not in ("-id", "--id", "-namespace", "--namespace"):
+            continue
+        if index + 1 == len(args) or args[index + 1].startswith("-"):
+            raise ValueError("Shim flag has no value")
+        (ids if arg in ("-id", "--id") else namespaces).add(args[index + 1])
+    if len(ids) != 1 or len(namespaces) > 1:
+        raise ValueError("Missing or conflicting shim ID/namespace flags")
+    cid = next(iter(ids))
+    if not re.fullmatch(r"[0-9a-f]{64}", cid):
+        raise ValueError("Invalid shim container ID")
+    return cid, next(iter(namespaces), None)
+
+
+def ancestor_chain(task, limit=512):
+    """real_parent 포인터를 따라 init/PID 1까지 조상 체인을 복원한다.
+
+    로직: real_parent를 거슬러 오르며 주소·PID·명령을 기록한다. NULL·자기참조·
+    순환·한도 도달·PID 1에서 멈춘다. 반환은 가까운 조상부터의 순서다.
+    """
+    chain, seen = [], set()
+    current = task
+    while True:
+        address = int(current.vol.offset)
+        if address in seen or len(seen) >= limit:
+            break
+        seen.add(address)
+        try:
+            parent_ptr = current.real_parent
+        except (exceptions.VolatilityException, AttributeError):
+            break
+        if not int(parent_ptr):
+            break
+        parent_address = int(parent_ptr)
+        if parent_address == address:  # init_task는 자기 자신을 부모로 가진다.
+            break
+        parent = parent_ptr.dereference()
+        try:
+            record = {"address": hex(parent_address), "pid": int(parent.tgid),
+                      "tid": int(parent.pid),
+                      "comm": utility.array_to_string(parent.comm)}
+        except (exceptions.VolatilityException, ValueError, AttributeError):
+            chain.append({"address": hex(parent_address), "pid": None, "tid": None,
+                          "comm": None, "unreadable": True})
+            break
+        chain.append(record)
+        if record["pid"] == 1:
+            break
+        current = parent
+    return chain
+
+
+def comm_matches(comm, signature):
+    return bool(comm) and comm in (signature, signature[:15])
+
+
+def runtime_from_ancestry(task, supervisors, max_depth=8):
+    seen, current = set(), task
+    for _ in range(max_depth):
+        try:
+            if not current or not _object_readable(current):
+                break
+            address = _object_address(current)
+            if address in seen:
+                break
+            seen.add(address)
+            comm = utility.array_to_string(current.comm)
+            for signature, runtime in supervisors:
+                if comm_matches(comm, signature):
+                    return runtime, comm
+            current = (current.real_parent if current.has_member("real_parent")
+                       else current.parent)
+        except READ_ERRORS:
+            break
+    return "", ""
