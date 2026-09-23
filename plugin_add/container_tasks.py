@@ -23,9 +23,9 @@ linux.docker.Docker 디스패처에도 편입하지 않는다. 무거운 판독�
 옵션:
     --container 접두사: 특정 컨테이너만 표시한다. 6에서 64자리 16진수 고유
     접두사 하나를 받는다.
-    --triage: 소속 근거(cgroup ID, shim 계보 ID, runtime namespace)가 서로
-    어긋나거나 확정하지 못한 태스크만 골라, 스레드와 조상에서 shim까지의 계보를
-    트리로 보여준다. 옵션이 없으면 모든 컨테이너 태스크를 상세 표로 보여준다.
+    --triage: 소속 근거의 불일치가 기록된 태스크만 한 행씩 표시한다.
+    cgroup ID와 shim ID를 나란히 비교하고 계보는 audit JSON에 보존한다.
+    옵션이 없으면 핵심 요약 표, --details는 기존 상세 표를 보여준다.
     전체 수집 근거는 화면과 무관하게 언제나 containertasks-audit.json에 남긴다.
     표는 표시용이며, 소속 불일치가 곧 악성 행위를 뜻하지는 않는다.
 
@@ -52,7 +52,7 @@ from volatility3.plugins.linux._artifacts.tasks import read_argv, INVENTORY_ARGV
 
 
 LOG = logging.getLogger(__name__)
-VERSION_INFO = (1, 0, 0)
+VERSION_INFO = (1, 4, 0)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
 
@@ -219,11 +219,7 @@ class _Timing(CollectionSession):
 
 
 class ContainerTasks(interfaces.plugins.PluginInterface):
-    """컨테이너 태스크 상세와 shim 계보 교차 검증을 통합한 분석(구 9번 + 구 10번).
-
-    Ubuntu·커널 버전 번호로 판독기를 고르지 않는다. 심볼이 일치해도 모든 커널의
-    완전한 분석을 보장하지 않으며, 미지원 구조는 명시적으로 남긴다.
-    """
+    """Inspect container tasks and cross-check cgroup membership against shim ancestry."""
 
     _required_framework_version = (2, 13, 0)
     _version = VERSION_INFO
@@ -239,8 +235,11 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 name="container", description="Docker ID or unique hex prefix (6-64 characters)",
                 optional=True),
             requirements.BooleanRequirement(
+                name="details", description="Show the full task table (ignored with --triage)",
+                default=False, optional=True),
+            requirements.BooleanRequirement(
                 name="triage",
-                description="Triage tree of conflict/unresolved tasks with threads and full ancestor/shim lineage",
+                description="Show membership mismatches only; report Normal when none are detected",
                 default=False, optional=True),
         ]
 
@@ -531,8 +530,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         if prefix and not re.fullmatch(r"[0-9a-fA-F]{6,64}", prefix):
             raise ValueError("Container prefix must be 6-64 hexadecimal characters")
         triage = self.config.get("triage", False)
-        # 기본은 모든 컨테이너 태스크를 스레드까지 상세 표로 보여준다. --triage는 충돌/미확정
-        # 태스크만 골라 스레드와 조상, shim 계보를 트리로 보여준다.
+        # 모든 태스크를 수집하고 표시 방식만 바꾼다. triage는 검토 대상과 관계를 표시한다.
         conflicts_only = triage
         include_threads = True
 
@@ -543,7 +541,8 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             "scope": "Container-candidate tasks: Docker-marked cgroup membership or a shim ancestor. "
                      "Full evidence retained here regardless of the display filter.",
             "include_threads": include_threads,
-            "display_filter": "triage" if triage else "conflicts_only" if conflicts_only else "all_container_candidates",
+            "display_filter": "mismatches_only" if triage else "all_container_candidates",
+            "display_view": "triage" if triage else "details" if self.config.get("details", False) else "summary",
             "selected_prefix": prefix,
             "compatibility": readers["layout"],
             "limitations": [
@@ -620,21 +619,25 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         displayed = audit["tasks"]
         if prefix:
             displayed = [t for t in displayed if t["ContainerID"] and t["ContainerID"].startswith(prefix)]
+        audit["selected_tasks"] = len(displayed)
         if conflicts_only:
-            displayed = [t for t in displayed if t["membership"]["status"] in ("conflict", "unresolved")]
+            displayed = [t for t in displayed if self._is_mismatch(t)]
         displayed = sorted(displayed, key=lambda t: (t["ContainerID"] or "", t["HostPID"], t["HostTID"]))
         audit["displayed_tasks"] = len(displayed)
 
         # 근거 JSON 저장. self.open은 Volatility 출력 디렉터리(-o)를 따른다.
         with self.open("containertasks-audit.json") as handle:
             handle.write(json.dumps(audit, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
-        if audit["traversal_errors"] or audit["conflict_tasks"]:
-            LOG.warning("ContainerTasks: candidates=%d, conflicts/unresolved=%d; see containertasks-audit.json",
-                        audit["candidate_tasks"], audit["conflict_tasks"])
+        if audit["traversal_errors"]:
+            LOG.warning("ContainerTasks: task collection incomplete; see containertasks-audit.json")
+        if triage and displayed:
+            LOG.warning("ContainerTasks: membership mismatches=%d; see containertasks-audit.json", len(displayed))
 
         if triage:
             return self._triage_grid(audit, displayed)
-        return self._raw_grid(displayed)
+        if self.config.get("details", False) and displayed:
+            return self._raw_grid(displayed)
+        return self._summary_grid(audit, displayed)
 
     # ---- 출력 ----------------------------------------------------------------
 
@@ -648,7 +651,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         if value is None:
             return renderers.NotAvailableValue()
         if isinstance(value, str):
-            return "".join(ch if ch >= " " or ch == "\t" else " " for ch in value)
+            return "".join(ch if ch.isprintable() else " " for ch in value)
         return value
 
     def _raw_grid(self, displayed):
@@ -678,65 +681,95 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
 
         return renderers.TreeGrid(columns, rows())
 
-    def _triage_grid(self, audit, displayed):
-        """세 옵션(충돌 필터, 스레드 펼침, 조상 계보)을 한 트리로 합친 triage 보기.
+    @staticmethod
+    def _membership_label(detail):
+        return {
+            "confirmed_agree": "Sources agree",
+            "single_source": "Single source",
+            "conflict": "Review: mismatch",
+            "unresolved": "Review: unknown",
+        }[detail["membership"]["status"]]
 
-        로직: 충돌/미확정 태스크가 하나라도 있는 프로세스를 대상으로, 프로세스 리더를
-        상위 노드로 두고 그 아래에 스레드 행과 부모에서 shim까지의 조상 계보를 들여써
-        한 화면에 보여준다. TreeGrid 들여쓰기가 태스크에서 스레드, 조상, shim으로 이어지는
-        소속 경로를 그대로 나타낸다.
-        """
-        # 모든 후보 태스크를 프로세스(HostPID)별로 모은다. displayed는 충돌/미확정만,
-        # 프리픽스까지 반영된 목록이므로 표시 대상 프로세스를 여기서 정한다.
-        by_pid = {}
-        for t in audit["tasks"]:
-            by_pid.setdefault(t["HostPID"], []).append(t)
-        included_pids = sorted({t["HostPID"] for t in displayed})
+    @staticmethod
+    def _review_reason(detail):
+        reasons = [c["reason"] for c in detail["conflicts"]]
+        if detail["membership"]["status"] == "unresolved":
+            reasons.append("No usable container ID from cgroup or shim")
+        if not reasons:
+            sources = detail["membership"]["sources"]
+            reasons.append("Cgroup and shim IDs agree" if len(sources) == 2 else
+                           "Only {} evidence available".format(" and ".join(sources)))
+        if detail["Status"] != "ok":
+            reasons.append("Some task fields could not be read; see audit JSON")
+        return "; ".join(reasons)
 
-        columns = [("Kind", str), ("ContainerID", str), ("PID", int), ("TID", int),
-                   ("Name", str), ("EUID", int), ("Basis", str), ("Conflict", str), ("Info", str)]
+    @staticmethod
+    def _empty_message(audit):
+        prefix = audit["selected_prefix"]
+        if not audit["candidate_tasks"]:
+            message = "No container-candidate tasks recovered"
+        elif prefix and not any(t["ContainerID"] and t["ContainerID"].startswith(prefix)
+                                for t in audit["tasks"]):
+            message = "No container matches prefix {}".format(prefix)
+        else:
+            message = "No conflicting or unresolved membership in the selected tasks"
+        return message + ". This does not prove complete recovery or safety; see containertasks-audit.json."
 
-        def conflict_text(detail):
-            return "; ".join(c["kind"] for c in detail["conflicts"]) or "-"
-
-        def task_row(kind, detail, info):
-            return (self._cell(kind), self._cell(short_id(detail["ContainerID"])),
-                    detail["HostPID"], detail["HostTID"], self._cell(detail["Name"]),
-                    detail["EUID"] if detail["EUID"] is not None else renderers.NotAvailableValue(),
-                    self._cell(detail["membership"]["basis"]), self._cell(conflict_text(detail)),
-                    self._cell(info))
-
-        def ancestor_row(kind, node, info):
-            return (self._cell(kind), renderers.NotAvailableValue(),
-                    node["pid"] if node["pid"] is not None else renderers.NotAvailableValue(),
-                    node["tid"] if node["tid"] is not None else renderers.NotAvailableValue(),
-                    self._cell(node["comm"]), renderers.NotAvailableValue(),
-                    renderers.NotAvailableValue(), renderers.NotAvailableValue(), self._cell(info))
+    def _summary_grid(self, audit, displayed):
+        """Compact, flat task view; full evidence remains in the audit file."""
+        columns = [("Container", str), ("Host PID", int), ("Host TID", int),
+                   ("Name", str), ("Membership", str), ("Evidence / next step", str)]
 
         def rows():
-            for pid in included_pids:
-                threads = by_pid.get(pid, [])
-                if not threads:
-                    continue
-                leader = next((t for t in threads if t["HostTID"] == t["HostPID"]), threads[0])
-                # 상위 노드: 프로세스 리더 상세(구 9번 항목). Info에는 명령행을 요약해 싣는다.
-                cmd = (leader["Cmdline"] or "")
-                info = (cmd[:80] + "…") if len(cmd) > 80 else (cmd or "-")
-                yield 0, task_row("TASK", leader, info)
-                # 스레드 펼침: 리더가 아닌 스레드를 TID 순으로.
-                for th in sorted((t for t in threads if t["HostTID"] != t["HostPID"]),
-                                 key=lambda x: x["HostTID"]):
-                    yield 1, task_row("THREAD", th, "thread")
-                # 조상 계보: 부모에서 shim까지. shim 노드에 runtime namespace와 shim ID를 표시.
-                lineage = leader["shim_lineage"] or {}
-                shim_addr = lineage.get("shim_task")
-                for node in leader["ancestry"]:
-                    is_shim = shim_addr is not None and node["address"] == shim_addr
-                    if is_shim:
-                        info = "runtime={} id={}".format(lineage.get("runtime_namespace"),
-                                                         short_id(lineage.get("container_id")))
-                        yield 1, ancestor_row("SHIM", node, info)
-                        break  # shim까지가 소속 계보다. 그 위 호스트 계층은 생략한다.
-                    yield 1, ancestor_row("ANCESTOR", node, "-")
+            if not displayed:
+                yield 0, tuple(self._cell(v) for v in
+                               (None, None, None, None, "No results", self._empty_message(audit)))
+            for task in displayed:
+                yield 0, tuple(self._cell(v) for v in (
+                    short_id(task["ContainerID"]), task["HostPID"], task["HostTID"],
+                    task["Name"], self._membership_label(task), self._review_reason(task)))
+        return renderers.TreeGrid(columns, rows())
 
+    @staticmethod
+    def _is_mismatch(task):
+        # A recorded runtime conflict can coexist with an unresolved ID status.
+        return bool(task["conflicts"])
+
+    def _triage_empty_result(self, audit):
+        selected = audit["tasks"]
+        prefix = audit.get("selected_prefix", "")
+        if prefix:
+            selected = [t for t in selected if t["ContainerID"] and t["ContainerID"].startswith(prefix)]
+        if audit.get("traversal_errors"):
+            return "Incomplete", "No membership mismatches detected; task collection was incomplete. See audit JSON."
+        if not selected:
+            return "No results", self._empty_message(audit)
+        reason = "Normal: no membership mismatches detected in the selected tasks."
+        limited = sum(t["membership"]["status"] != "confirmed_agree" or t["Status"] != "ok"
+                      for t in selected)
+        if limited:
+            reason += " {} task(s) have limited evidence; this is not confirmation of their membership. See audit JSON.".format(limited)
+        return "Normal", reason
+
+    def _triage_grid(self, audit, displayed):
+        """One row per mismatch; missing evidence alone is not a mismatch."""
+        columns = [("PID / TID", str), ("Name", str), ("Cgroup ID", str),
+                   ("Shim PID", int), ("Shim ID", str), ("Runtime NS", str),
+                   ("Shim Cgroup ID", str), ("Result", str), ("Reason", str)]
+        mismatches = [task for task in displayed if self._is_mismatch(task)]
+
+        def rows():
+            if not mismatches:
+                result, reason = self._triage_empty_result(audit)
+                yield 0, tuple(self._cell(v) for v in
+                               (None, None, None, None, None, None, None, result, reason))
+            for task in mismatches:
+                lineage = task["shim_lineage"] or {}
+                # Do not substitute a fallback shim ID for missing cgroup evidence.
+                cgroup_id = task["membership"]["sources"].get("cgroup")
+                yield 0, tuple(self._cell(v) for v in (
+                    "{} / {}".format(task["HostPID"], task["HostTID"]), task["Name"],
+                    short_id(cgroup_id), lineage.get("shim_pid"),
+                    short_id(lineage.get("container_id")), lineage.get("runtime_namespace"),
+                    short_id(lineage.get("shim_cgroup_id")), "Mismatch", self._review_reason(task)))
         return renderers.TreeGrid(columns, rows())
