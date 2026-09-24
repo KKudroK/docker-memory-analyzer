@@ -5,17 +5,24 @@
 No report schema or container attribution belongs here. Callers retain their
 exception boundaries, so a failed read never silently becomes an empty value.
 """
-from dataclasses import dataclass
+
+import dataclasses
+
 from volatility3.framework import exceptions, objects
 from volatility3.framework.objects import utility
 
 READ_ERRORS = (
-    AttributeError, IndexError, KeyError, TypeError, ValueError,
-    exceptions.InvalidAddressException, exceptions.VolatilityException,
+    AttributeError,
+    IndexError,
+    KeyError,
+    TypeError,
+    ValueError,
+    exceptions.InvalidAddressException,
+    exceptions.VolatilityException,
 )
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class CStringErrors:
     invalid_bound: str = "null string pointer or invalid string bound"
     short_read: str = "short unpadded string read"
@@ -25,8 +32,12 @@ class CStringErrors:
 
 KERNEL_STRING_ERRORS = CStringErrors()
 FILE_STRING_ERRORS = CStringErrors(
-    "invalid string address/bound", "short string read", "empty string", "unterminated string",
+    "invalid string address/bound",
+    "short string read",
+    "empty string",
+    "unterminated string",
 )
+
 
 class Unsupported(ValueError):
     """A layout cannot be interpreted without guessing."""
@@ -41,10 +52,12 @@ class UnsupportedLayoutError(exceptions.VolatilityException):
 
     def __init__(self, feature, field, reason):
         self.feature, self.field = feature, field
-        self.message = f'{feature}: {field}: {reason}'
+        self.message = f"{feature}: {field}: {reason}"
         self.compatibility = {
-            'feature': feature, 'status': 'unsupported',
-            'field': field, 'message': self.message,
+            "feature": feature,
+            "status": "unsupported",
+            "field": field,
+            "message": self.message,
         }
         super().__init__(self.message)
 
@@ -53,9 +66,11 @@ def require_type(module, name, feature):
     try:
         template = module.get_type(name)
     except (exceptions.SymbolError, KeyError) as exc:
-        raise UnsupportedLayoutError(feature, name, 'required symbol type is missing') from exc
+        raise UnsupportedLayoutError(
+            feature, name, "required symbol type is missing"
+        ) from exc
     if template is None:
-        raise UnsupportedLayoutError(feature, name, 'required symbol type is missing')
+        raise UnsupportedLayoutError(feature, name, "required symbol type is missing")
     return template
 
 
@@ -64,7 +79,9 @@ def require_fields(module, name, fields, feature):
     template = require_type(module, name, feature)
     for field in fields:
         if not template.has_member(field):
-            raise UnsupportedLayoutError(feature, f'{name}.{field}', 'required symbol field is missing')
+            raise UnsupportedLayoutError(
+                feature, f"{name}.{field}", "required symbol field is missing"
+            )
     return template
 
 
@@ -73,9 +90,9 @@ class UnsupportedLayout(ValueError):
 
 
 def observation(feature, status, reason, layout=None, **details):
-    value = {'feature': feature, 'status': status, 'reason': reason, **details}
+    value = {"feature": feature, "status": status, "reason": reason, **details}
     if layout is not None:
-        value['layout'] = layout
+        value["layout"] = layout
     return value
 
 
@@ -85,7 +102,7 @@ class InconsistentData(ValueError):
 
 def member(obj, name):
     if not obj.has_member(name):
-        raise UnsupportedLayout('Member ' + name + ' is absent from the symbols')
+        raise UnsupportedLayout("Member " + name + " is absent from the symbols")
     return obj.member(name)
 
 
@@ -94,20 +111,24 @@ def capture(observations, feature, fn, layout=None):
     try:
         value = fn()
     except UnsupportedLayout as exc:
-        observations.append(observation(feature, 'unsupported', str(exc), layout))
+        observations.append(observation(feature, "unsupported", str(exc), layout))
     except InconsistentData as exc:
-        observations.append(observation(feature, 'inconsistent', str(exc), layout))
-    except Exception as exc:
-        observations.append(observation(feature, 'read_error', type(exc).__name__ + ': ' + str(exc), layout))
+        observations.append(observation(feature, "inconsistent", str(exc), layout))
+    except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        observations.append(
+            observation(
+                feature, "read_error", type(exc).__name__ + ": " + str(exc), layout
+            )
+        )
     else:
-        observations.append(observation(feature, 'ok', 'Read from memory', layout))
+        observations.append(observation(feature, "ok", "Read from memory", layout))
         return value
     return None
 
 
 def dereference(pointer, name):
     if not int(pointer):
-        raise InconsistentData('Null ' + name + ' pointer')
+        raise InconsistentData("Null " + name + " pointer")
     return pointer.dereference()
 
 
@@ -135,18 +156,30 @@ def _object_readable(obj) -> bool:
         pointer_check = getattr(obj, "is_readable", None)
         if callable(pointer_check):
             return bool(obj) and bool(pointer_check())
-        return bool(obj._context.layers[obj.vol.layer_name].is_valid(
-            int(obj.vol.offset), int(obj.vol.size)
-        ))
+        return bool(
+            obj._context.layers[obj.vol.layer_name].is_valid(
+                int(obj.vol.offset), int(obj.vol.size)
+            )
+        )
     except (
-        AttributeError, KeyError, IndexError, TypeError, ValueError,
-        exceptions.InvalidAddressException, exceptions.VolatilityException,
+        AttributeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        exceptions.InvalidAddressException,
+        exceptions.VolatilityException,
     ):
         return False
 
 
-def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = False,
-                         errors=KERNEL_STRING_ERRORS) -> str:
+def _read_kernel_cstring(
+    pointer,
+    max_bytes: int = 4096,
+    *,
+    allow_empty: bool = False,
+    errors=KERNEL_STRING_ERRORS,
+) -> str:
     """Read a bounded C string only when its NUL terminator was captured.
 
     pointer_to_string() may return a readable prefix without a terminator.
@@ -181,7 +214,9 @@ def _read_kernel_cstring(pointer, max_bytes: int = 4096, *, allow_empty: bool = 
 
 def read_file_cstring(pointer, max_bytes=4096, *, allow_empty=False):
     """Same bounded reader, retaining the file collector's diagnostic text."""
-    return _read_kernel_cstring(pointer, max_bytes, allow_empty=allow_empty, errors=FILE_STRING_ERRORS)
+    return _read_kernel_cstring(
+        pointer, max_bytes, allow_empty=allow_empty, errors=FILE_STRING_ERRORS
+    )
 
 
 def containing_object(owner, link, type_name, member):
@@ -189,12 +224,16 @@ def containing_object(owner, link, type_name, member):
     context = owner._context
     table = owner.vol.type_name.split("!", 1)[0]
     qualified = table + "!" + type_name
-    displacement = context.symbol_space.get_type(qualified).relative_child_offset(member)
+    displacement = context.symbol_space.get_type(qualified).relative_child_offset(
+        member
+    )
     address = _object_address(link) - displacement
     if address <= 0:
         raise ValueError("invalid containing object")
     return context.object(
-        qualified, offset=address, layer_name=owner.vol.layer_name,
+        qualified,
+        offset=address,
+        layer_name=owner.vol.layer_name,
         native_layer_name=owner.vol.native_layer_name,
     )
 
@@ -204,6 +243,7 @@ class CollectionSession:
 
     def __init__(self, context, kernel_name):
         self.context = context
+        self.kernel_name = kernel_name
         self.kernel = context.modules[kernel_name]
         self.layer = context.layers[self.kernel.layer_name]
 
@@ -212,18 +252,20 @@ class CollectionSession:
 
     def symbol(self, name, typename):
         # A symbol can have an address without type metadata in a BTF ISF.
-        return self.kernel.object(typename, offset=self.kernel.get_symbol(name).address, absolute=False)
+        return self.kernel.object(
+            typename, offset=self.kernel.get_symbol(name).address, absolute=False
+        )
 
 
 def pointer_string(pointer, maximum=4096):
     """Compatibility reader: NULL is empty; stock string semantics retained."""
-    return utility.pointer_to_string(pointer, maximum) if pointer else ''
+    return utility.pointer_to_string(pointer, maximum) if pointer else ""
 
 
 def bounded(iterator, limit):
     for index, value in enumerate(iterator):
         if index >= limit:
-            raise Incomplete('Traversal budget exceeded')
+            raise Incomplete("Traversal budget exceeded")
         yield value
 
 
