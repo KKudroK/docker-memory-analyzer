@@ -33,6 +33,7 @@ linux.docker.Docker를 통해 실행하는 내부 분석 모듈이다.
 지원 정책은 저장소의 다른 분석과 같다. 커널 버전 번호가 아니라 심볼 구조로
 판독기를 선택하며, 미지원 구조는 임의로 채우지 않고 명시적으로 남긴다.
 """
+
 import datetime
 import json
 import logging
@@ -41,21 +42,18 @@ import re
 from volatility3.framework import exceptions, interfaces, renderers
 from volatility3.framework.configuration import requirements
 from volatility3.framework.objects import utility
-from volatility3.plugins.linux import pslist
+from volatility3.plugins.linux import docker_artifacts, pslist
+from volatility3.plugins.linux._artifacts import cgroups as cgroup_readers
 
 # 메모리 판독은 공유 패키지에 맡기고 소속 교차 검증과 출력은 여기서 처리한다.
-from volatility3.plugins.linux._artifacts.core import CollectionSession
-from volatility3.plugins.linux._artifacts.cgroups import membership_resolver
-from volatility3.plugins.linux._artifacts.credentials import SecurityReader
-from volatility3.plugins.linux._artifacts.namespaces import read_pid_chain, inspect_pid_layout
-from volatility3.plugins.linux._artifacts.tasks import (
-    read_argv, INVENTORY_ARGV, list_tasks, shim_arguments, ancestor_chain,
-)
-from volatility3.plugins.linux._artifacts.timing import read_kernel_boot, read_process_start_ns
-
+from volatility3.plugins.linux._artifacts import core as artifact_core
+from volatility3.plugins.linux._artifacts import credentials as credential_readers
+from volatility3.plugins.linux._artifacts import tasks as task_readers
+from volatility3.plugins.linux._artifacts import timing as timing_readers
 
 LOG = logging.getLogger(__name__)
-VERSION_INFO = (1, 4, 1)
+# 2.x changes the default task table and the triage columns/filter semantics.
+VERSION_INFO = (2, 0, 2)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
 
@@ -102,7 +100,8 @@ def utc(seconds, nanoseconds=0):
     로직: epoch 기준 초를 UTC로 변환한 뒤 나노초를 마이크로초로 더한다.
     """
     return datetime.datetime.fromtimestamp(seconds, UTC) + datetime.timedelta(
-        microseconds=nanoseconds // 1000)
+        microseconds=nanoseconds // 1000
+    )
 
 
 def identify_docker(chain):
@@ -117,17 +116,24 @@ def identify_docker(chain):
         name = node["name"]
         match = SCOPE.fullmatch(name)
         cid = match.group(1).lower() if match else None
-        if cid is None and index and chain[index - 1]["name"] == "docker" and FULL_ID.fullmatch(name):
+        if (
+            cid is None
+            and index
+            and chain[index - 1]["name"] == "docker"
+            and FULL_ID.fullmatch(name)
+        ):
             cid = name.lower()
         if cid is not None:
             found = {
-                "id": cid, "root_address": node["address"],
-                "root_path": "/" + "/".join(x["name"] for x in chain[:index + 1] if x["name"]),
+                "id": cid,
+                "root_address": node["address"],
+                "root_path": "/"
+                + "/".join(x["name"] for x in chain[: index + 1] if x["name"]),
             }
     return found
 
 
-class _Timing(CollectionSession):
+class _Timing(artifact_core.CollectionSession):
     """공통 시간 판독기의 결과를 이 옵션의 UTC datetime 형식으로 변환한다."""
 
     def __init__(self, context, kernel_name):
@@ -137,10 +143,12 @@ class _Timing(CollectionSession):
     def process_start(self, task):
         if self.boot is None:
             self.boot = self.kernel_boot_ns()
-        return utc(*divmod(read_process_start_ns(task, self.boot), 1000000000))
+        return utc(
+            *divmod(timing_readers.read_process_start_ns(task, self.boot), 1000000000)
+        )
 
     def kernel_boot_ns(self):
-        return read_kernel_boot(self).nanoseconds
+        return timing_readers.read_kernel_boot(self).nanoseconds
 
 
 class ContainerTasks(interfaces.plugins.PluginInterface):
@@ -153,20 +161,36 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
     @classmethod
     def get_requirements(cls):
         return [
+            requirements.VersionRequirement(
+                name="docker_artifacts",
+                component=docker_artifacts.DockerArtifacts,
+                version=(1, 0, 1),
+            ),
             requirements.ModuleRequirement(
-                name="kernel", description="Linux x86-64 kernel with matching symbols",
-                architectures=["Intel64"]),
-            requirements.VersionRequirement(name="pslist", component=pslist.PsList, version=(4, 0, 0)),
+                name="kernel",
+                description="Linux x86-64 kernel with matching symbols",
+                architectures=["Intel64"],
+            ),
+            requirements.VersionRequirement(
+                name="pslist", component=pslist.PsList, version=(4, 0, 0)
+            ),
             requirements.StringRequirement(
-                name="container", description="Docker ID or unique hex prefix (6-64 characters)",
-                optional=True),
+                name="container",
+                description="Docker ID or unique hex prefix (6-64 characters)",
+                optional=True,
+            ),
             requirements.BooleanRequirement(
-                name="details", description="Show the full task table (ignored with --triage)",
-                default=False, optional=True),
+                name="details",
+                description="Show the full task table (ignored with --triage)",
+                default=False,
+                optional=True,
+            ),
             requirements.BooleanRequirement(
                 name="triage",
                 description="Show membership mismatches only; report Normal when none are detected",
-                default=False, optional=True),
+                default=False,
+                optional=True,
+            ),
         ]
 
     # ---- 공유 판독기 준비 ----------------------------------------------------
@@ -179,68 +203,128 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         """
         readers = {"layout": {}}
         try:
-            readers["resolver"] = membership_resolver(module, identify_docker)
+            readers["resolver"] = cgroup_readers.membership_resolver(
+                module, identify_docker
+            )
             readers["layout"]["membership"] = readers["resolver"].compatibility
         except Exception as exc:  # noqa: BLE001 - 계층 독립 실행을 위해 광범위하게 잡는다.
             readers["resolver"] = None
-            readers["layout"]["membership"] = {"feature": "container_membership",
-                                               "status": "unsupported", "reason": str(exc)}
-        readers["security"] = SecurityReader(self.context, module)
+            readers["layout"]["membership"] = {
+                "feature": "container_membership",
+                "status": "unsupported",
+                "reason": str(exc),
+            }
+        readers["security"] = credential_readers.SecurityReader(self.context, module)
         try:
             readers["timing"] = _Timing(self.context, self.config["kernel"])
         except Exception as exc:  # noqa: BLE001
             readers["timing"] = None
-            readers["layout"]["timing"] = {"feature": "process_timing", "status": "read_error",
-                                           "reason": str(exc)}
+            readers["layout"]["timing"] = {
+                "feature": "process_timing",
+                "status": "read_error",
+                "reason": str(exc),
+            }
         try:
-            readers["layout"]["pid_namespace"] = inspect_pid_layout(module)
+            readers["layout"]["pid_namespace"] = (
+                docker_artifacts.DockerArtifacts.inspect_pid_layout(
+                    self.context, self.config["kernel"]
+                )
+            )
         except Exception as exc:  # noqa: BLE001
-            readers["layout"]["pid_namespace"] = getattr(exc, "compatibility", {
-                "feature": "pid_namespace", "status": "unsupported", "reason": str(exc)})
+            readers["layout"]["pid_namespace"] = getattr(
+                exc,
+                "compatibility",
+                {
+                    "feature": "pid_namespace",
+                    "status": "unsupported",
+                    "reason": str(exc),
+                },
+            )
         return readers
 
     # ---- 조상 체인 추적 (구 10번) --------------------------------------------
 
     @staticmethod
     def _ancestors(task, limit=ANCESTRY_LIMIT):
-        return ancestor_chain(task, limit=limit)
+        return task_readers.ancestor_chain(task, limit=limit)
 
-    def _cgroup_container_id(self, task, readers):
+    def _cgroup_container_id(self, task, readers, *, errors):
         """태스크 cgroup의 Docker 소속 ID만 뽑는다(없으면 None).
 
-        로직: 소속 판독기로 태스크 cgroup을 해석해 표식 ID를 반환한다. 읽기 실패나
-        표식 부재는 None으로 처리한다(상세 근거는 _task_detail에서 별도로 남긴다).
+        로직: 소속 판독기로 태스크 cgroup을 해석해 표식 ID를 반환한다. 판독 실패는
+        audit의 수집 오류 목록에 기록하므로 후보에서 제외된 태스크의 실패도 보존한다.
         """
         if readers["resolver"] is None:
             return None
         try:
             _cset, _cgroup, _chain, group = readers["resolver"].resolve(task)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - 후보 판독 실패를 기록하고 다음 태스크를 수집한다.
+            errors.append(
+                f"container_membership task={task.vol.offset:#x}: {type(exc).__name__}: {exc}"
+            )
             return None
         return group["id"] if group else None
 
     # ---- shim 신원 (구 10번, 1차 순회에서 공유 수집) --------------------------
 
-    def _shim_identity(self, task, readers, address):
+    def _shim_identity(self, task, readers, address, *, errors):
         """shim 후보의 명령행에서 컨테이너 ID·runtime namespace를 해석한다.
 
         로직: 인자를 shim_arguments로 해석해 ID·namespace를 얻고 shim 자신의 cgroup
         ID도 함께 읽어, 소속 교차 검증의 근거로 보존한다.
         """
         try:
-            argv = read_argv(self.context, task, INVENTORY_ARGV)
-        except (exceptions.VolatilityException, ValueError, AttributeError, TypeError):
-            argv = []
+            argv = docker_artifacts.DockerArtifacts.read_task_argv(
+                self.context,
+                self.config["kernel"],
+                int(task.vol.offset),
+                policy="inventory",
+                layer_name=task.vol.layer_name,
+                native_layer_name=task.vol.native_layer_name,
+            )
+        except (
+            exceptions.VolatilityException,
+            ValueError,
+            AttributeError,
+            TypeError,
+        ) as exc:
+            # A read failure is not evidence that the shim omitted its ID flags.
+            # Keep the failure even when this task is excluded from later views.
+            reason = f"shim_argv task={address:#x}: {type(exc).__name__}: {exc}"
+            errors.append(reason)
+            return {
+                "task": hex(address),
+                "pid": int(task.tgid),
+                "container_id": None,
+                "runtime_namespace": None,
+                "argv": [],
+                "cgroup_id": None,
+                "attributed": False,
+                "error": reason,
+            }
         try:
-            cid, namespace = shim_arguments(argv)
+            cid, namespace = task_readers.shim_arguments(argv)
         except ValueError as exc:
-            return {"task": hex(address), "pid": int(task.tgid), "container_id": None,
-                    "runtime_namespace": None, "argv": argv, "cgroup_id": None,
-                    "attributed": False, "error": str(exc)}
-        return {"task": hex(address), "pid": int(task.tgid), "container_id": cid,
-                "runtime_namespace": namespace, "argv": argv,
-                "cgroup_id": self._cgroup_container_id(task, readers),
-                "attributed": namespace == "moby" or cid is not None, "error": None}
+            return {
+                "task": hex(address),
+                "pid": int(task.tgid),
+                "container_id": None,
+                "runtime_namespace": None,
+                "argv": argv,
+                "cgroup_id": None,
+                "attributed": False,
+                "error": str(exc),
+            }
+        return {
+            "task": hex(address),
+            "pid": int(task.tgid),
+            "container_id": cid,
+            "runtime_namespace": namespace,
+            "argv": argv,
+            "cgroup_id": self._cgroup_container_id(task, readers, errors=errors),
+            "attributed": namespace == "moby" or cid is not None,
+            "error": None,
+        }
 
     # ---- 태스크 상세 (구 9번) + 교차 검증 (구 10번) --------------------------
 
@@ -252,13 +336,30 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         """
         address = int(task.vol.offset)
         detail = {
-            "TaskAddress": hex(address), "HostPID": int(task.tgid), "HostTID": int(task.pid),
-            "PPID": None, "Name": None, "Cmdline": None, "StartUTC": None,
-            "NSPID": None, "NSTID": None, "PIDNS": None, "EUID": None, "UserNS": None,
-            "CapabilityScope": None, "CgroupPath": None, "ContainerID": None, "ContainerRoot": None,
-            "cap_effective": None, "capabilities": {}, "Status": "ok",
-            "ancestry": [], "shim_lineage": None,
-            "membership": {}, "conflicts": [], "observations": [],
+            "TaskAddress": hex(address),
+            "HostPID": int(task.tgid),
+            "HostTID": int(task.pid),
+            "PPID": None,
+            "Name": None,
+            "Cmdline": None,
+            "StartUTC": None,
+            "NSPID": None,
+            "NSTID": None,
+            "PIDNS": None,
+            "EUID": None,
+            "UserNS": None,
+            "CapabilityScope": None,
+            "CgroupPath": None,
+            "ContainerID": None,
+            "ContainerRoot": None,
+            "cap_effective": None,
+            "capabilities": {},
+            "Status": "ok",
+            "ancestry": [],
+            "shim_lineage": None,
+            "membership": {},
+            "conflicts": [],
+            "observations": [],
         }
 
         try:
@@ -274,26 +375,56 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
 
         # 명령행·시작 시각 (구 9번)
         try:
-            detail["Cmdline"] = " ".join(read_argv(self.context, task, INVENTORY_ARGV))
+            detail["Cmdline"] = " ".join(
+                docker_artifacts.DockerArtifacts.read_task_argv(
+                    self.context,
+                    self.config["kernel"],
+                    int(task.vol.offset),
+                    policy="inventory",
+                    layer_name=task.vol.layer_name,
+                    native_layer_name=task.vol.native_layer_name,
+                )
+            )
         except (exceptions.VolatilityException, ValueError, AttributeError, TypeError):
             detail["Status"] = "partial"
         if readers["timing"] is not None:
             try:
                 detail["StartUTC"] = readers["timing"].process_start(task).isoformat()
-            except (exceptions.VolatilityException, ValueError, AttributeError, TypeError):
+            except (
+                exceptions.VolatilityException,
+                ValueError,
+                AttributeError,
+                TypeError,
+            ):
                 detail["Status"] = "partial"
 
         # PID namespace 계층 (구 9번, 소속 PID/TID 연결)
         try:
-            chain = read_pid_chain(task, module)
-            leader_chain = read_pid_chain(task.group_leader.dereference(), module)
+            chain = docker_artifacts.DockerArtifacts.read_pid_chain(
+                self.context,
+                self.config["kernel"],
+                int(task.vol.offset),
+                layer_name=task.vol.layer_name,
+                native_layer_name=task.vol.native_layer_name,
+            )
+            leader = task.group_leader.dereference()
+            leader_chain = docker_artifacts.DockerArtifacts.read_pid_chain(
+                self.context,
+                self.config["kernel"],
+                int(leader.vol.offset),
+                layer_name=leader.vol.layer_name,
+                native_layer_name=leader.vol.native_layer_name,
+            )
             detail["PIDNS"] = chain[-1]["namespace"]
             detail["NSTID"] = chain[-1]["id"]
-            detail["NSPID"] = next(x["id"] for x in leader_chain if x["namespace"] == detail["PIDNS"])
+            detail["NSPID"] = next(
+                x["id"] for x in leader_chain if x["namespace"] == detail["PIDNS"]
+            )
         except Exception as exc:  # noqa: BLE001
             detail["Status"] = "partial"
-            detail["observations"].append({"feature": "pid_namespace", "status": "read_error",
-                                           "reason": str(exc)})
+            detail["observations"].append(
+                {"feature": "pid_namespace", "status": "read_error", "reason": str(exc)}
+            )
 
         # EUID·capability·user namespace (구 9번)
         security = readers["security"]
@@ -303,8 +434,15 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 credentials = security.credentials(cred)
                 try:
                     security.enrich_identity(credentials, cred)
-                except Exception:  # noqa: BLE001 - 보강 실패가 capability 판독을 버리지 않는다.
-                    pass
+                except Exception as exc:  # noqa: BLE001 - 보강 실패를 기록하고 capability 판독은 보존한다.
+                    detail["Status"] = "partial"
+                    detail["observations"].append(
+                        {
+                            "feature": "credentials.identity",
+                            "status": "read_error",
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
                 detail["EUID"] = credentials.get("ids_kernel", {}).get("euid")
                 detail["capabilities"] = credentials.get("capabilities", {})
                 detail["cap_effective"] = detail["capabilities"].get("cap_effective")
@@ -313,27 +451,40 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 ns_chain = scope.get("chain_leaf_to_initial") or []
                 if ns_chain:
                     detail["UserNS"] = ns_chain[0].get("inum")
-                if any(item.get("status") != "ok" for item in credentials.get("observations", [])):
+                if any(
+                    item.get("status") != "ok"
+                    for item in credentials.get("observations", [])
+                ):
                     detail["Status"] = "partial"
         except Exception as exc:  # noqa: BLE001
             detail["Status"] = "partial"
-            detail["observations"].append({"feature": "credentials", "status": "read_error",
-                                           "reason": str(exc)})
+            detail["observations"].append(
+                {"feature": "credentials", "status": "read_error", "reason": str(exc)}
+            )
 
         # cgroup 경로·소속 ID (구 9번 경로 + 구 10번 cgroup 근거)
         cgroup_cid = None
         if readers["resolver"] is not None:
             try:
                 _cset, _cgroup, cchain, group = readers["resolver"].resolve(task)
-                detail["CgroupPath"] = ("/" + "/".join(x["name"] for x in cchain if x["name"])) if cchain else None
+                detail["CgroupPath"] = (
+                    ("/" + "/".join(x["name"] for x in cchain if x["name"]))
+                    if cchain
+                    else None
+                )
                 if group:
                     cgroup_cid = group["id"]
                     detail["ContainerID"] = group["id"]
                     detail["ContainerRoot"] = group["root_address"]
             except Exception as exc:  # noqa: BLE001
                 detail["Status"] = "partial"
-                detail["observations"].append({"feature": "container_membership",
-                                               "status": "read_error", "reason": str(exc)})
+                detail["observations"].append(
+                    {
+                        "feature": "container_membership",
+                        "status": "read_error",
+                        "reason": str(exc),
+                    }
+                )
 
         # 조상 체인·shim 계보 (구 10번)
         ancestry = self._ancestors(task)
@@ -342,16 +493,26 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         for depth, node in enumerate(ancestry):
             shim = shims.get(node["address"])
             if shim is not None:
-                shim_lineage = {"shim_task": shim["task"], "shim_pid": shim["pid"],
-                                "depth": depth + 1, "container_id": shim["container_id"],
-                                "runtime_namespace": shim["runtime_namespace"],
-                                "shim_cgroup_id": shim["cgroup_id"],
-                                "attributed": shim["attributed"]}
+                shim_lineage = {
+                    "shim_task": shim["task"],
+                    "shim_pid": shim["pid"],
+                    "depth": depth + 1,
+                    "container_id": shim["container_id"],
+                    "runtime_namespace": shim["runtime_namespace"],
+                    "shim_cgroup_id": shim["cgroup_id"],
+                    "attributed": shim["attributed"],
+                }
                 break
         detail["shim_lineage"] = shim_lineage
 
-        detail["membership"], detail["conflicts"] = self._cross_verify(cgroup_cid, shim_lineage)
-        if detail["ContainerID"] is None and shim_lineage and shim_lineage["container_id"]:
+        detail["membership"], detail["conflicts"] = self._cross_verify(
+            cgroup_cid, shim_lineage
+        )
+        if (
+            detail["ContainerID"] is None
+            and shim_lineage
+            and shim_lineage["container_id"]
+        ):
             detail["ContainerID"] = shim_lineage["container_id"]
         return detail
 
@@ -374,17 +535,31 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         conflicts = []
 
         if cgroup_cid and shim_cid and cgroup_cid != shim_cid:
-            conflicts.append({"kind": "CGROUP_SHIM_ID_MISMATCH",
-                              "reason": "cgroup container ID and shim-lineage container ID disagree",
-                              "cgroup_id": cgroup_cid, "shim_lineage_id": shim_cid})
+            conflicts.append(
+                {
+                    "kind": "CGROUP_SHIM_ID_MISMATCH",
+                    "reason": "cgroup container ID and shim-lineage container ID disagree",
+                    "cgroup_id": cgroup_cid,
+                    "shim_lineage_id": shim_cid,
+                }
+            )
         if shim_lineage and runtime_ns is not None and runtime_ns != "moby":
-            conflicts.append({"kind": "NON_MOBY_RUNTIME_NAMESPACE",
-                              "reason": "shim runtime namespace is not the Docker 'moby' namespace",
-                              "runtime_namespace": runtime_ns})
+            conflicts.append(
+                {
+                    "kind": "NON_MOBY_RUNTIME_NAMESPACE",
+                    "reason": "shim runtime namespace is not the Docker 'moby' namespace",
+                    "runtime_namespace": runtime_ns,
+                }
+            )
         if shim_cid and shim_cgroup_cid and shim_cid != shim_cgroup_cid:
-            conflicts.append({"kind": "SHIM_ID_CGROUP_MISMATCH",
-                              "reason": "shim argument ID and the shim's own cgroup ID disagree",
-                              "shim_id": shim_cid, "shim_cgroup_id": shim_cgroup_cid})
+            conflicts.append(
+                {
+                    "kind": "SHIM_ID_CGROUP_MISMATCH",
+                    "reason": "shim argument ID and the shim's own cgroup ID disagree",
+                    "shim_id": shim_cid,
+                    "shim_cgroup_id": shim_cgroup_cid,
+                }
+            )
 
         if not sources:
             status = "unresolved"
@@ -395,8 +570,12 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         else:
             status = "single_source"
 
-        return {"status": status, "sources": sources, "runtime_namespace": runtime_ns,
-                "basis": ContainerTasks._basis_text(status, sources)}, conflicts
+        return {
+            "status": status,
+            "sources": sources,
+            "runtime_namespace": runtime_ns,
+            "basis": ContainerTasks._basis_text(status, sources),
+        }, conflicts
 
     @staticmethod
     def _basis_text(status, sources):
@@ -431,10 +610,16 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             "plugin_version": VERSION,
             "method": "Merged task/thread detail (former #9) with shim-lineage cross-verification (former #10)",
             "scope": "Container-candidate tasks: Docker-marked cgroup membership or a shim ancestor. "
-                     "Full evidence retained here regardless of the display filter.",
+            "Full evidence retained here regardless of the display filter.",
             "include_threads": include_threads,
-            "display_filter": "mismatches_only" if triage else "all_container_candidates",
-            "display_view": "triage" if triage else "details" if self.config.get("details", False) else "summary",
+            "display_filter": "mismatches_only"
+            if triage
+            else "all_container_candidates",
+            "display_view": "triage"
+            if triage
+            else "details"
+            if self.config.get("details", False)
+            else "summary",
             "selected_prefix": prefix,
             "compatibility": readers["layout"],
             "limitations": [
@@ -443,16 +628,21 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 "Ancestor tracing follows real_parent; a broken or reparented chain is left partial.",
                 "Threads are enumerated by the official API; hidden/unlinked tasks are not recovered.",
             ],
-            "shims": [], "tasks": [], "containers": [],
-            "enumerated_tasks": 0, "candidate_tasks": 0, "conflict_tasks": 0,
+            "shims": [],
+            "tasks": [],
+            "containers": [],
+            "enumerated_tasks": 0,
+            "candidate_tasks": 0,
+            "conflict_tasks": 0,
             "traversal_errors": [],
         }
 
         # 1차 순회: 전체 태스크 열거 + shim 등록(태스크·shim 수집 결과 공유)
         tasks, shims, seen = [], {}, set()
         try:
-            for task in list_tasks(
-                    self.context, self.config["kernel"], include_threads=include_threads):
+            for task in docker_artifacts.DockerArtifacts.list_tasks(
+                self.context, self.config["kernel"], include_threads=include_threads
+            ):
                 address = int(task.vol.offset)
                 if address in seen:
                     continue
@@ -463,7 +653,9 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 except (exceptions.VolatilityException, ValueError, AttributeError):
                     comm = ""
                 if comm.startswith(SHIM_PREFIX):
-                    record = self._shim_identity(task, readers, address)
+                    record = self._shim_identity(
+                        task, readers, address, errors=audit["traversal_errors"]
+                    )
                     shims[hex(address)] = record
                     audit["shims"].append(record)
         except Exception as exc:  # noqa: BLE001
@@ -472,14 +664,21 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
 
         # 2차 순회: 컨테이너 후보(태스크의 cgroup Docker 소속 또는 shim 조상)만 상세 수집
         for task in tasks:
-            has_shim_ancestor = any(node["address"] in shims for node in self._ancestors(task))
-            cgroup_cid = self._cgroup_container_id(task, readers)
+            has_shim_ancestor = any(
+                node["address"] in shims for node in self._ancestors(task)
+            )
+            cgroup_cid = self._cgroup_container_id(
+                task, readers, errors=audit["traversal_errors"]
+            )
             if cgroup_cid is None and not has_shim_ancestor:
                 continue  # 호스트 태스크: 컨테이너 후보가 아니다.
             audit["tasks"].append(self._task_detail(task, readers, module, shims))
         audit["candidate_tasks"] = len(audit["tasks"])
         audit["conflict_tasks"] = sum(
-            1 for t in audit["tasks"] if t["membership"]["status"] in ("conflict", "unresolved"))
+            1
+            for t in audit["tasks"]
+            if t["membership"]["status"] in ("conflict", "unresolved")
+        )
 
         # 접두사 고유성 검증
         observed_ids = {t["ContainerID"] for t in audit["tasks"] if t["ContainerID"]}
@@ -492,9 +691,16 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             cid = detail["ContainerID"]
             if cid is None:
                 continue
-            entry = containers.setdefault(cid, {"container_id": cid, "task_count": 0,
-                                                "conflict_count": 0, "roots": set(),
-                                                "runtime_namespaces": set()})
+            entry = containers.setdefault(
+                cid,
+                {
+                    "container_id": cid,
+                    "task_count": 0,
+                    "conflict_count": 0,
+                    "roots": set(),
+                    "runtime_namespaces": set(),
+                },
+            )
             entry["task_count"] += 1
             if detail["membership"]["status"] in ("conflict", "unresolved"):
                 entry["conflict_count"] += 1
@@ -504,26 +710,47 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             if rns:
                 entry["runtime_namespaces"].add(rns)
         audit["containers"] = [
-            {**e, "roots": sorted(e["roots"]), "runtime_namespaces": sorted(e["runtime_namespaces"])}
-            for e in sorted(containers.values(), key=lambda x: x["container_id"])]
+            {
+                **e,
+                "roots": sorted(e["roots"]),
+                "runtime_namespaces": sorted(e["runtime_namespaces"]),
+            }
+            for e in sorted(containers.values(), key=lambda x: x["container_id"])
+        ]
 
         # 표시 대상 선택
         displayed = audit["tasks"]
         if prefix:
-            displayed = [t for t in displayed if t["ContainerID"] and t["ContainerID"].startswith(prefix)]
+            displayed = [
+                t
+                for t in displayed
+                if t["ContainerID"] and t["ContainerID"].startswith(prefix)
+            ]
         audit["selected_tasks"] = len(displayed)
         if conflicts_only:
             displayed = [t for t in displayed if self._is_mismatch(t)]
-        displayed = sorted(displayed, key=lambda t: (t["ContainerID"] or "", t["HostPID"], t["HostTID"]))
+        displayed = sorted(
+            displayed,
+            key=lambda t: (t["ContainerID"] or "", t["HostPID"], t["HostTID"]),
+        )
         audit["displayed_tasks"] = len(displayed)
 
         # 근거 JSON 저장. self.open은 Volatility 출력 디렉터리(-o)를 따른다.
         with self.open("containertasks-audit.json") as handle:
-            handle.write(json.dumps(audit, ensure_ascii=False, indent=2, default=str).encode("utf-8"))
+            handle.write(
+                json.dumps(audit, ensure_ascii=False, indent=2, default=str).encode(
+                    "utf-8"
+                )
+            )
         if audit["traversal_errors"]:
-            LOG.warning("ContainerTasks: task collection incomplete; see containertasks-audit.json")
+            LOG.warning(
+                "ContainerTasks: task collection incomplete; see containertasks-audit.json"
+            )
         if triage and displayed:
-            LOG.warning("ContainerTasks: membership mismatches=%d; see containertasks-audit.json", len(displayed))
+            LOG.warning(
+                "ContainerTasks: membership mismatches=%d; see containertasks-audit.json",
+                len(displayed),
+            )
 
         if triage:
             return self._triage_grid(audit, displayed)
@@ -549,26 +776,53 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
     def _raw_grid(self, displayed):
         """태스크별 상세 raw 표(구 9번 항목 + 구 10번 근거)."""
         columns = [
-            ("ContainerID", str), ("CgroupPath", str), ("HostPID", int), ("HostTID", int),
-            ("PPID", int), ("Name", str), ("NSPID", int), ("NSTID", int), ("PIDNS", int),
-            ("EUID", int), ("UserNS", int), ("StartUTC", str), ("Cmdline", str),
-            ("ShimPID", int), ("ShimID", str), ("RuntimeNS", str),
-            ("Basis", str), ("Conflict", str), ("Effective", str), ("Status", str)]
+            ("ContainerID", str),
+            ("CgroupPath", str),
+            ("HostPID", int),
+            ("HostTID", int),
+            ("PPID", int),
+            ("Name", str),
+            ("NSPID", int),
+            ("NSTID", int),
+            ("PIDNS", int),
+            ("EUID", int),
+            ("UserNS", int),
+            ("StartUTC", str),
+            ("Cmdline", str),
+            ("ShimPID", int),
+            ("ShimID", str),
+            ("RuntimeNS", str),
+            ("Basis", str),
+            ("Conflict", str),
+            ("Effective", str),
+            ("Status", str),
+        ]
 
         def rows():
             for t in displayed:
                 shim = t["shim_lineage"] or {}
                 values = {
-                    "ContainerID": short_id(t["ContainerID"]), "CgroupPath": abbrev_path(t["CgroupPath"]),
-                    "HostPID": t["HostPID"], "HostTID": t["HostTID"], "PPID": t["PPID"],
-                    "Name": t["Name"], "NSPID": t["NSPID"], "NSTID": t["NSTID"],
-                    "PIDNS": t["PIDNS"], "EUID": t["EUID"], "UserNS": t["UserNS"],
-                    "StartUTC": t["StartUTC"], "Cmdline": truncate(t["Cmdline"]),
-                    "ShimPID": shim.get("shim_pid"), "ShimID": short_id(shim.get("container_id")),
+                    "ContainerID": short_id(t["ContainerID"]),
+                    "CgroupPath": abbrev_path(t["CgroupPath"]),
+                    "HostPID": t["HostPID"],
+                    "HostTID": t["HostTID"],
+                    "PPID": t["PPID"],
+                    "Name": t["Name"],
+                    "NSPID": t["NSPID"],
+                    "NSTID": t["NSTID"],
+                    "PIDNS": t["PIDNS"],
+                    "EUID": t["EUID"],
+                    "UserNS": t["UserNS"],
+                    "StartUTC": t["StartUTC"],
+                    "Cmdline": truncate(t["Cmdline"]),
+                    "ShimPID": shim.get("shim_pid"),
+                    "ShimID": short_id(shim.get("container_id")),
                     "RuntimeNS": t["membership"].get("runtime_namespace"),
                     "Basis": t["membership"]["basis"],
                     "Conflict": "; ".join(c["kind"] for c in t["conflicts"]) or "-",
-                    "Effective": t["cap_effective"], "Status": t["Status"]}
+                    "Effective": t["cap_effective"],
+                    "Status": t["Status"],
+                }
                 yield 0, tuple(self._cell(values[name]) for name, _kind in columns)
 
         return renderers.TreeGrid(columns, rows())
@@ -589,8 +843,11 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             reasons.append("No usable container ID from cgroup or shim")
         if not reasons:
             sources = detail["membership"]["sources"]
-            reasons.append("Cgroup and shim IDs agree" if len(sources) == 2 else
-                           "Only {} evidence available".format(" and ".join(sources)))
+            reasons.append(
+                "Cgroup and shim IDs agree"
+                if len(sources) == 2
+                else f"Only {' and '.join(sources)} evidence available"
+            )
         if detail["Status"] != "ok":
             reasons.append("Some task fields could not be read; see audit JSON")
         return "; ".join(reasons)
@@ -600,26 +857,61 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         prefix = audit["selected_prefix"]
         if not audit["candidate_tasks"]:
             message = "No container-candidate tasks recovered"
-        elif prefix and not any(t["ContainerID"] and t["ContainerID"].startswith(prefix)
-                                for t in audit["tasks"]):
-            message = "No container matches prefix {}".format(prefix)
+        elif prefix and not any(
+            t["ContainerID"] and t["ContainerID"].startswith(prefix)
+            for t in audit["tasks"]
+        ):
+            message = f"No container matches prefix {prefix}"
         else:
             message = "No conflicting or unresolved membership in the selected tasks"
-        return message + ". This does not prove complete recovery or safety; see containertasks-audit.json."
+        return (
+            message
+            + ". This does not prove complete recovery or safety; see containertasks-audit.json."
+        )
 
     def _summary_grid(self, audit, displayed):
         """Compact, flat task view; full evidence remains in the audit file."""
-        columns = [("Container", str), ("Host PID", int), ("Host TID", int),
-                   ("Name", str), ("Membership", str), ("Evidence / next step", str)]
+        columns = [
+            ("Container", str),
+            ("Host PID", int),
+            ("Host TID", int),
+            ("Name", str),
+            ("Membership", str),
+            ("Evidence / next step", str),
+        ]
 
         def rows():
             if not displayed:
-                yield 0, tuple(self._cell(v) for v in
-                               (None, None, None, None, "No results", self._empty_message(audit)))
+                yield (
+                    0,
+                    tuple(
+                        self._cell(v)
+                        for v in (
+                            None,
+                            None,
+                            None,
+                            None,
+                            "No results",
+                            self._empty_message(audit),
+                        )
+                    ),
+                )
             for task in displayed:
-                yield 0, tuple(self._cell(v) for v in (
-                    short_id(task["ContainerID"]), task["HostPID"], task["HostTID"],
-                    task["Name"], self._membership_label(task), self._review_reason(task)))
+                yield (
+                    0,
+                    tuple(
+                        self._cell(v)
+                        for v in (
+                            short_id(task["ContainerID"]),
+                            task["HostPID"],
+                            task["HostTID"],
+                            task["Name"],
+                            self._membership_label(task),
+                            self._review_reason(task),
+                        )
+                    ),
+                )
+
         return renderers.TreeGrid(columns, rows())
 
     @staticmethod
@@ -631,37 +923,82 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         selected = audit["tasks"]
         prefix = audit.get("selected_prefix", "")
         if prefix:
-            selected = [t for t in selected if t["ContainerID"] and t["ContainerID"].startswith(prefix)]
+            selected = [
+                t
+                for t in selected
+                if t["ContainerID"] and t["ContainerID"].startswith(prefix)
+            ]
         if audit.get("traversal_errors"):
-            return "Incomplete", "No membership mismatches detected; task collection was incomplete. See audit JSON."
+            return (
+                "Incomplete",
+                "No membership mismatches detected; task collection was incomplete. See audit JSON.",
+            )
         if not selected:
             return "No results", self._empty_message(audit)
         reason = "Normal: no membership mismatches detected in the selected tasks."
-        limited = sum(t["membership"]["status"] != "confirmed_agree" or t["Status"] != "ok"
-                      for t in selected)
+        limited = sum(
+            t["membership"]["status"] != "confirmed_agree" or t["Status"] != "ok"
+            for t in selected
+        )
         if limited:
-            reason += " {} task(s) have limited evidence; this is not confirmation of their membership. See audit JSON.".format(limited)
+            reason += f" {limited} task(s) have limited evidence; this is not confirmation of their membership. See audit JSON."
         return "Normal", reason
 
     def _triage_grid(self, audit, displayed):
         """One row per mismatch; missing evidence alone is not a mismatch."""
-        columns = [("PID / TID", str), ("Name", str), ("Cgroup ID", str),
-                   ("Shim PID", int), ("Shim ID", str), ("Runtime NS", str),
-                   ("Shim Cgroup ID", str), ("Result", str), ("Reason", str)]
+        columns = [
+            ("PID / TID", str),
+            ("Name", str),
+            ("Cgroup ID", str),
+            ("Shim PID", int),
+            ("Shim ID", str),
+            ("Runtime NS", str),
+            ("Shim Cgroup ID", str),
+            ("Result", str),
+            ("Reason", str),
+        ]
         mismatches = [task for task in displayed if self._is_mismatch(task)]
 
         def rows():
             if not mismatches:
                 result, reason = self._triage_empty_result(audit)
-                yield 0, tuple(self._cell(v) for v in
-                               (None, None, None, None, None, None, None, result, reason))
+                yield (
+                    0,
+                    tuple(
+                        self._cell(v)
+                        for v in (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            result,
+                            reason,
+                        )
+                    ),
+                )
             for task in mismatches:
                 lineage = task["shim_lineage"] or {}
                 # Do not substitute a fallback shim ID for missing cgroup evidence.
                 cgroup_id = task["membership"]["sources"].get("cgroup")
-                yield 0, tuple(self._cell(v) for v in (
-                    "{} / {}".format(task["HostPID"], task["HostTID"]), task["Name"],
-                    short_id(cgroup_id), lineage.get("shim_pid"),
-                    short_id(lineage.get("container_id")), lineage.get("runtime_namespace"),
-                    short_id(lineage.get("shim_cgroup_id")), "Mismatch", self._review_reason(task)))
+                yield (
+                    0,
+                    tuple(
+                        self._cell(v)
+                        for v in (
+                            f"{task['HostPID']} / {task['HostTID']}",
+                            task["Name"],
+                            short_id(cgroup_id),
+                            lineage.get("shim_pid"),
+                            short_id(lineage.get("container_id")),
+                            lineage.get("runtime_namespace"),
+                            short_id(lineage.get("shim_cgroup_id")),
+                            "Mismatch",
+                            self._review_reason(task),
+                        )
+                    ),
+                )
+
         return renderers.TreeGrid(columns, rows())

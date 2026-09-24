@@ -33,8 +33,8 @@ NAME_ONLY는 이름만 확인된 경우다. 정상 FD가 현재 프로세스의 
 일부 제어문자·비UTF8 파일명은 현재 판독 범위 밖이다.
 """
 
-from collections import Counter
-from dataclasses import dataclass, field
+import collections
+import dataclasses
 import logging
 import re
 
@@ -43,25 +43,17 @@ from volatility3.framework.configuration import requirements
 from volatility3.framework.interfaces import plugins
 from volatility3.framework.objects import utility
 from volatility3.framework.symbols import linux
-from volatility3.plugins.linux import pslist
-
-
-from volatility3.plugins.linux._artifacts.core import (
-    READ_ERRORS, _object_address, _object_readable,
-)
-from volatility3.plugins.linux._artifacts.cgroups import read_link_memberships
-from volatility3.plugins.linux._artifacts.tasks import (
-    list_tasks, comm_matches as _comm_matches, runtime_from_ancestry,
-)
-from volatility3.plugins.linux._artifacts.mounts import namespace_covering as _namespace_covering
-from volatility3.plugins.linux._artifacts.paths import FileHostMountResolver as HostMountResolver
-from volatility3.plugins.linux._artifacts.files import (
-    MAX_FDS, file_facts as _file_facts, container_path as _container_path, read_fds,
-)
+from volatility3.plugins.linux import docker_artifacts, pslist
+from volatility3.plugins.linux._artifacts import cgroups as cgroup_readers
+from volatility3.plugins.linux._artifacts import core as artifact_core
+from volatility3.plugins.linux._artifacts import files as file_readers
+from volatility3.plugins.linux._artifacts import mounts as mount_readers
+from volatility3.plugins.linux._artifacts import paths as path_readers
+from volatility3.plugins.linux._artifacts import tasks as task_readers
 
 
 def _runtime_from_ancestry(task):
-    return runtime_from_ancestry(task, RUNTIME_SUPERVISORS)
+    return task_readers.runtime_from_ancestry(task, RUNTIME_SUPERVISORS)
 
 
 vollog = logging.getLogger(__name__)
@@ -70,7 +62,8 @@ MAX_TASKS = 1000000
 
 # 실제 cgroup 소속과 런타임 조상 관계 판독.
 
-@dataclass(frozen=True)
+
+@dataclasses.dataclass(frozen=True)
 class Identity:
     runtime: str
     identifier: str
@@ -78,7 +71,7 @@ class Identity:
     evidence: str
 
 
-@dataclass
+@dataclasses.dataclass
 class TaskObservation:
     pid: int
     task: object
@@ -93,22 +86,54 @@ class TaskObservation:
 _CGROUP_HEX_ID = r"[0-9a-f]{64}"
 _CGROUP_POD_ID = r"[0-9a-f]{8}(?:[-_][0-9a-f]{4}){3}[-_][0-9a-f]{12}"
 _CGROUP_ID_PATTERNS = (
-    (rf"(?:^|/)docker-({_CGROUP_HEX_ID})\.scope(?=/|$)",
-     "docker", "container", "docker-systemd-cgroup"),
-    (rf"(?:^|/)docker/({_CGROUP_HEX_ID})(?=/|$)",
-     "docker", "container", "docker-cgroupfs"),
-    (rf"(?:^|/)cri-containerd-({_CGROUP_HEX_ID})\.scope(?=/|$)",
-     "containerd", "container", "containerd-systemd-cgroup"),
-    (rf"(?:^|/)crio-({_CGROUP_HEX_ID})\.scope(?=/|$)",
-     "cri-o", "container", "crio-systemd-cgroup"),
-    (rf"(?:^|/)libpod-({_CGROUP_HEX_ID})\.scope(?=/|$)",
-     "podman", "container", "podman-systemd-cgroup"),
-    (rf"(?:^|/)(?:crio|cri-containerd)/({_CGROUP_HEX_ID})(?=/|$)",
-     "kubernetes", "container", "cri-cgroupfs"),
-    (rf"(?:^|/)kubepods(?:/(?:burstable|besteffort))?/pod{_CGROUP_POD_ID}/({_CGROUP_HEX_ID})(?=/|$)",
-     "kubernetes", "container", "kubernetes-cgroupfs-container"),
-    (rf"(?:^|/)(?:kubepods(?:-[^/]+)*-)?pod({_CGROUP_POD_ID})(?:\.slice)?(?=/|$)",
-     "kubernetes", "pod", "kubernetes-pod-cgroup"),
+    (
+        rf"(?:^|/)docker-({_CGROUP_HEX_ID})\.scope(?=/|$)",
+        "docker",
+        "container",
+        "docker-systemd-cgroup",
+    ),
+    (
+        rf"(?:^|/)docker/({_CGROUP_HEX_ID})(?=/|$)",
+        "docker",
+        "container",
+        "docker-cgroupfs",
+    ),
+    (
+        rf"(?:^|/)cri-containerd-({_CGROUP_HEX_ID})\.scope(?=/|$)",
+        "containerd",
+        "container",
+        "containerd-systemd-cgroup",
+    ),
+    (
+        rf"(?:^|/)crio-({_CGROUP_HEX_ID})\.scope(?=/|$)",
+        "cri-o",
+        "container",
+        "crio-systemd-cgroup",
+    ),
+    (
+        rf"(?:^|/)libpod-({_CGROUP_HEX_ID})\.scope(?=/|$)",
+        "podman",
+        "container",
+        "podman-systemd-cgroup",
+    ),
+    (
+        rf"(?:^|/)(?:crio|cri-containerd)/({_CGROUP_HEX_ID})(?=/|$)",
+        "kubernetes",
+        "container",
+        "cri-cgroupfs",
+    ),
+    (
+        rf"(?:^|/)kubepods(?:/(?:burstable|besteffort))?/pod{_CGROUP_POD_ID}/({_CGROUP_HEX_ID})(?=/|$)",
+        "kubernetes",
+        "container",
+        "kubernetes-cgroupfs-container",
+    ),
+    (
+        rf"(?:^|/)(?:kubepods(?:-[^/]+)*-)?pod({_CGROUP_POD_ID})(?:\.slice)?(?=/|$)",
+        "kubernetes",
+        "pod",
+        "kubernetes-pod-cgroup",
+    ),
 )
 _CGROUP_ID_PATTERNS = tuple(
     (re.compile(pattern, re.IGNORECASE), runtime, kind, source)
@@ -136,17 +161,26 @@ def _cgroup_identity(memberships):
                 identifier = match.group(1).lower()
                 if kind == "pod":
                     identifier = identifier.replace("_", "-")
-                matches.append((membership, Identity(runtime, identifier, kind, source)))
+                matches.append(
+                    (membership, Identity(runtime, identifier, kind, source))
+                )
     for kind in ("container", "pod"):
         if len({item.identifier for _, item in matches if item.id_kind == kind}) > 1:
             return None, "", True
     for kind in ("container", "pod"):
-        candidates = [(membership, identity) for membership, identity in matches
-                      if identity.id_kind == kind]
+        candidates = [
+            (membership, identity)
+            for membership, identity in matches
+            if identity.id_kind == kind
+        ]
         if candidates:
-            candidates.sort(key=lambda item: (
-                item[0].version != "v2", item[0].display(), item[1].runtime,
-            ))
+            candidates.sort(
+                key=lambda item: (
+                    item[0].version != "v2",
+                    item[0].display(),
+                    item[1].runtime,
+                )
+            )
             membership, identity = candidates[0]
             owner = ",".join(membership.controllers) or "unified"
             return identity, f"{membership.version}:{owner}", False
@@ -155,19 +189,32 @@ def _cgroup_identity(memberships):
 
 def _observe_task(task):
     try:
-        if (not task or not task.fs or not _object_readable(task.fs)
-                or not task.nsproxy or not _object_readable(task.nsproxy)):
+        if (
+            not task
+            or not task.fs
+            or not artifact_core._object_readable(task.fs)
+            or not task.nsproxy
+            or not artifact_core._object_readable(task.nsproxy)
+        ):
             return None
         mnt_ns = task.nsproxy.mnt_ns
         root_mnt, root_dentry = task.fs.get_root_mnt(), task.fs.get_root_dentry()
-        if not all(obj and _object_readable(obj) for obj in (mnt_ns, root_mnt, root_dentry)):
+        if not all(
+            obj and artifact_core._object_readable(obj)
+            for obj in (mnt_ns, root_mnt, root_dentry)
+        ):
             return None
         pid = int(task.pid)
-        root_key = (_object_address(root_mnt), _object_address(root_dentry))
-    except READ_ERRORS:
+        root_key = (
+            artifact_core._object_address(root_mnt),
+            artifact_core._object_address(root_dentry),
+        )
+    except artifact_core.READ_ERRORS:
         return None
     issues = set()
-    memberships = read_link_memberships(task, issues_out=issues, logger=vollog)
+    memberships = cgroup_readers.read_link_memberships(
+        task, issues_out=issues, logger=vollog
+    )
     identity, source, conflict = _cgroup_identity(memberships)
     conflict = conflict or "cgroup-id-conflict" in issues
     if conflict:
@@ -183,9 +230,14 @@ def _observe_task(task):
     if "cgroup-metadata-partial" in issues:
         evidence.append("cgroup-metadata-partial")
     return TaskObservation(
-        pid=pid, task=task, mnt_ns=mnt_ns, root_key=root_key,
-        cgroup_memberships=memberships, identity=identity,
-        runtime=identity.runtime if identity else runtime, evidence=tuple(evidence),
+        pid=pid,
+        task=task,
+        mnt_ns=mnt_ns,
+        root_key=root_key,
+        cgroup_memberships=memberships,
+        identity=identity,
+        runtime=identity.runtime if identity else runtime,
+        evidence=tuple(evidence),
     )
 
 
@@ -199,7 +251,7 @@ def _safe_text(value):
 
 def _display_ids(identifiers, full=False):
     """짧은 ID끼리 충돌하면 구별될 때까지 확장한다. 내부 소속 ID는 항상 원문이다."""
-    identifiers = sorted(set(identifier for identifier in identifiers if identifier))
+    identifiers = sorted({identifier for identifier in identifiers if identifier})
     if full:
         return {identifier: identifier for identifier in identifiers}
     result = {}
@@ -214,7 +266,7 @@ def _display_ids(identifiers, full=False):
     return result
 
 
-@dataclass
+@dataclasses.dataclass
 class TaskView:
     task: object
     tgid: int
@@ -222,8 +274,8 @@ class TaskView:
     container_id: str
     observation: object
     files_address: int
-    members: set = field(default_factory=set)
-    issues: set = field(default_factory=set)
+    members: set = dataclasses.field(default_factory=set)
+    issues: set = dataclasses.field(default_factory=set)
 
 
 class InspectFiles(plugins.PluginInterface):
@@ -231,45 +283,69 @@ class InspectFiles(plugins.PluginInterface):
 
     hidden = True
     _required_framework_version = (2, 28, 0)
-    _version = (0, 3, 1)
+    _version = (0, 3, 4)
 
     @classmethod
     def get_requirements(cls):
         return [
+            requirements.VersionRequirement(
+                name="docker_artifacts",
+                component=docker_artifacts.DockerArtifacts,
+                version=(1, 0, 1),
+            ),
             requirements.ModuleRequirement(
-                name="kernel", description="Linux kernel with matching ISF",
+                name="kernel",
+                description="Linux kernel with matching ISF",
                 architectures=["Intel32", "Intel64"],
             ),
             requirements.VersionRequirement(
-                name="linuxutils", component=linux.LinuxUtilities, version=(2, 4, 0),
+                name="linuxutils",
+                component=linux.LinuxUtilities,
+                version=(2, 4, 0),
             ),
-            requirements.VersionRequirement(name="pslist", component=pslist.PsList, version=(4, 1, 1)),
+            requirements.VersionRequirement(
+                name="pslist", component=pslist.PsList, version=(4, 1, 1)
+            ),
             requirements.ListRequirement(
-                name="pids", element_type=int, min_elements=1, optional=True,
+                name="pids",
+                element_type=int,
+                min_elements=1,
+                optional=True,
                 description="Explicit host process IDs (TGIDs), including their thread file tables",
             ),
             requirements.StringRequirement(
-                name="container", optional=True,
+                name="container",
+                optional=True,
                 description="Select one unambiguous container ID prefix (6..64 hex characters)",
             ),
             requirements.ChoiceRequirement(
-                name="view", choices=["files", "hosts", "details"], optional=True,
+                name="view",
+                choices=["files", "hosts", "details"],
+                optional=True,
                 description="All views are vertical Record/Field/Value rows; files: basic fields, hosts: host paths, details: all fields",
             ),
             requirements.BooleanRequirement(
-                name="extended", optional=True, default=False,
+                name="extended",
+                optional=True,
+                default=False,
                 description="Alias for --view details (all fields, same 3-column vertical output)",
             ),
             requirements.BooleanRequirement(
-                name="unlinked-only", optional=True, default=False,
+                name="unlinked-only",
+                optional=True,
+                default=False,
                 description="Only UNLINKED names, not anonymous or never-linked temporary files",
             ),
             requirements.BooleanRequirement(
-                name="full-id", optional=True, default=False,
+                name="full-id",
+                optional=True,
+                default=False,
                 description="Use complete container IDs (also required for full-ID JSON export)",
             ),
             requirements.IntRequirement(
-                name="max-fds", optional=True, default=65536,
+                name="max-fds",
+                optional=True,
+                default=65536,
                 description="Slots per file table (1..1048576); truncation is reported, never silently complete",
             ),
         ]
@@ -277,51 +353,72 @@ class InspectFiles(plugins.PluginInterface):
     def _options(self):
         wanted = self.config.get("pids")
         if wanted is not None and (
-            not isinstance(wanted, list) or not wanted
+            not isinstance(wanted, list)
+            or not wanted
             or any(type(pid) is not int or pid <= 0 for pid in wanted)
         ):
-            raise exceptions.VolatilityException("--pids requires positive host process IDs")
+            raise exceptions.VolatilityException(
+                "--pids requires positive host process IDs"
+            )
         prefix = self.config.get("container")
         if prefix is not None and (
-            not isinstance(prefix, str) or not re.fullmatch(r"[0-9a-fA-F]{6,64}", prefix)
+            not isinstance(prefix, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{6,64}", prefix)
         ):
-            raise exceptions.VolatilityException("--container requires a 6..64 hex ID prefix")
+            raise exceptions.VolatilityException(
+                "--container requires a 6..64 hex ID prefix"
+            )
         limit = self.config.get("max-fds", 65536)
-        if type(limit) is not int or not 1 <= limit <= MAX_FDS:
+        if type(limit) is not int or not 1 <= limit <= file_readers.MAX_FDS:
             raise exceptions.VolatilityException("--max-fds must be in 1..1048576")
         for name in ("extended", "unlinked-only", "full-id"):
             if type(self.config.get(name, False)) is not bool:
                 raise exceptions.VolatilityException(f"--{name} must be a boolean")
         self._selected_view()
-        return set(wanted) if wanted is not None else None, prefix.lower() if prefix else None, limit
+        return (
+            set(wanted) if wanted is not None else None,
+            prefix.lower() if prefix else None,
+            limit,
+        )
 
     def _selected_view(self):
         value = self.config.get("view")
         if value is not None and value not in ("files", "hosts", "details"):
-            raise exceptions.VolatilityException("--view must be files, hosts or details")
+            raise exceptions.VolatilityException(
+                "--view must be files, hosts or details"
+            )
         if self.config.get("extended", False):
             if value not in (None, "details"):
-                raise exceptions.VolatilityException("--extended is an alias for --view details")
+                raise exceptions.VolatilityException(
+                    "--extended is an alias for --view details"
+                )
             return "details"
         return value or "files"
 
     def _task_views(self, wanted, prefix):
         views, found, seen = {}, set(), set()
-        failures = Counter()
+        failures = collections.Counter()
         try:
-            initial = self.context.modules[self.config["kernel"]].object_from_symbol("init_task")
+            initial = self.context.modules[self.config["kernel"]].object_from_symbol(
+                "init_task"
+            )
             host_namespace = initial.nsproxy.mnt_ns
-            host_namespace_address = (_object_address(host_namespace)
-                                      if _object_readable(host_namespace) else None)
-        except READ_ERRORS:
+            host_namespace_address = (
+                artifact_core._object_address(host_namespace)
+                if artifact_core._object_readable(host_namespace)
+                else None
+            )
+        except artifact_core.READ_ERRORS:
             host_namespace_address = None
-        tasks = list_tasks(
-            self.context, self.config["kernel"], include_threads=True,
+        tasks = docker_artifacts.DockerArtifacts.list_tasks(
+            self.context,
+            self.config["kernel"],
+            include_threads=True,
         )
         try:
             for task in tasks:
                 try:
-                    address = _object_address(task)
+                    address = artifact_core._object_address(task)
                     if address in seen:
                         continue
                     if len(seen) >= MAX_TASKS:
@@ -345,12 +442,14 @@ class InspectFiles(plugins.PluginInterface):
                         continue
                     related = False
                     if observation is not None:
-                        related = (observation.identity is not None
-                                   or "cgroup-id-conflict" in observation.evidence)
+                        related = (
+                            observation.identity is not None
+                            or "cgroup-id-conflict" in observation.evidence
+                        )
                         if not related and host_namespace_address is not None:
                             command = utility.array_to_string(task.comm)
                             itself_supervisor = any(
-                                _comm_matches(command, signature)
+                                task_readers.comm_matches(command, signature)
                                 for signature, _ in RUNTIME_SUPERVISORS
                             )
                             # shim 자체의 FD를 컨테이너 내부 FD로 오인하지 않는다.
@@ -358,98 +457,165 @@ class InspectFiles(plugins.PluginInterface):
                             # 허용하지만, supervisor 단독 근거는 분리된 NS를 요구한다.
                             related = (
                                 not itself_supervisor
-                                and _object_address(observation.mnt_ns) != host_namespace_address
-                                and any(item.startswith("supervisor:") for item in observation.evidence)
+                                and artifact_core._object_address(observation.mnt_ns)
+                                != host_namespace_address
+                                and any(
+                                    item.startswith("supervisor:")
+                                    for item in observation.evidence
+                                )
                             )
                     if wanted is None and not related:
                         continue
                     identity = observation.identity if observation is not None else None
-                    container_id = identity.identifier if identity and identity.id_kind == "container" else ""
+                    container_id = (
+                        identity.identifier
+                        if identity and identity.id_kind == "container"
+                        else ""
+                    )
                     if prefix and not container_id.startswith(prefix):
                         continue
                     found.add(tgid)
-                    files_address = _object_address(task.files)
+                    files_address = artifact_core._object_address(task.files)
                     issues = set()
                     if observation is None:
                         issues.add("task-membership-or-view")
                         owner = ("unknown", tid)
                         view_key = (tid,)
                     else:
-                        issues.update(flag for flag in observation.evidence
-                                      if flag in {"cgroup-id-conflict", "cgroup-metadata-partial"})
+                        issues.update(
+                            flag
+                            for flag in observation.evidence
+                            if flag in {"cgroup-id-conflict", "cgroup-metadata-partial"}
+                        )
                         owner = container_id or (
-                            tuple((m.version, m.cgroup_address) for m in observation.cgroup_memberships),
+                            tuple(
+                                (m.version, m.cgroup_address)
+                                for m in observation.cgroup_memberships
+                            ),
                             observation.runtime,
                             tid if issues else None,
                         )
-                        view_key = (_object_address(observation.mnt_ns), observation.root_key)
+                        view_key = (
+                            artifact_core._object_address(observation.mnt_ns),
+                            observation.root_key,
+                        )
                     # 같은 프로세스의 같은 FD table만 합친다. 다른 프로세스의
                     # 공유 FD, 스레드 전용 FD table, 다른 root/cgroup은 보존한다.
                     key = (tgid, files_address, view_key, owner)
                     if key not in views:
-                        views[key] = TaskView(task, tgid, tid, container_id, observation,
-                                              files_address, {tid}, issues)
+                        views[key] = TaskView(
+                            task,
+                            tgid,
+                            tid,
+                            container_id,
+                            observation,
+                            files_address,
+                            {tid},
+                            issues,
+                        )
                     else:
                         view = views[key]
                         view.members.add(tid)
                         view.issues.update(issues)
                         if (tid != tgid, tid) < (view.tid != tgid, view.tid):
-                            view.task, view.tid, view.observation = task, tid, observation
-                except READ_ERRORS:
+                            view.task, view.tid, view.observation = (
+                                task,
+                                tid,
+                                observation,
+                            )
+                except artifact_core.READ_ERRORS:
                     failures["task-metadata"] += 1
-        except READ_ERRORS:
+        except artifact_core.READ_ERRORS:
             failures["task-list"] += 1
         if wanted is not None and wanted - found:
-            vollog.warning("Requested TGIDs not selected/readable: %s", sorted(wanted - found))
+            vollog.warning(
+                "Requested TGIDs not selected/readable: %s", sorted(wanted - found)
+            )
         if wanted is None and host_namespace_address is None:
-            vollog.warning("Host MNT NS unreadable; automatic selection used cgroup evidence only")
+            vollog.warning(
+                "Host MNT NS unreadable; automatic selection used cgroup evidence only"
+            )
         if failures:
-            vollog.warning("Task collection incomplete: %s; missing rows do not prove absence", dict(failures))
+            vollog.warning(
+                "Task collection incomplete: %s; missing rows do not prove absence",
+                dict(failures),
+            )
             for view in views.values():
                 view.issues.add("task-list-partial")
         ids = {view.container_id for view in views.values() if view.container_id}
         if prefix and len(ids) > 1:
-            raise exceptions.VolatilityException("--container is ambiguous; use a longer/full ID")
-        return sorted(views.values(), key=lambda view: (view.container_id, view.tgid, view.tid))
+            raise exceptions.VolatilityException(
+                "--container is ambiguous; use a longer/full ID"
+            )
+        return sorted(
+            views.values(), key=lambda view: (view.container_id, view.tgid, view.tid)
+        )
 
     def _read_fds(self, task, limit):
-        return read_fds(self.context, self.config["kernel"], task, limit)
+        return docker_artifacts.DockerArtifacts.read_file_descriptors(
+            self.context,
+            self.config["kernel"],
+            int(task.vol.offset),
+            limit=limit,
+            layer_name=task.vol.layer_name,
+            native_layer_name=task.vol.native_layer_name,
+        )
 
     def _generator(self, output_view):
         wanted, prefix, limit = self._options()
         views = self._task_views(wanted, prefix)
         if not views:
-            vollog.warning("No task views selected; use --pids for an explicit known host process")
+            vollog.warning(
+                "No task views selected; use --pids for an explicit known host process"
+            )
             return
-        id_display = _display_ids((view.container_id for view in views), self.config.get("full-id", False))
+        id_display = _display_ids(
+            (view.container_id for view in views), self.config.get("full-id", False)
+        )
         kernel = self.context.modules[self.config["kernel"]]
-        resolver = HostMountResolver(kernel.object_from_symbol("init_task"), logger=vollog)
+        resolver = path_readers.FileHostMountResolver(
+            kernel.object_from_symbol("init_task"), logger=vollog
+        )
         table_cache, file_cache, namespace_cache = {}, {}, {}
-        counts = Counter()
+        counts = collections.Counter()
         for view in views:
             if view.files_address not in table_cache:
                 table_cache[view.files_address] = self._read_fds(view.task, limit)
             entries, table_issues = table_cache[view.files_address]
             if table_issues:
-                vollog.warning("PID/TID %s/%s FD table incomplete: %s", view.tgid, view.tid, dict(table_issues))
+                vollog.warning(
+                    "PID/TID %s/%s FD table incomplete: %s",
+                    view.tgid,
+                    view.tid,
+                    dict(table_issues),
+                )
             covering, namespace_complete = {}, False
             if view.observation is not None:
-                namespace_address = _object_address(view.observation.mnt_ns)
+                namespace_address = artifact_core._object_address(
+                    view.observation.mnt_ns
+                )
                 if namespace_address not in namespace_cache:
-                    namespace_cache[namespace_address] = _namespace_covering(view.observation.mnt_ns)
+                    namespace_cache[namespace_address] = (
+                        mount_readers.namespace_covering(view.observation.mnt_ns)
+                    )
                 covering, namespace_complete = namespace_cache[namespace_address]
             try:
                 comm = _safe_text(utility.array_to_string(view.task.comm))
-            except READ_ERRORS:
+            except artifact_core.READ_ERRORS:
                 comm = "-"
             for fd, filp in entries:
-                file_address = _object_address(filp)
+                file_address = artifact_core._object_address(filp)
                 if file_address not in file_cache:
-                    file_cache[file_address] = _file_facts(filp, resolver)
+                    file_cache[file_address] = file_readers.file_facts(filp, resolver)
                 facts = file_cache[file_address]
-                if self.config.get("unlinked-only", False) and facts.state != "UNLINKED":
+                if (
+                    self.config.get("unlinked-only", False)
+                    and facts.state != "UNLINKED"
+                ):
                     continue
-                path, path_status = _container_path(view.task, facts, covering, namespace_complete)
+                path, path_status = file_readers.container_path(
+                    view.task, facts, covering, namespace_complete
+                )
                 issues = set(view.issues) | set(facts.issues)
                 issues.update(table_issues)
                 if path_status == "PARTIAL":
@@ -471,39 +637,85 @@ class InspectFiles(plugins.PluginInterface):
                     # 상태에 별표가 있으면 해당 행의 일부 정보를 못 읽은 것이다.
                     # 임의로 경로를 자르지 않으며 details에서 그 사유를 확인한다.
                     state = facts.state + ("*" if issues else "")
-                    fields.extend([
-                        ("Access", facts.access), ("State", state), ("Path", displayed_path),
-                    ])
+                    fields.extend(
+                        [
+                            ("Access", facts.access),
+                            ("State", state),
+                            ("Path", displayed_path),
+                        ]
+                    )
                 elif output_view == "hosts":
                     # 별칭 여러 개를 긴 셀 하나에 이어 붙이지 않고 각각 한 행으로.
-                    fields.extend(("Host Path", _safe_text(alias)) for alias in facts.host_paths or ("-",))
+                    fields.extend(
+                        ("Host Path", _safe_text(alias))
+                        for alias in facts.host_paths or ("-",)
+                    )
                     fields.append(("Status", facts.host_status))
                 else:
-                    detail = "PARTIAL:" + ",".join(sorted(issues)) if issues else "COMPLETE"
-                    fields.extend([
-                        ("Process", comm), ("Access", facts.access), ("Type", facts.kind),
-                        ("Name State", facts.state), ("Path", displayed_path),
-                    ])
-                    fields.extend(("Host Path", _safe_text(alias)) for alias in facts.host_paths or ("-",))
-                    fields.extend([
-                        ("Path Status", path_status), ("Host Path Status", facts.host_status),
-                        ("Read Status", detail),
-                        ("Inode", str(facts.inode_number) if facts.inode_number is not None else "-"),
-                        ("Link Count", str(facts.nlink) if facts.nlink is not None else "-"),
-                        ("File Flags", hex(facts.file_flags) if facts.file_flags is not None else "-"),
-                        ("File Mode", hex(facts.raw_mode) if facts.raw_mode is not None else "-"),
-                    ])
+                    detail = (
+                        "PARTIAL:" + ",".join(sorted(issues)) if issues else "COMPLETE"
+                    )
+                    fields.extend(
+                        [
+                            ("Process", comm),
+                            ("Access", facts.access),
+                            ("Type", facts.kind),
+                            ("Name State", facts.state),
+                            ("Path", displayed_path),
+                        ]
+                    )
+                    fields.extend(
+                        ("Host Path", _safe_text(alias))
+                        for alias in facts.host_paths or ("-",)
+                    )
+                    fields.extend(
+                        [
+                            ("Path Status", path_status),
+                            ("Host Path Status", facts.host_status),
+                            ("Read Status", detail),
+                            (
+                                "Inode",
+                                str(facts.inode_number)
+                                if facts.inode_number is not None
+                                else "-",
+                            ),
+                            (
+                                "Link Count",
+                                str(facts.nlink) if facts.nlink is not None else "-",
+                            ),
+                            (
+                                "File Flags",
+                                hex(facts.file_flags)
+                                if facts.file_flags is not None
+                                else "-",
+                            ),
+                            (
+                                "File Mode",
+                                hex(facts.raw_mode)
+                                if facts.raw_mode is not None
+                                else "-",
+                            ),
+                        ]
+                    )
                     # 스레드 목록도 길게 합치지 않는다. 여러 TID가 같은 테이블을
                     # 공유할 때만 별도 행으로 나열한다.
                     if len(view.members) > 1:
-                        fields.extend(("Shared TID", str(tid)) for tid in sorted(view.members))
+                        fields.extend(
+                            ("Shared TID", str(tid)) for tid in sorted(view.members)
+                        )
                 # 콘솔/JSON/CSV 모두 같은 구조를 사용하며 실제 값은 자르지 않는다.
                 for label, value in fields:
                     yield 0, (counts["rows"], label, value)
         if counts["partial"]:
-            vollog.warning("%s/%s FDs have incomplete metadata (* in State); inspect --view details", counts["partial"], counts["rows"])
+            vollog.warning(
+                "%s/%s FDs have incomplete metadata (* in State); inspect --view details",
+                counts["partial"],
+                counts["rows"],
+            )
         if not counts["rows"]:
-            vollog.warning("No matching readable FD rows; this does not prove there are no open/deleted files")
+            vollog.warning(
+                "No matching readable FD rows; this does not prove there are no open/deleted files"
+            )
 
     def run(self):
         self._options()

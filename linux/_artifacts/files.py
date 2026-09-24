@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 """File-table slots and VFS facts; callers own task selection, caches and output."""
-from collections import Counter
-from dataclasses import dataclass, field
-from typing import Optional
-from .core import (READ_ERRORS, _object_address, _object_readable,
-                   read_file_cstring as _read_kernel_cstring)
-from .paths import read_dentry_name as _read_dentry_name, walk_mount_path as _walk_mount_path
+
+from __future__ import annotations
+
+import collections
+import dataclasses
+
+from . import core as artifact_core
+from . import paths as path_readers
 
 FMODE_PATH = 0x4000
 O_PATH = 0x200000
@@ -21,13 +23,13 @@ def access_mode(filp):
         if mode & FMODE_PATH:
             return "PATH"
         return {0: "NONE", 1: "R", 2: "W", 3: "RW"}[mode & 3]
-    except READ_ERRORS:
+    except artifact_core.READ_ERRORS:
         try:
             flags = int(filp.f_flags)
             if flags & O_PATH:
                 return "PATH"
             return {0: "R", 1: "W", 2: "RW"}.get(flags & 3, "UNKNOWN")
-        except READ_ERRORS:
+        except artifact_core.READ_ERRORS:
             return "UNKNOWN"
 
 
@@ -38,14 +40,18 @@ def name_state(dentry, inode, file_flags, fs_type):
     if fs_type == "anon_inodefs":
         return "ANONYMOUS"
     try:
-        if not (dentry and _object_readable(dentry)
-                and inode and _object_readable(inode)):
+        if not (
+            dentry
+            and artifact_core._object_readable(dentry)
+            and inode
+            and artifact_core._object_readable(inode)
+        ):
             return "UNKNOWN"
-        parent_address = _object_address(dentry.d_parent)
+        parent_address = artifact_core._object_address(dentry.d_parent)
         if not parent_address:
             return "UNKNOWN"
-        address = _object_address(dentry)
-        hashed = bool(_object_address(dentry.d_hash.pprev))
+        address = artifact_core._object_address(dentry)
+        hashed = bool(artifact_core._object_address(dentry.d_hash.pprev))
         if parent_address == address:
             # memfd와 anonymous dentry도 self-parent일 수 있다. 파일시스템
             # 루트인지 여부는 경로 판독에서 확인하고 여기서는 링크 수를 함께 본다.
@@ -64,26 +70,26 @@ def name_state(dentry, inode, file_flags, fs_type):
             return "UNKNOWN"
         # 양의 i_nlink라도 해당 이름은 unlink되었을 수 있다(다른 hardlink).
         return "UNLINKED"
-    except READ_ERRORS:
+    except artifact_core.READ_ERRORS:
         return "UNKNOWN"
 
 
 def scan_fd_array(array, count):
     """한 슬롯의 page fault 때문에 뒤쪽 FD까지 사라지지 않도록 분리해서 읽는다."""
-    entries, issues = [], Counter()
+    entries, issues = [], collections.Counter()
     for fd in range(count):
         try:
             filp = array[fd]
             # 슬롯 자체가 안 읽히면 open/closed 여부조차 알 수 없다. 가짜 FD
             # 행을 만들지 않고 누락 슬롯 수를 전체 판독 상태에 남긴다.
-            if _object_address(filp):
+            if artifact_core._object_address(filp):
                 entries.append((fd, filp))
-        except READ_ERRORS:
+        except artifact_core.READ_ERRORS:
             issues["fd-slot-unreadable"] += 1
     return entries, issues
 
 
-@dataclass
+@dataclasses.dataclass
 class FileFacts:
     """동일 struct file에서 한 번만 읽는 정보. 태스크별 경로는 따로 계산한다."""
 
@@ -94,20 +100,20 @@ class FileFacts:
     dentry: object = None
     vfsmnt: object = None
     inode: object = None
-    inode_number: Optional[int] = None
-    nlink: Optional[int] = None
-    file_flags: Optional[int] = None
-    raw_mode: Optional[int] = None
+    inode_number: int | None = None
+    nlink: int | None = None
+    file_flags: int | None = None
+    raw_mode: int | None = None
     host_paths: tuple = ()
     host_status: str = "PARTIAL"
     special_name: str = ""
-    issues: set = field(default_factory=set)
+    issues: set = dataclasses.field(default_factory=set)
 
 
 def file_facts(filp, resolver):
     """경로/선택 필드 하나가 손상되어도 이미 발견한 FD 행은 보존한다."""
     result = FileFacts()
-    if not _object_readable(filp):
+    if not artifact_core._object_readable(filp):
         result.issues.add("file-unreadable")
         return result
     result.access = access_mode(filp)
@@ -116,35 +122,41 @@ def file_facts(filp, resolver):
     for member, target in (("f_flags", "file_flags"), ("f_mode", "raw_mode")):
         try:
             setattr(result, target, int(getattr(filp, member)))
-        except READ_ERRORS:
+        except artifact_core.READ_ERRORS:
             result.issues.add(member)
     try:
         result.inode = filp.get_inode()
-        if not (result.inode and _object_readable(result.inode)):
+        if not (result.inode and artifact_core._object_readable(result.inode)):
             raise ValueError("unreadable inode")
         result.kind = result.inode.get_inode_type() or "UNKNOWN"
         result.inode_number = int(result.inode.i_ino)
         result.nlink = int(result.inode.i_nlink)
-    except READ_ERRORS:
+    except artifact_core.READ_ERRORS:
         result.issues.add("inode")
     try:
         result.dentry = filp.get_dentry()
         result.vfsmnt = filp.get_vfsmnt()
-        if not (_object_readable(result.dentry)
-                and _object_readable(result.vfsmnt)):
+        if not (
+            artifact_core._object_readable(result.dentry)
+            and artifact_core._object_readable(result.vfsmnt)
+        ):
             raise ValueError("unreadable f_path")
         superblock = result.vfsmnt.get_mnt_sb()
-        if not _object_readable(superblock):
+        if not artifact_core._object_readable(superblock):
             raise ValueError("unreadable superblock")
-        result.fs_type = _read_kernel_cstring(superblock.s_type.name, 256)
+        result.fs_type = artifact_core.read_file_cstring(superblock.s_type.name, 256)
         # 동일 주소공간의 VFS 객체 관계만 비교한다. 경로 문자열 접두어를
         # 바꾸거나 overlay의 upper/lower 파일을 추측해서 만들지 않는다.
-        if _object_address(result.dentry.d_sb) != _object_address(superblock):
+        if artifact_core._object_address(
+            result.dentry.d_sb
+        ) != artifact_core._object_address(superblock):
             raise ValueError("dentry/mount superblock mismatch")
-        if result.inode and (_object_address(result.inode)
-                             != _object_address(result.dentry.d_inode)):
+        if result.inode and (
+            artifact_core._object_address(result.inode)
+            != artifact_core._object_address(result.dentry.d_inode)
+        ):
             raise ValueError("file/dentry inode mismatch")
-    except READ_ERRORS:
+    except artifact_core.READ_ERRORS:
         result.issues.add("f-path-or-superblock")
         # 관계 불일치로 얻은 객체를 경로 확정에 사용하지 않는다.
         result.dentry = None
@@ -167,11 +179,11 @@ def file_facts(filp, resolver):
             if result.kind == "UNKNOWN" and "inode" not in result.issues:
                 result.kind = "ANON"
             try:
-                name, issue = _read_dentry_name(result.dentry)
+                name, issue = path_readers.read_dentry_name(result.dentry)
                 result.special_name = "anon_inode:" + (name if not issue else "?")
                 if issue:
                     result.issues.add("anonymous-name")
-            except READ_ERRORS:
+            except artifact_core.READ_ERRORS:
                 result.special_name = "anon_inode:?"
                 result.issues.add("anonymous-name")
         result.host_status = "N/A"
@@ -196,11 +208,14 @@ def container_path(task, facts, covering, index_complete):
     try:
         if facts.state == "NAMELESS":
             # 처음부터 이름 없이 열린 파일에 과거의 절대경로를 만들어 붙이지 않는다.
-            name, issue = _read_dentry_name(facts.dentry)
+            name, issue = path_readers.read_dentry_name(facts.dentry)
             return ("name:" + name, "NAME_ONLY") if not issue else ("", "PARTIAL")
         root_dentry, root_mnt = task.fs.get_root_dentry(), task.fs.get_root_mnt()
-        path, status = _walk_mount_path(
-            root_dentry, root_mnt, facts.dentry, facts.vfsmnt,
+        path, status = path_readers.walk_mount_path(
+            root_dentry,
+            root_mnt,
+            facts.dentry,
+            facts.vfsmnt,
             covering_mounts=covering,
         )
         if status == "COMPLETE":
@@ -213,16 +228,22 @@ def container_path(task, facts, covering, index_complete):
             # 다시 따라가, 실제로 task.fs.root 밖임이 확인될 때만 구분한다.
             # require_live_inode=False인 아래 residual 결과로 정상화하면 실제
             # inode 판독 실패나 unlink를 숨길 수 있으므로 별도로 검증한다.
-            _, topology_status = _walk_mount_path(
-                root_dentry, root_mnt, facts.dentry, facts.vfsmnt,
+            _, topology_status = path_readers.walk_mount_path(
+                root_dentry,
+                root_mnt,
+                facts.dentry,
+                facts.vfsmnt,
                 require_live_inode=True,
             )
             if topology_status == "OUTSIDE_ROOT":
                 status = "OUTSIDE_ROOT"
         # 삭제/overmount/분리된 mount여도 FD는 남을 수 있다. 끝까지 따라간
         # 연결만 보조 표시하고 현재 열 수 있는 경로처럼 취급하지 않는다.
-        residual, residual_status = _walk_mount_path(
-            root_dentry, root_mnt, facts.dentry, facts.vfsmnt,
+        residual, residual_status = path_readers.walk_mount_path(
+            root_dentry,
+            root_mnt,
+            facts.dentry,
+            facts.vfsmnt,
             require_live_inode=False,
         )
         if residual_status == "COMPLETE":
@@ -231,22 +252,22 @@ def container_path(task, facts, covering, index_complete):
             if status == "COVERED":
                 return residual + " [covered]", "COVERED"
             return residual + " [visibility unknown]", "PARTIAL"
-        name, issue = _read_dentry_name(facts.dentry)
+        name, issue = path_readers.read_dentry_name(facts.dentry)
         if not issue:
             # task.fs.root를 벗어난 FD나 memfd의 이름을 임의의 절대경로로 만들지 않는다.
             return "name:" + name, (
                 "PARTIAL" if status.startswith("INCOMPLETE:") else "NAME_ONLY"
             )
         return "", "PARTIAL" if status.startswith("INCOMPLETE:") else "UNRESOLVED"
-    except READ_ERRORS:
+    except artifact_core.READ_ERRORS:
         return "", "PARTIAL"
 
 
 def read_fds(context, kernel_name, task, limit=65536):
-    issues = Counter()
+    issues = collections.Counter()
     try:
         files = task.files
-        if not (files and _object_readable(files)):
+        if not (files and artifact_core._object_readable(files)):
             raise ValueError("unreadable files_struct")
         descriptor_table = files.fdt if files.has_member("fdt") else files
         count = int(descriptor_table.max_fds)
@@ -262,22 +283,29 @@ def read_fds(context, kernel_name, task, limit=65536):
         # 배열 주소가 아닌 fd[0] 값을 검사하게 된다. stdin이 닫혔거나 첫
         # 슬롯 페이지가 누락되어도 뒤의 FD는 읽을 수 있어야 한다.
         base_pointer = descriptor_table.fd
-        base_address = _object_address(base_pointer)
+        base_address = artifact_core._object_address(base_pointer)
         if not base_address:
             raise ValueError("null fd array")
         kernel = context.modules[kernel_name]
-        subtype = context.symbol_space.get_type(kernel.symbol_table_name + "!pointer").clone()
-        subtype.update_vol(subtype=context.symbol_space.get_type(kernel.symbol_table_name + "!file"))
+        subtype = context.symbol_space.get_type(
+            kernel.symbol_table_name + "!pointer"
+        ).clone()
+        subtype.update_vol(
+            subtype=context.symbol_space.get_type(kernel.symbol_table_name + "!file")
+        )
         # Array 자체를 만들 때는 슬롯을 읽지 않는다. 각 포인터의 판독은
         # _scan_fd_array에서 개별적으로 수행한다.
         array = context.object(
-            kernel.symbol_table_name + "!array", count=count, subtype=subtype,
-            offset=base_address, layer_name=base_pointer.vol.native_layer_name,
+            kernel.symbol_table_name + "!array",
+            count=count,
+            subtype=subtype,
+            offset=base_address,
+            layer_name=base_pointer.vol.native_layer_name,
             native_layer_name=base_pointer.vol.native_layer_name,
         )
         entries, slot_issues = scan_fd_array(array, count)
         issues.update(slot_issues)
         return entries, issues
-    except READ_ERRORS:
+    except artifact_core.READ_ERRORS:
         issues["fd-table"] += 1
         return [], issues

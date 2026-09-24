@@ -1,10 +1,14 @@
 """Task-list strategies and argv readers, with explicit legacy policies."""
-from dataclasses import dataclass
+
+import dataclasses
 import re
+
 from volatility3.framework import exceptions
 from volatility3.framework.objects import utility
 from volatility3.plugins.linux import pslist
-from .core import Incomplete, READ_ERRORS, _object_address, _object_readable
+
+from . import core as artifact_core
+
 
 def audit_task_list(head, read_link, limit=100000):
     """태스크 연결 목록을 양방향으로 검사하고, 도달한 노드·연결 불일치·순회 중단 내역을 반환한다.
@@ -24,41 +28,83 @@ def audit_task_list(head, read_link, limit=100000):
             cache[key] = read_link(address, field)
         return cache[key]
 
-    for direction, field, opposite in (("forward", "next", "prev"),
-                                        ("backward", "prev", "next")):
+    for direction, field, opposite in (
+        ("forward", "next", "prev"),
+        ("backward", "prev", "next"),
+    ):
         nodes, seen, previous = [], set(), head
         closed = False
         try:
             current = link(head, field)
             while current != head:
                 if not current or current in seen or len(seen) >= limit:
-                    raise Incomplete("Null/cycle/traversal budget before returning to head")
+                    raise artifact_core.Incomplete(
+                        "Null/cycle/traversal budget before returning to head"
+                    )
                 seen.add(current)
                 nodes.append(current)
                 try:
                     actual = link(current, opposite)
                     if actual != previous:
-                        result["issues"].append({"direction": direction, "kind": "RECIPROCAL_MISMATCH",
-                            "node": hex(current), "field": opposite,
-                            "expected": hex(previous), "actual": hex(actual)})
-                except (exceptions.VolatilityException, ValueError, AttributeError) as exc:
-                    result["issues"].append({"direction": direction, "kind": "UNREADABLE_BACKLINK",
-                        "node": hex(current), "detail": str(exc)})
+                        result["issues"].append(
+                            {
+                                "direction": direction,
+                                "kind": "RECIPROCAL_MISMATCH",
+                                "node": hex(current),
+                                "field": opposite,
+                                "expected": hex(previous),
+                                "actual": hex(actual),
+                            }
+                        )
+                except (
+                    exceptions.VolatilityException,
+                    ValueError,
+                    AttributeError,
+                ) as exc:
+                    result["issues"].append(
+                        {
+                            "direction": direction,
+                            "kind": "UNREADABLE_BACKLINK",
+                            "node": hex(current),
+                            "detail": str(exc),
+                        }
+                    )
                 previous, current = current, link(current, field)
             closed = True
             if link(head, opposite) != previous:
-                result["issues"].append({"direction": direction, "kind": "HEAD_TAIL_MISMATCH",
-                    "expected": hex(previous), "actual": hex(link(head, opposite))})
+                result["issues"].append(
+                    {
+                        "direction": direction,
+                        "kind": "HEAD_TAIL_MISMATCH",
+                        "expected": hex(previous),
+                        "actual": hex(link(head, opposite)),
+                    }
+                )
         except (exceptions.VolatilityException, ValueError, AttributeError) as exc:
-            result["issues"].append({"direction": direction, "kind": "TRAVERSAL_STOPPED", "detail": str(exc)})
-        result["directions"][direction] = {"nodes": nodes, "closed": closed, "count": len(nodes)}
+            result["issues"].append(
+                {
+                    "direction": direction,
+                    "kind": "TRAVERSAL_STOPPED",
+                    "detail": str(exc),
+                }
+            )
+        result["directions"][direction] = {
+            "nodes": nodes,
+            "closed": closed,
+            "count": len(nodes),
+        }
     forward = set(result["directions"]["forward"]["nodes"])
     backward = set(result["directions"]["backward"]["nodes"])
     result["forward_only"] = sorted(forward - backward)
     result["backward_only"] = sorted(backward - forward)
     if forward != backward:
-        result["issues"].append({"kind": "DIRECTION_SET_MISMATCH",
-            "forward_only": len(forward - backward), "backward_only": len(backward - forward)})
+        result["issues"].append(
+            {
+                "kind": "DIRECTION_SET_MISMATCH",
+                "forward_only": len(forward - backward),
+                "backward_only": len(backward - forward),
+            }
+        )
     result["status"] = "PARTIAL" if result["issues"] else "CONSISTENT"
     return result
 
@@ -67,7 +113,9 @@ def list_tasks(context, kernel_name, *, include_threads=None):
     # None preserves the stock default used by mount views.
     if include_threads is None:
         return pslist.PsList.list_tasks(context, kernel_name)
-    return pslist.PsList.list_tasks(context, kernel_name, include_threads=include_threads)
+    return pslist.PsList.list_tasks(
+        context, kernel_name, include_threads=include_threads
+    )
 
 
 def walk_list(reader, head, typename, member, *, check_backlinks):
@@ -78,44 +126,58 @@ def walk_list(reader, head, typename, member, *, check_backlinks):
     while link != end:
         if check_backlinks:
             if not link or link in seen or len(seen) >= reader.limit:
-                raise Incomplete('NULL link, non-head cycle or traversal limit')
+                raise artifact_core.Incomplete(
+                    "NULL link, non-head cycle or traversal limit"
+                )
         else:
             if len(seen) >= reader.limit:
-                raise ValueError('traversal limit reached')
+                raise ValueError("traversal limit reached")
             if not link or link in seen:
-                raise ValueError('null link or non-head cycle')
+                raise ValueError("null link or non-head cycle")
         seen.add(link)
         obj = reader.obj(typename, link - offset)
         if check_backlinks:
             entry = obj.member(member)
             if int(entry.prev) != previous:
-                raise Incomplete('List backlink mismatch')
+                raise artifact_core.Incomplete("List backlink mismatch")
         yield obj
         if check_backlinks:
             previous, link = link, int(entry.next)
         else:
             link = int(obj.member(member).next)
     if check_backlinks and int(head.prev) != previous:
-        raise Incomplete('List tail disagrees with forward traversal')
+        raise artifact_core.Incomplete("List tail disagrees with forward traversal")
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class ArgvPolicy:
     limit: int
     length_error: str
     layer_error: str
     error_type: type = ValueError
-    missing_mm_error: str = ''
+    missing_mm_error: str = ""
     require_terminator: bool = False
     strip_trailing_nuls: bool = False
 
 
-PRESENCE_ARGV = ArgvPolicy(65536, 'Runtime argv missing or outside byte limit',
-    'Runtime process layer unavailable', Incomplete,
-    'Runtime task has no userspace memory descriptor', require_terminator=True)
-NETWORK_ARGV = ArgvPolicy(65536, 'runtime argv length out of bounds', 'runtime process layer unavailable')
-INVENTORY_ARGV = ArgvPolicy(16 * 1024 * 1024, 'Command line length outside budget',
-    'No process address space', Incomplete, strip_trailing_nuls=True)
+PRESENCE_ARGV = ArgvPolicy(
+    65536,
+    "Runtime argv missing or outside byte limit",
+    "Runtime process layer unavailable",
+    artifact_core.Incomplete,
+    "Runtime task has no userspace memory descriptor",
+    require_terminator=True,
+)
+NETWORK_ARGV = ArgvPolicy(
+    65536, "runtime argv length out of bounds", "runtime process layer unavailable"
+)
+INVENTORY_ARGV = ArgvPolicy(
+    16 * 1024 * 1024,
+    "Command line length outside budget",
+    "No process address space",
+    artifact_core.Incomplete,
+    strip_trailing_nuls=True,
+)
 
 
 def read_argv(context, task, policy, *, limit=None):
@@ -125,20 +187,24 @@ def read_argv(context, task, policy, *, limit=None):
         return []
     start, end = int(task.mm.arg_start), int(task.mm.arg_end)
     maximum = policy.limit if limit is None else limit
-    if not 0 <= end - start <= maximum or (policy.require_terminator and (not start or end == start)):
+    if not 0 <= end - start <= maximum or (
+        policy.require_terminator and (not start or end == start)
+    ):
         raise policy.error_type(policy.length_error)
     layer = task.add_process_layer()
     if layer is None:
         raise policy.error_type(policy.layer_error)
     if policy.require_terminator:
         raw = context.layers[layer].read(start, end - start, pad=False)
-        if not raw.endswith(b'\0'):
-            raise policy.error_type('Runtime argv is not NUL-terminated')
-        return raw[:-1].decode('utf-8', errors='strict').split('\0')
-    value = context.layers[layer].read(start, end - start).decode('utf-8', errors='replace')
+        if not raw.endswith(b"\0"):
+            raise policy.error_type("Runtime argv is not NUL-terminated")
+        return raw[:-1].decode("utf-8", errors="strict").split("\0")
+    value = (
+        context.layers[layer].read(start, end - start).decode("utf-8", errors="replace")
+    )
     if policy.strip_trailing_nuls:
-        value = value.rstrip('\0')
-    return value.split('\0')
+        value = value.rstrip("\0")
+    return value.split("\0")
 
 
 def shim_arguments(args):
@@ -185,12 +251,22 @@ def ancestor_chain(task, limit=512):
             break
         parent = parent_ptr.dereference()
         try:
-            record = {"address": hex(parent_address), "pid": int(parent.tgid),
-                      "tid": int(parent.pid),
-                      "comm": utility.array_to_string(parent.comm)}
+            record = {
+                "address": hex(parent_address),
+                "pid": int(parent.tgid),
+                "tid": int(parent.pid),
+                "comm": utility.array_to_string(parent.comm),
+            }
         except (exceptions.VolatilityException, ValueError, AttributeError):
-            chain.append({"address": hex(parent_address), "pid": None, "tid": None,
-                          "comm": None, "unreadable": True})
+            chain.append(
+                {
+                    "address": hex(parent_address),
+                    "pid": None,
+                    "tid": None,
+                    "comm": None,
+                    "unreadable": True,
+                }
+            )
             break
         chain.append(record)
         if record["pid"] == 1:
@@ -207,9 +283,9 @@ def runtime_from_ancestry(task, supervisors, max_depth=8):
     seen, current = set(), task
     for _ in range(max_depth):
         try:
-            if not current or not _object_readable(current):
+            if not current or not artifact_core._object_readable(current):
                 break
-            address = _object_address(current)
+            address = artifact_core._object_address(current)
             if address in seen:
                 break
             seen.add(address)
@@ -217,8 +293,11 @@ def runtime_from_ancestry(task, supervisors, max_depth=8):
             for signature, runtime in supervisors:
                 if comm_matches(comm, signature):
                     return runtime, comm
-            current = (current.real_parent if current.has_member("real_parent")
-                       else current.parent)
-        except READ_ERRORS:
+            current = (
+                current.real_parent
+                if current.has_member("real_parent")
+                else current.parent
+            )
+        except artifact_core.READ_ERRORS:
             break
     return "", ""

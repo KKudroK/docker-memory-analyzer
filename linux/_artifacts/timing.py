@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
 """Kernel boot/task start time reads; callers own caches, provenance and formatting."""
-from dataclasses import dataclass
+
+import dataclasses
+
 from volatility3.framework import constants, objects
-from .core import Unsupported
+
+from . import core as artifact_core
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class BootTime:
     nanoseconds: int
     symbol: str
@@ -19,7 +22,9 @@ def read_kernel_boot(session):
             continue
         if symbol_name == "timekeeper" and session.kernel.has_type("timekeeper"):
             type_name = "timekeeper"
-        elif session.kernel.has_type("tk_data") and session.kernel.get_type("tk_data").has_member("timekeeper"):
+        elif session.kernel.has_type("tk_data") and session.kernel.get_type(
+            "tk_data"
+        ).has_member("timekeeper"):
             type_name = "tk_data"
         else:
             candidates = []
@@ -34,26 +39,28 @@ def read_kernel_boot(session):
                 if child.vol.type_name.split(constants.BANG)[-1] == "timekeeper":
                     candidates.append(candidate_name)
             if len(candidates) != 1:
-                raise Unsupported("No unique tk_core timekeeper layout")
+                raise artifact_core.Unsupported("No unique tk_core timekeeper layout")
             type_name = candidates[0]
         container = session.symbol(symbol_name, type_name)
         keeper = container if type_name == "timekeeper" else container.timekeeper
         if not keeper.has_member("offs_real") or not keeper.has_member("offs_boot"):
-            raise Unsupported("Timekeeper has no boot offsets")
+            raise artifact_core.Unsupported("Timekeeper has no boot offsets")
 
-        def offset_ns(field):
+        def offset_ns(field, *, keeper=keeper):
             value = keeper.member(field)
             if value.has_member("tv64"):
                 value = value.tv64
             if not issubclass(type(value), objects.Integer) or value.vol.size != 8:
-                raise Unsupported("Unsupported timekeeper offset: " + field)
+                raise artifact_core.Unsupported(
+                    "Unsupported timekeeper offset: " + field
+                )
             return int(value)
 
         boot = offset_ns("offs_real") - offset_ns("offs_boot")
         if boot <= 0:
-            raise Unsupported("Invalid kernel boot time")
+            raise artifact_core.Unsupported("Invalid kernel boot time")
         return BootTime(boot, symbol_name, type_name, keeper)
-    raise Unsupported("No supported timekeeper symbol")
+    raise artifact_core.Unsupported("No supported timekeeper symbol")
 
 
 def read_process_start_ns(task, boot_ns):
@@ -66,8 +73,8 @@ def read_process_start_ns(task, boot_ns):
         elif issubclass(type(value), objects.Integer) and value.vol.size == 8:
             start_ns = int(value)
         else:
-            raise Unsupported("Unsupported process start field: " + field)
+            raise artifact_core.Unsupported("Unsupported process start field: " + field)
         if start_ns < 0:
-            raise Unsupported("Negative process start time")
+            raise artifact_core.Unsupported("Negative process start time")
         return boot_ns + start_ns
-    raise Unsupported("No supported process start field")
+    raise artifact_core.Unsupported("No supported process start field")

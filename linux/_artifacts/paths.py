@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: MIT
 """VFS path and host-alias readers; no container selection or display logic."""
-from dataclasses import dataclass
+
+import dataclasses
 import logging
+
 from volatility3.framework import exceptions
-from .core import READ_ERRORS, _object_address, _object_readable
-from .mounts import file_mount_points as _mount_points, mount_current as _mount_current
+
+from . import core as artifact_core
+from . import mounts as mount_readers
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class PathPolicy:
     require_truthy: bool = False
-    errors: tuple = READ_ERRORS
+    errors: tuple = artifact_core.READ_ERRORS
     root_error: str = "INCOMPLETE:root-or-source"
     route_error: str = "INCOMPLETE:route"
     inode_error: str = "INCOMPLETE:inode"
@@ -25,8 +28,14 @@ class PathPolicy:
 FILE_PATH = PathPolicy()
 MOUNT_PATH = PathPolicy(
     require_truthy=True,
-    errors=(AttributeError, IndexError, TypeError, ValueError,
-            exceptions.InvalidAddressException, exceptions.VolatilityException),
+    errors=(
+        AttributeError,
+        IndexError,
+        TypeError,
+        ValueError,
+        exceptions.InvalidAddressException,
+        exceptions.VolatilityException,
+    ),
     root_error="INCOMPLETE:unreadable-root-or-source",
     route_error="INCOMPLETE:unreadable-route",
     inode_error="INCOMPLETE:missing-inode",
@@ -34,7 +43,8 @@ MOUNT_PATH = PathPolicy(
     mount_root_error="INCOMPLETE:unreadable-mount-root",
     parent_mount_error="INCOMPLETE:unreadable-attachment",
     parent_dentry_error="INCOMPLETE:unreadable-parent",
-    name_length_error="invalid-name", name_size_error="invalid-name",
+    name_length_error="invalid-name",
+    name_size_error="invalid-name",
 )
 
 
@@ -45,8 +55,13 @@ def read_dentry_name(dentry, *, policy=FILE_PATH):
     if length is not None and not 1 <= length <= 255:
         return "", policy.name_length_error
     name = qname.name_as_str()
-    if (not name or name in {".", ".."} or "/" in name or "\ufffd" in name
-            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\ufffd" in name
+        or any(ord(char) < 32 or ord(char) == 127 for char in name)
+    ):
         return "", "invalid-name"
     encoded_length = len(name.encode("utf-8"))
     if encoded_length > 255:
@@ -56,22 +71,40 @@ def read_dentry_name(dentry, *, policy=FILE_PATH):
     return name, ""
 
 
-def walk_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt, *, max_depth=4096,
-                     covering_mounts=None, require_live_inode=True, policy=FILE_PATH):
+def walk_mount_path(
+    root_dentry,
+    root_vfsmnt,
+    dentry,
+    vfsmnt,
+    *,
+    max_depth=4096,
+    covering_mounts=None,
+    require_live_inode=True,
+    policy=FILE_PATH,
+):
     """정확한 (mount, dentry) 루트까지 연결된 경로만 반환한다."""
+
     def readable(obj):
-        return (not policy.require_truthy or bool(obj)) and _object_readable(obj)
+        return (
+            not policy.require_truthy or bool(obj)
+        ) and artifact_core._object_readable(obj)
 
     names, visited, permitted_cover = [], set(), None
     crossed_mount = False
     try:
         if not all(readable(obj) for obj in (root_dentry, root_vfsmnt, dentry, vfsmnt)):
             return "", policy.root_error
-        root = (_object_address(root_vfsmnt), _object_address(root_dentry))
+        root = (
+            artifact_core._object_address(root_vfsmnt),
+            artifact_core._object_address(root_dentry),
+        )
         for _ in range(max_depth):
             if not (readable(dentry) and readable(vfsmnt)):
                 return "", policy.route_error
-            key = (_object_address(vfsmnt), _object_address(dentry))
+            key = (
+                artifact_core._object_address(vfsmnt),
+                artifact_core._object_address(dentry),
+            )
             if key in visited:
                 return "", "INCOMPLETE:cycle"
             visited.add(key)
@@ -91,13 +124,13 @@ def walk_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt, *, max_depth=4096,
             mount_root = vfsmnt.get_mnt_root()
             if not readable(mount_root):
                 return "", policy.mount_root_error
-            if key[1] == _object_address(mount_root):
+            if key[1] == artifact_core._object_address(mount_root):
                 # unlink된 파일도 bind의 루트라면 그 bind 경로는 살아 있을 수 있다.
                 parent_mount = vfsmnt.get_vfsmnt_parent()
                 attachment = vfsmnt.get_mnt_mountpoint()
                 if not (readable(parent_mount) and readable(attachment)):
                     return "", policy.parent_mount_error
-                if _object_address(parent_mount) == key[0]:
+                if artifact_core._object_address(parent_mount) == key[0]:
                     return "", "OUTSIDE_ROOT"
                 permitted_cover, crossed_mount = key[0], True
                 dentry, vfsmnt = attachment, parent_mount
@@ -105,9 +138,11 @@ def walk_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt, *, max_depth=4096,
             parent = dentry.d_parent
             if not readable(parent):
                 return "", policy.parent_dentry_error
-            if _object_address(parent) == key[1]:
+            if artifact_core._object_address(parent) == key[1]:
                 return "", "OUTSIDE_ROOT" if crossed_mount else "OUTSIDE_MOUNT"
-            if require_live_inode and not _object_address(dentry.d_hash.pprev):
+            if require_live_inode and not artifact_core._object_address(
+                dentry.d_hash.pprev
+            ):
                 return "", "UNLINKED"
             name, issue = read_dentry_name(dentry, policy=policy)
             if issue:
@@ -119,7 +154,7 @@ def walk_mount_path(root_dentry, root_vfsmnt, dentry, vfsmnt, *, max_depth=4096,
     return "", "INCOMPLETE:depth-limit"
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class SourceResolution:
     paths: tuple
     status: str
@@ -135,57 +170,83 @@ class FileHostMountResolver:
         try:
             self.root_dentry = host_task.fs.get_root_dentry()
             self.root_mount = host_task.fs.get_root_mnt()
-            if not (_object_readable(self.root_dentry) and _object_readable(self.root_mount)):
+            if not (
+                artifact_core._object_readable(self.root_dentry)
+                and artifact_core._object_readable(self.root_mount)
+            ):
                 raise ValueError("unreadable host root")
-            points, state = _mount_points(host_task.nsproxy.mnt_ns)
+            points, state = mount_readers.file_mount_points(host_task.nsproxy.mnt_ns)
             self.complete = state == "COMPLETE"
             indexed = set()
             for mnt in points:
                 try:
-                    current, superblock = _mount_current(mnt), mnt.get_mnt_sb()
-                    if not (_object_readable(current) and _object_readable(superblock)):
+                    current, superblock = (
+                        mount_readers.mount_current(mnt),
+                        mnt.get_mnt_sb(),
+                    )
+                    if not (
+                        artifact_core._object_readable(current)
+                        and artifact_core._object_readable(superblock)
+                    ):
                         raise ValueError("unreadable mount")
-                    address = _object_address(current)
+                    address = artifact_core._object_address(current)
                     if address in indexed:
                         continue
                     indexed.add(address)
-                    self.by_superblock.setdefault(_object_address(superblock), []).append(current)
+                    self.by_superblock.setdefault(
+                        artifact_core._object_address(superblock), []
+                    ).append(current)
                     parent = mnt.get_vfsmnt_parent()
-                    if not _object_readable(parent):
+                    if not artifact_core._object_readable(parent):
                         raise ValueError("unreadable parent")
-                    if _object_address(parent) != address:
+                    if artifact_core._object_address(parent) != address:
                         point = mnt.get_mnt_mountpoint()
-                        if not _object_readable(point):
+                        if not artifact_core._object_readable(point):
                             raise ValueError("unreadable attachment")
-                        key = (_object_address(parent), _object_address(point))
+                        key = (
+                            artifact_core._object_address(parent),
+                            artifact_core._object_address(point),
+                        )
                         self.covering.setdefault(key, set()).add(address)
-                except READ_ERRORS:
+                except artifact_core.READ_ERRORS:
                     self.complete = False
-            if _object_address(self.root_mount) not in indexed:
+            if artifact_core._object_address(self.root_mount) not in indexed:
                 self.complete = False
             if any(parent not in indexed for parent, _ in self.covering):
                 self.complete = False
-        except READ_ERRORS:
+        except artifact_core.READ_ERRORS:
             self.complete = False
         if not self.complete:
-            (logger or logging.getLogger(__name__)).warning("Host mount topology incomplete; host aliases may be PARTIAL")
+            (logger or logging.getLogger(__name__)).warning(
+                "Host mount topology incomplete; host aliases may be PARTIAL"
+            )
 
     def resolve(self, dentry, vfsmnt):
         try:
-            if not (_object_readable(dentry) and _object_readable(vfsmnt)):
+            if not (
+                artifact_core._object_readable(dentry)
+                and artifact_core._object_readable(vfsmnt)
+            ):
                 raise ValueError("unreadable file path")
             superblock = vfsmnt.get_mnt_sb()
-            if not _object_readable(superblock):
+            if not artifact_core._object_readable(superblock):
                 raise ValueError("unreadable superblock")
-            if _object_address(dentry.d_sb) != _object_address(superblock):
+            if artifact_core._object_address(
+                dentry.d_sb
+            ) != artifact_core._object_address(superblock):
                 raise ValueError("file/mount superblock mismatch")
-            candidates = self.by_superblock.get(_object_address(superblock), ())
-        except READ_ERRORS:
+            candidates = self.by_superblock.get(
+                artifact_core._object_address(superblock), ()
+            )
+        except artifact_core.READ_ERRORS:
             return SourceResolution((), "PARTIAL")
         paths, complete = set(), self.complete
         for candidate in candidates:
             path, state = walk_mount_path(
-                self.root_dentry, self.root_mount, dentry, candidate,
+                self.root_dentry,
+                self.root_mount,
+                dentry,
+                candidate,
                 covering_mounts=self.covering,
             )
             if state == "COMPLETE":
@@ -195,5 +256,11 @@ class FileHostMountResolver:
         result = tuple(sorted(paths))
         if not complete:
             return SourceResolution(result, "PARTIAL")
-        return SourceResolution(result, "UNRESOLVED" if not result else
-                                "SINGLE" if len(result) == 1 else "MULTIPLE")
+        return SourceResolution(
+            result,
+            "UNRESOLVED"
+            if not result
+            else "SINGLE"
+            if len(result) == 1
+            else "MULTIPLE",
+        )
