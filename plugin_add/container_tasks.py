@@ -52,7 +52,7 @@ from volatility3.plugins.linux._artifacts.tasks import read_argv, INVENTORY_ARGV
 
 
 LOG = logging.getLogger(__name__)
-VERSION_INFO = (1, 4, 0)
+VERSION_INFO = (1, 4, 1)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
 
@@ -64,6 +64,14 @@ FULL_ID = re.compile(r"[0-9a-fA-F]{64}\Z")
 HEX64 = re.compile(r"[0-9a-fA-F]{64}")
 SHORT_ID_LEN = 12
 CMDLINE_MAX = 48
+
+
+def read_error_text(feature, task_address, exc):
+    """Keep the failed layer and address even when the exception message is empty."""
+    reason = f"{feature} task={task_address:#x}: {type(exc).__name__}: {exc}"
+    if isinstance(exc, exceptions.InvalidAddressException):
+        reason += f" layer_name={exc.layer_name} invalid_address={exc.invalid_address:#x}"
+    return reason
 
 
 def short_id(value):
@@ -313,23 +321,24 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             current = parent
         return chain
 
-    def _cgroup_container_id(self, task, readers):
+    def _cgroup_container_id(self, task, readers, *, errors):
         """태스크 cgroup의 Docker 소속 ID만 뽑는다(없으면 None).
 
-        로직: 소속 판독기로 태스크 cgroup을 해석해 표식 ID를 반환한다. 읽기 실패나
-        표식 부재는 None으로 처리한다(상세 근거는 _task_detail에서 별도로 남긴다).
+        로직: 소속 판독기로 태스크 cgroup을 해석해 표식 ID를 반환한다. 읽기 실패는 errors에 기록하고,
+        실패 또는 표식 부재 시 None을 반환한다.
         """
         if readers["resolver"] is None:
             return None
         try:
             _cset, _cgroup, _chain, group = readers["resolver"].resolve(task)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            errors.append(read_error_text("container_membership", task.vol.offset, exc))
             return None
         return group["id"] if group else None
 
     # ---- shim 신원 (구 10번, 1차 순회에서 공유 수집) --------------------------
 
-    def _shim_identity(self, task, readers, address):
+    def _shim_identity(self, task, readers, address, *, errors):
         """shim 후보의 명령행에서 컨테이너 ID·runtime namespace를 해석한다.
 
         로직: 인자를 shim_arguments로 해석해 ID·namespace를 얻고 shim 자신의 cgroup
@@ -337,8 +346,12 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         """
         try:
             argv = read_argv(self.context, task, INVENTORY_ARGV)
-        except (exceptions.VolatilityException, ValueError, AttributeError, TypeError):
-            argv = []
+        except (exceptions.VolatilityException, ValueError, AttributeError, TypeError) as exc:
+            reason = read_error_text("shim_argv", address, exc)
+            errors.append(reason)
+            return {"task": hex(address), "pid": int(task.tgid), "container_id": None,
+                    "runtime_namespace": None, "argv": [], "cgroup_id": None,
+                    "attributed": False, "error": reason}
         try:
             cid, namespace = shim_arguments(argv)
         except ValueError as exc:
@@ -347,7 +360,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     "attributed": False, "error": str(exc)}
         return {"task": hex(address), "pid": int(task.tgid), "container_id": cid,
                 "runtime_namespace": namespace, "argv": argv,
-                "cgroup_id": self._cgroup_container_id(task, readers),
+                "cgroup_id": self._cgroup_container_id(task, readers, errors=errors),
                 "attributed": namespace == "moby" or cid is not None, "error": None}
 
     # ---- 태스크 상세 (구 9번) + 교차 검증 (구 10번) --------------------------
@@ -571,7 +584,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 except (exceptions.VolatilityException, ValueError, AttributeError):
                     comm = ""
                 if comm.startswith(SHIM_PREFIX):
-                    record = self._shim_identity(task, readers, address)
+                    record = self._shim_identity(task, readers, address, errors=audit["traversal_errors"])
                     shims[hex(address)] = record
                     audit["shims"].append(record)
         except Exception as exc:  # noqa: BLE001
@@ -581,7 +594,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         # 2차 순회: 컨테이너 후보(태스크의 cgroup Docker 소속 또는 shim 조상)만 상세 수집
         for task in tasks:
             has_shim_ancestor = any(node["address"] in shims for node in self._ancestors(task))
-            cgroup_cid = self._cgroup_container_id(task, readers)
+            cgroup_cid = self._cgroup_container_id(task, readers, errors=audit["traversal_errors"])
             if cgroup_cid is None and not has_shim_ancestor:
                 continue  # 호스트 태스크: 컨테이너 후보가 아니다.
             audit["tasks"].append(self._task_detail(task, readers, module, shims))
