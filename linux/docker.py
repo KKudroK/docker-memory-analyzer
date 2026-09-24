@@ -44,6 +44,7 @@ SETTINGS = {
     "unresolved": {"inspect-caps": "unresolved"},
     "view": {"inspect-networks": "view", "inspect-caps": "view", "inspect-files": "view"},
     "triage": {"container-tasks": "triage"},
+    "details": {"container-tasks": "details"},
     "unlinked-only": {"inspect-files": "unlinked-only"},
     "full-id": {"inspect-files": "full-id"},
     "max-fds": {"inspect-files": "max-fds"},
@@ -61,13 +62,14 @@ class Docker(interfaces.plugins.PluginInterface):
 
     Select exactly one analysis. --container accepts several prefixes for
     networks and one for capabilities, tasks or files. --extended adds mount
-    fields or selects the files details view. --triage selects the task
-    membership conflict/unresolved tree. Task evidence is always saved to
+    fields or selects the files details view. Tasks show a summary by default;
+    --details selects the full task table and --triage shows membership mismatches
+    (takes precedence over --details). Task evidence is always saved to
     containertasks-audit.json. Evidence files use Volatility's -o directory.
     """
 
     _required_framework_version = (2, 28, 0)
-    _version = (2, 2, 0)
+    _version = (2, 3, 0)
 
     @classmethod
     def get_requirements(cls):
@@ -114,7 +116,9 @@ class Docker(interfaces.plugins.PluginInterface):
                 optional=True, default=None,
                 description="[networks, caps, files] Output view; defaults: networks=sockets, caps=raw, files=files"),
             requirements.BooleanRequirement(name="triage", optional=True, default=None,
-                description="[tasks] Show conflict/unresolved tasks with threads and ancestor/shim lineage"),
+                description="[tasks] Show membership mismatches only; report Normal when none are detected"),
+            requirements.BooleanRequirement(name="details", optional=True, default=None,
+                description="[tasks] Show the full task table instead of the summary; ignored with --triage"),
             requirements.BooleanRequirement(name="unlinked-only", optional=True, default=None,
                 description="[files] Show only UNLINKED names; excludes anonymous/never-linked temporary files"),
             requirements.BooleanRequirement(name="full-id", optional=True, default=None,
