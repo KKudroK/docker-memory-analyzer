@@ -10,7 +10,9 @@ from volatility3.framework.symbols import linux
 from . import core as artifact_core
 
 
-def list_mount_points(mnt_ns, max_nodes: int = 100000) -> tuple[list[object], str]:
+def list_mount_points(
+    mnt_ns, max_nodes: int = 100000, *, diagnostics=None
+) -> tuple[list[object], str]:
     """Collect a legacy namespace list only after proving return to its head.
 
     Upstream list_head.to_list() silently stops at unreadable/repeated
@@ -23,12 +25,12 @@ def list_mount_points(mnt_ns, max_nodes: int = 100000) -> tuple[list[object], st
     try:
         if not (
             mnt_ns
-            and artifact_core._object_readable(mnt_ns)
+            and artifact_core._object_readable(mnt_ns, diagnostics=diagnostics)
             and mnt_ns.has_member("list")
         ):
             raise ValueError("missing or unreadable legacy namespace list")
         head = mnt_ns.list
-        if not artifact_core._object_readable(head):
+        if not artifact_core._object_readable(head, diagnostics=diagnostics):
             raise ValueError("unreadable legacy namespace list head")
         context = head._context
         table_name = head.vol.type_name.split("!", 1)[0]
@@ -53,7 +55,9 @@ def list_mount_points(mnt_ns, max_nodes: int = 100000) -> tuple[list[object], st
                 return points, "COMPLETE"
             if len(points) >= max_nodes:
                 raise ValueError("legacy mount list exceeds node limit")
-            if not link_pointer or not artifact_core._object_readable(link_pointer):
+            if not link_pointer or not artifact_core._object_readable(
+                link_pointer, diagnostics=diagnostics
+            ):
                 raise ValueError("unreadable legacy mount-list entry")
             if link_address in seen:
                 raise ValueError("cyclic legacy mount list outside its head")
@@ -87,10 +91,11 @@ def list_mount_points(mnt_ns, max_nodes: int = 100000) -> tuple[list[object], st
         exceptions.InvalidAddressException,
         exceptions.VolatilityException,
     ) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.list_walk", exc)
         return points, f"PARTIAL:list-walk:{type(exc).__name__}:{exc}"
 
 
-def mount_points(mnt_ns) -> tuple[list[object], str]:
+def mount_points(mnt_ns, *, diagnostics=None) -> tuple[list[object], str]:
     """Collect namespace mounts without losing every sibling to one bad RB node.
 
     Volatility 3's upstream extension recursively walks the kernel >= 6.8
@@ -106,11 +111,12 @@ def mount_points(mnt_ns) -> tuple[list[object], str]:
         is_rb_tree = mnt_ns.has_member("mounts") and str(
             mnt_ns.mounts.vol.type_name
         ).endswith("!rb_root")
-    except (AttributeError, exceptions.InvalidAddressException):
+    except (AttributeError, exceptions.InvalidAddressException) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.layout", exc)
         is_rb_tree = False
 
     if not is_rb_tree:
-        return list_mount_points(mnt_ns)
+        return list_mount_points(mnt_ns, diagnostics=diagnostics)
 
     try:
         vmlinux = linux.LinuxUtilities.get_module_from_volobj_type(
@@ -118,11 +124,13 @@ def mount_points(mnt_ns) -> tuple[list[object], str]:
         )
         stack = [mnt_ns.mounts.rb_node]
     except (AttributeError, exceptions.InvalidAddressException) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.rb_root", exc)
         return points, f"PARTIAL:rb-root:{type(exc).__name__}"
 
     seen_nodes = set()
     while stack:
         node_pointer = stack.pop()
+        node_address = None
         try:
             node_address = int(node_pointer)
             if not node_address:
@@ -134,7 +142,9 @@ def mount_points(mnt_ns) -> tuple[list[object], str]:
                 skipped_nodes += 1
                 break
             seen_nodes.add(node_address)
-            if not artifact_core._object_readable(node_pointer):
+            if not artifact_core._object_readable(
+                node_pointer, diagnostics=diagnostics
+            ):
                 skipped_nodes += 1
                 continue
             node = node_pointer.dereference()
@@ -146,7 +156,14 @@ def mount_points(mnt_ns) -> tuple[list[object], str]:
                     child = node.member(member)
                     if child:
                         stack.append(child)
-                except (AttributeError, exceptions.InvalidAddressException):
+                except (AttributeError, exceptions.InvalidAddressException) as exc:
+                    artifact_core.record_read_error(
+                        diagnostics,
+                        "mount.rb_child",
+                        exc,
+                        node_address=node_address,
+                        field=member,
+                    )
                     skipped_nodes += 1
 
             mnt = linux.LinuxUtilities.container_of(
@@ -170,7 +187,10 @@ def mount_points(mnt_ns) -> tuple[list[object], str]:
             ValueError,
             exceptions.InvalidAddressException,
             exceptions.VolatilityException,
-        ):
+        ) as exc:
+            artifact_core.record_read_error(
+                diagnostics, "mount.rb_node", exc, node_address=node_address
+            )
             skipped_nodes += 1
             continue
 
@@ -293,11 +313,11 @@ def mount_current(mnt):
     return mnt.get_vfsmnt_current()
 
 
-def file_mount_points(namespace, max_nodes=100000):
+def file_mount_points(namespace, max_nodes=100000, *, diagnostics=None):
     """구형 연결 리스트와 6.8 이후 RB 트리를 각각 상한/순환 검사하며 읽는다."""
     result, issues = [], 0
     try:
-        if not artifact_core._object_readable(namespace):
+        if not artifact_core._object_readable(namespace, diagnostics=diagnostics):
             raise ValueError("unreadable namespace")
         owner_address = artifact_core._object_address(namespace)
         table = namespace.vol.type_name.split("!", 1)[0]
@@ -305,7 +325,7 @@ def file_mount_points(namespace, max_nodes=100000):
         if namespace.has_member("list"):
             # 리스트의 끝처럼 보이는 지점이 아니라, 정확히 head로 복귀해야 완료다.
             head = namespace.list
-            if not artifact_core._object_readable(head):
+            if not artifact_core._object_readable(head, diagnostics=diagnostics):
                 raise ValueError("unreadable list head")
             head_address = artifact_core._object_address(head)
             previous, seen, cursor = head_address, {head_address}, head.next
@@ -319,7 +339,9 @@ def file_mount_points(namespace, max_nodes=100000):
                 if (
                     address in seen
                     or len(result) >= max_nodes
-                    or not artifact_core._object_readable(cursor)
+                    or not artifact_core._object_readable(
+                        cursor, diagnostics=diagnostics
+                    )
                 ):
                     raise ValueError("incomplete mount list")
                 seen.add(address)
@@ -328,7 +350,7 @@ def file_mount_points(namespace, max_nodes=100000):
                 mnt = artifact_core.containing_object(
                     namespace, cursor, kind, "mnt_list"
                 )
-                if not artifact_core._object_readable(mnt):
+                if not artifact_core._object_readable(mnt, diagnostics=diagnostics):
                     raise ValueError("unreadable mount")
                 if (
                     mnt.has_member("mnt_ns")
@@ -350,6 +372,7 @@ def file_mount_points(namespace, max_nodes=100000):
         pending, seen = [namespace.mounts.rb_node], set()
         while pending:
             cursor = pending.pop()
+            address = None
             try:
                 address = artifact_core._object_address(cursor)
                 if not address:
@@ -361,7 +384,7 @@ def file_mount_points(namespace, max_nodes=100000):
                     issues += 1
                     break
                 seen.add(address)
-                if not artifact_core._object_readable(cursor):
+                if not artifact_core._object_readable(cursor, diagnostics=diagnostics):
                     issues += 1
                     continue
                 node = cursor.dereference()
@@ -370,12 +393,19 @@ def file_mount_points(namespace, max_nodes=100000):
                         child = node.member(child_name)
                         if artifact_core._object_address(child):
                             pending.append(child)
-                    except artifact_core.READ_ERRORS:
+                    except artifact_core.READ_ERRORS as exc:
+                        artifact_core.record_read_error(
+                            diagnostics,
+                            "mount.rb_child",
+                            exc,
+                            node_address=address,
+                            field=child_name,
+                        )
                         issues += 1
                 mnt = artifact_core.containing_object(
                     namespace, cursor, "mount", "mnt_node"
                 )
-                if not artifact_core._object_readable(mnt):
+                if not artifact_core._object_readable(mnt, diagnostics=diagnostics):
                     raise ValueError("unreadable mount")
                 if (
                     mnt.has_member("mnt_ns")
@@ -383,17 +413,21 @@ def file_mount_points(namespace, max_nodes=100000):
                 ):
                     raise ValueError("mount namespace mismatch")
                 result.append(mnt)
-            except artifact_core.READ_ERRORS:
+            except artifact_core.READ_ERRORS as exc:
+                artifact_core.record_read_error(
+                    diagnostics, "mount.rb_node", exc, node_address=address
+                )
                 issues += 1
         return result, "COMPLETE" if not issues else f"PARTIAL:mount-nodes={issues}"
     except artifact_core.READ_ERRORS as exc:
+        artifact_core.record_read_error(diagnostics, "mount.enumeration", exc)
         return result, "PARTIAL:mount-list:" + type(exc).__name__
 
 
-def namespace_covering(mnt_ns):
+def namespace_covering(mnt_ns, *, diagnostics=None):
     """프로세스 경로 위에 다른 마운트가 덮여 있는지 확인할 인덱스."""
     result, complete, known = {}, True, set()
-    mount_list, status = file_mount_points(mnt_ns)
+    mount_list, status = file_mount_points(mnt_ns, diagnostics=diagnostics)
     complete = status == "COMPLETE"
     for mnt in mount_list:
         try:
@@ -404,12 +438,13 @@ def namespace_covering(mnt_ns):
             known.add(current)
             if current != parent:
                 point = mnt.get_mnt_mountpoint()
-                if not artifact_core._object_readable(point):
+                if not artifact_core._object_readable(point, diagnostics=diagnostics):
                     raise ValueError("unreadable mountpoint")
                 result.setdefault(
                     (parent, artifact_core._object_address(point)), set()
                 ).add(current)
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
+            artifact_core.record_read_error(diagnostics, "mount.covering", exc)
             complete = False
     if any(parent not in known for parent, _ in result):
         complete = False

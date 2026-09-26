@@ -100,6 +100,50 @@ class InconsistentData(ValueError):
     """Successfully read fields fail a structural consistency check."""
 
 
+def exception_chain(exc):
+    """Walk explicit causes or unsuppressed contexts, stopping at cycles."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+
+
+def exception_detail(exc):
+    """Keep the original message and memory addresses from every causal level."""
+    parts = []
+    for index, current in enumerate(exception_chain(exc)):
+        message = str(current)
+        if isinstance(current, exceptions.InvalidAddressException):
+            message += (
+                f" layer_name={current.layer_name}"
+                f" invalid_address={current.invalid_address:#x}"
+            )
+        if index:
+            message = f"cause/context {type(current).__name__}: {message}"
+        if message:
+            parts.append(message.strip())
+    return "; ".join(parts) or type(exc).__name__
+
+
+def exception_text(exc):
+    """A standalone diagnostic, including the outer exception type."""
+    return f"{type(exc).__name__}: {exception_detail(exc)}"
+
+
+def record_read_error(diagnostics, stage, exc, **context):
+    """Append a serializable read failure without reading more kernel memory."""
+    if diagnostics is not None:
+        diagnostics.append(
+            {
+                "stage": stage,
+                "exception": type(exc).__name__,
+                "detail": exception_detail(exc),
+                **context,
+            }
+        )
+
+
 def member(obj, name):
     if not obj.has_member(name):
         raise UnsupportedLayout("Member " + name + " is absent from the symbols")
@@ -111,14 +155,16 @@ def capture(observations, feature, fn, layout=None):
     try:
         value = fn()
     except UnsupportedLayout as exc:
-        observations.append(observation(feature, "unsupported", str(exc), layout))
+        observations.append(
+            observation(feature, "unsupported", exception_detail(exc), layout)
+        )
     except InconsistentData as exc:
-        observations.append(observation(feature, "inconsistent", str(exc), layout))
+        observations.append(
+            observation(feature, "inconsistent", exception_detail(exc), layout)
+        )
     except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
         observations.append(
-            observation(
-                feature, "read_error", type(exc).__name__ + ": " + str(exc), layout
-            )
+            observation(feature, "read_error", exception_text(exc), layout)
         )
     else:
         observations.append(observation(feature, "ok", "Read from memory", layout))
@@ -141,13 +187,15 @@ def _object_address(obj) -> int:
         return int(obj.vol.offset)
 
 
-def _object_readable(obj) -> bool:
+def _object_readable(obj, *, diagnostics=None) -> bool:
     """Validate pointer targets and embedded structs with their own layer APIs.
 
     Pointer.is_readable() checks the pointed-to object.  Embedded StructType
     objects (for example mount.mnt and list heads) do not provide that method;
     their storage range must be checked in their layer instead.  Do not treat
-    an absent pointer-only method as unreadable memory.
+    an absent pointer-only method as unreadable memory. Caught exceptions are
+    copied to the optional diagnostic sink before returning False; a normal
+    negative validity check does not fabricate an exception or fault address.
     """
 
     try:
@@ -169,7 +217,8 @@ def _object_readable(obj) -> bool:
         ValueError,
         exceptions.InvalidAddressException,
         exceptions.VolatilityException,
-    ):
+    ) as exc:
+        record_read_error(diagnostics, "object.readable", exc)
         return False
 
 

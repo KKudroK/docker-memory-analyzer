@@ -38,7 +38,7 @@ from volatility3.plugins.linux._artifacts import timing as timing_readers
 vollog = logging.getLogger(__name__)
 # This function backend has no PluginInterface class; version its evidence
 # from one tuple. 2.x marks the task-linked summary replacing lifecycle output.
-VERSION = (2, 0, 2)
+VERSION = (2, 0, 3)
 LIMIT = 100000
 FILE_LIMIT = 16 * 1024 * 1024
 SETTINGS_MOUNT_LIMIT = 2048
@@ -315,7 +315,7 @@ class Collector(artifact_core.CollectionSession):
                 "address": address,
                 "kind": kind,
                 "exception": type(exc).__name__,
-                "detail": str(exc),
+                "detail": artifact_core.exception_detail(exc),
             }
         )
 

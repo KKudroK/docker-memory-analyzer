@@ -53,7 +53,7 @@ from volatility3.plugins.linux._artifacts import timing as timing_readers
 
 LOG = logging.getLogger(__name__)
 # 2.x changes the default task table and the triage columns/filter semantics.
-VERSION_INFO = (2, 0, 2)
+VERSION_INFO = (2, 0, 7)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
 
@@ -64,6 +64,14 @@ FULL_ID = re.compile(r"[0-9a-fA-F]{64}\Z")
 HEX64 = re.compile(r"[0-9a-fA-F]{64}")
 SHORT_ID_LEN = 12
 CMDLINE_MAX = 48
+
+
+def read_error_text(feature, task_address, exc):
+    """Preserve read diagnostics; use None when no failing task is known."""
+    location = feature
+    if task_address is not None:
+        location += f" task={task_address:#x}"
+    return f"{location}: {artifact_core.exception_text(exc)}"
 
 
 def short_id(value):
@@ -212,9 +220,16 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             readers["layout"]["membership"] = {
                 "feature": "container_membership",
                 "status": "unsupported",
-                "reason": str(exc),
+                "reason": read_error_text("container_membership.layout", None, exc),
             }
         readers["security"] = credential_readers.SecurityReader(self.context, module)
+        security_observations = [
+            dict(item)
+            for item in readers["security"].observations
+            if item.get("status") != "ok"
+        ]
+        if security_observations:
+            readers["layout"]["security"] = security_observations
         try:
             readers["timing"] = _Timing(self.context, self.config["kernel"])
         except Exception as exc:  # noqa: BLE001
@@ -222,7 +237,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             readers["layout"]["timing"] = {
                 "feature": "process_timing",
                 "status": "read_error",
-                "reason": str(exc),
+                "reason": read_error_text("process_timing.layout", None, exc),
             }
         try:
             readers["layout"]["pid_namespace"] = (
@@ -231,15 +246,15 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 )
             )
         except Exception as exc:  # noqa: BLE001
-            readers["layout"]["pid_namespace"] = getattr(
-                exc,
-                "compatibility",
-                {
-                    "feature": "pid_namespace",
-                    "status": "unsupported",
-                    "reason": str(exc),
-                },
+            compatibility = dict(
+                getattr(
+                    exc,
+                    "compatibility",
+                    {"feature": "pid_namespace", "status": "unsupported"},
+                )
             )
+            compatibility["reason"] = read_error_text("pid_namespace.layout", None, exc)
+            readers["layout"]["pid_namespace"] = compatibility
         return readers
 
     # ---- 조상 체인 추적 (구 10번) --------------------------------------------
@@ -247,6 +262,25 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
     @staticmethod
     def _ancestors(task, limit=ANCESTRY_LIMIT):
         return task_readers.ancestor_chain(task, limit=limit)
+
+    @staticmethod
+    def _ancestry_observations(task_address, ancestry):
+        """Attribute traversal errors without losing the failed parent or layer."""
+        observations = []
+        for error in ancestry.errors:
+            feature = f"ancestry.{error.operation}"
+            if error.address is not None:
+                feature += f" node={error.address:#x}"
+            observations.append(
+                {
+                    "feature": "ancestry",
+                    "status": "incomplete"
+                    if isinstance(error.exception, artifact_core.Incomplete)
+                    else "read_error",
+                    "reason": read_error_text(feature, task_address, error.exception),
+                }
+            )
+        return observations
 
     def _cgroup_container_id(self, task, readers, *, errors):
         """태스크 cgroup의 Docker 소속 ID만 뽑는다(없으면 None).
@@ -259,9 +293,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         try:
             _cset, _cgroup, _chain, group = readers["resolver"].resolve(task)
         except Exception as exc:  # noqa: BLE001 - 후보 판독 실패를 기록하고 다음 태스크를 수집한다.
-            errors.append(
-                f"container_membership task={task.vol.offset:#x}: {type(exc).__name__}: {exc}"
-            )
+            errors.append(read_error_text("container_membership", task.vol.offset, exc))
             return None
         return group["id"] if group else None
 
@@ -273,6 +305,11 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         로직: 인자를 shim_arguments로 해석해 ID·namespace를 얻고 shim 자신의 cgroup
         ID도 함께 읽어, 소속 교차 검증의 근거로 보존한다.
         """
+        pid = None
+        try:
+            pid = int(task.tgid)
+        except artifact_core.READ_ERRORS as exc:
+            errors.append(read_error_text("shim_pid", address, exc))
         try:
             argv = docker_artifacts.DockerArtifacts.read_task_argv(
                 self.context,
@@ -290,11 +327,11 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         ) as exc:
             # A read failure is not evidence that the shim omitted its ID flags.
             # Keep the failure even when this task is excluded from later views.
-            reason = f"shim_argv task={address:#x}: {type(exc).__name__}: {exc}"
+            reason = read_error_text("shim_argv", address, exc)
             errors.append(reason)
             return {
                 "task": hex(address),
-                "pid": int(task.tgid),
+                "pid": pid,
                 "container_id": None,
                 "runtime_namespace": None,
                 "argv": [],
@@ -307,7 +344,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         except ValueError as exc:
             return {
                 "task": hex(address),
-                "pid": int(task.tgid),
+                "pid": pid,
                 "container_id": None,
                 "runtime_namespace": None,
                 "argv": argv,
@@ -317,7 +354,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             }
         return {
             "task": hex(address),
-            "pid": int(task.tgid),
+            "pid": pid,
             "container_id": cid,
             "runtime_namespace": namespace,
             "argv": argv,
@@ -328,7 +365,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
 
     # ---- 태스크 상세 (구 9번) + 교차 검증 (구 10번) --------------------------
 
-    def _task_detail(self, task, readers, module, shims):
+    def _task_detail(self, task, readers, module, shims, *, ancestry=None):
         """한 태스크의 상세 값과 조상·shim 계보·소속 교차 검증 결과를 모은다.
 
         로직: 호스트/네임스페이스 PID, 부모 PID, 명령행, 시작 시각, EUID, capability,
@@ -337,8 +374,8 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         address = int(task.vol.offset)
         detail = {
             "TaskAddress": hex(address),
-            "HostPID": int(task.tgid),
-            "HostTID": int(task.pid),
+            "HostPID": None,
+            "HostTID": None,
             "PPID": None,
             "Name": None,
             "Cmdline": None,
@@ -362,16 +399,33 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             "observations": [],
         }
 
+        def record_error(feature, exc):
+            """Keep independent fields while recording why this task is partial."""
+            detail["Status"] = "partial"
+            detail["observations"].append(
+                {
+                    "feature": feature,
+                    "status": "read_error",
+                    "reason": read_error_text(feature, address, exc),
+                }
+            )
+
+        for field, member in (("HostPID", "tgid"), ("HostTID", "pid")):
+            try:
+                detail[field] = int(getattr(task, member))
+            except artifact_core.READ_ERRORS as exc:
+                record_error(field, exc)
+
         try:
             detail["Name"] = utility.array_to_string(task.comm)
-        except (exceptions.VolatilityException, ValueError, AttributeError):
-            detail["Status"] = "partial"
+        except (exceptions.VolatilityException, ValueError, AttributeError) as exc:
+            record_error("task_name", exc)
 
         try:
             if int(task.real_parent):
                 detail["PPID"] = int(task.real_parent.dereference().tgid)
-        except (exceptions.VolatilityException, ValueError, AttributeError):
-            detail["Status"] = "partial"
+        except (exceptions.VolatilityException, ValueError, AttributeError) as exc:
+            record_error("parent_pid", exc)
 
         # 명령행·시작 시각 (구 9번)
         try:
@@ -385,8 +439,13 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     native_layer_name=task.vol.native_layer_name,
                 )
             )
-        except (exceptions.VolatilityException, ValueError, AttributeError, TypeError):
-            detail["Status"] = "partial"
+        except (
+            exceptions.VolatilityException,
+            ValueError,
+            AttributeError,
+            TypeError,
+        ) as exc:
+            record_error("task_argv", exc)
         if readers["timing"] is not None:
             try:
                 detail["StartUTC"] = readers["timing"].process_start(task).isoformat()
@@ -395,8 +454,8 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 ValueError,
                 AttributeError,
                 TypeError,
-            ):
-                detail["Status"] = "partial"
+            ) as exc:
+                record_error("process_start", exc)
 
         # PID namespace 계층 (구 9번, 소속 PID/TID 연결)
         try:
@@ -421,10 +480,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 x["id"] for x in leader_chain if x["namespace"] == detail["PIDNS"]
             )
         except Exception as exc:  # noqa: BLE001
-            detail["Status"] = "partial"
-            detail["observations"].append(
-                {"feature": "pid_namespace", "status": "read_error", "reason": str(exc)}
-            )
+            record_error("pid_namespace", exc)
 
         # EUID·capability·user namespace (구 9번)
         security = readers["security"]
@@ -435,14 +491,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 try:
                     security.enrich_identity(credentials, cred)
                 except Exception as exc:  # noqa: BLE001 - 보강 실패를 기록하고 capability 판독은 보존한다.
-                    detail["Status"] = "partial"
-                    detail["observations"].append(
-                        {
-                            "feature": "credentials.identity",
-                            "status": "read_error",
-                            "reason": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
+                    record_error("credentials.identity", exc)
                 detail["EUID"] = credentials.get("ids_kernel", {}).get("euid")
                 detail["capabilities"] = credentials.get("capabilities", {})
                 detail["cap_effective"] = detail["capabilities"].get("cap_effective")
@@ -451,16 +500,15 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 ns_chain = scope.get("chain_leaf_to_initial") or []
                 if ns_chain:
                     detail["UserNS"] = ns_chain[0].get("inum")
-                if any(
-                    item.get("status") != "ok"
-                    for item in credentials.get("observations", [])
-                ):
+                for item in credentials.get("observations", []):
+                    if item.get("status") == "ok":
+                        continue
+                    observation = dict(item, source="credentials")
+                    if observation not in detail["observations"]:
+                        detail["observations"].append(observation)
                     detail["Status"] = "partial"
         except Exception as exc:  # noqa: BLE001
-            detail["Status"] = "partial"
-            detail["observations"].append(
-                {"feature": "credentials", "status": "read_error", "reason": str(exc)}
-            )
+            record_error("credentials", exc)
 
         # cgroup 경로·소속 ID (구 9번 경로 + 구 10번 cgroup 근거)
         cgroup_cid = None
@@ -477,20 +525,19 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     detail["ContainerID"] = group["id"]
                     detail["ContainerRoot"] = group["root_address"]
             except Exception as exc:  # noqa: BLE001
-                detail["Status"] = "partial"
-                detail["observations"].append(
-                    {
-                        "feature": "container_membership",
-                        "status": "read_error",
-                        "reason": str(exc),
-                    }
-                )
+                record_error("container_membership", exc)
 
         # 조상 체인·shim 계보 (구 10번)
-        ancestry = self._ancestors(task)
-        detail["ancestry"] = ancestry
+        if ancestry is None:
+            ancestry = self._ancestors(task)
+        detail["ancestry"] = ancestry.records
+        if ancestry.errors:
+            detail["Status"] = "partial"
+            detail["observations"].extend(
+                self._ancestry_observations(address, ancestry)
+            )
         shim_lineage = None
-        for depth, node in enumerate(ancestry):
+        for depth, node in enumerate(ancestry.records):
             shim = shims.get(node["address"])
             if shim is not None:
                 shim_lineage = {
@@ -650,8 +697,15 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 tasks.append(task)
                 try:
                     comm = utility.array_to_string(task.comm)
-                except (exceptions.VolatilityException, ValueError, AttributeError):
+                except (
+                    exceptions.VolatilityException,
+                    ValueError,
+                    AttributeError,
+                ) as exc:
                     comm = ""
+                    audit["traversal_errors"].append(
+                        read_error_text("task_name", address, exc)
+                    )
                 if comm.startswith(SHIM_PREFIX):
                     record = self._shim_identity(
                         task, readers, address, errors=audit["traversal_errors"]
@@ -659,20 +713,29 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     shims[hex(address)] = record
                     audit["shims"].append(record)
         except Exception as exc:  # noqa: BLE001
-            audit["traversal_errors"].append(str(exc))
+            audit["traversal_errors"].append(
+                read_error_text("task_enumeration", None, exc)
+            )
         audit["enumerated_tasks"] = len(seen)
 
         # 2차 순회: 컨테이너 후보(태스크의 cgroup Docker 소속 또는 shim 조상)만 상세 수집
         for task in tasks:
+            ancestry = self._ancestors(task)
+            audit["traversal_errors"].extend(
+                item["reason"]
+                for item in self._ancestry_observations(int(task.vol.offset), ancestry)
+            )
             has_shim_ancestor = any(
-                node["address"] in shims for node in self._ancestors(task)
+                node["address"] in shims for node in ancestry.records
             )
             cgroup_cid = self._cgroup_container_id(
                 task, readers, errors=audit["traversal_errors"]
             )
             if cgroup_cid is None and not has_shim_ancestor:
                 continue  # 호스트 태스크: 컨테이너 후보가 아니다.
-            audit["tasks"].append(self._task_detail(task, readers, module, shims))
+            audit["tasks"].append(
+                self._task_detail(task, readers, module, shims, ancestry=ancestry)
+            )
         audit["candidate_tasks"] = len(audit["tasks"])
         audit["conflict_tasks"] = sum(
             1
@@ -731,7 +794,13 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             displayed = [t for t in displayed if self._is_mismatch(t)]
         displayed = sorted(
             displayed,
-            key=lambda t: (t["ContainerID"] or "", t["HostPID"], t["HostTID"]),
+            key=lambda t: (
+                t["ContainerID"] or "",
+                t["HostPID"] is None,
+                t["HostPID"] or 0,
+                t["HostTID"] is None,
+                t["HostTID"] or 0,
+            ),
         )
         audit["displayed_tasks"] = len(displayed)
 
@@ -988,7 +1057,10 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     tuple(
                         self._cell(v)
                         for v in (
-                            f"{task['HostPID']} / {task['HostTID']}",
+                            " / ".join(
+                                str(task[field]) if task[field] is not None else "N/A"
+                                for field in ("HostPID", "HostTID")
+                            ),
                             task["Name"],
                             short_id(cgroup_id),
                             lineage.get("shim_pid"),

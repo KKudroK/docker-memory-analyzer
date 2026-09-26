@@ -31,7 +31,7 @@ from volatility3.plugins.linux._artifacts import tasks as task_readers
 
 vollog = logging.getLogger(__name__)
 # Changed output supersedes both the 2.x format and the earlier 3.1.0 lineage.
-VERSION = (4, 0, 2)
+VERSION = (4, 0, 3)
 EVIDENCE_SAMPLES = 3
 ERROR_SAMPLES_PER_STAGE = 3
 BRIDGE_NAME = re.compile(r"^br-[0-9a-f]{12}$")
@@ -228,7 +228,7 @@ class Collector(artifact_core.CollectionSession):
                 "address": address,
                 "kind": kind,
                 "exception": type(exc).__name__,
-                "detail": str(exc),
+                "detail": artifact_core.exception_detail(exc),
             }
         )
 

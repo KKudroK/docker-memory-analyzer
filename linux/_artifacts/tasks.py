@@ -1,5 +1,7 @@
 """Task-list strategies and argv readers, with explicit legacy policies."""
 
+from __future__ import annotations
+
 import dataclasses
 import re
 
@@ -66,7 +68,7 @@ def audit_task_list(head, read_link, limit=100000):
                             "direction": direction,
                             "kind": "UNREADABLE_BACKLINK",
                             "node": hex(current),
-                            "detail": str(exc),
+                            "detail": artifact_core.exception_detail(exc),
                         }
                     )
                 previous, current = current, link(current, field)
@@ -85,7 +87,7 @@ def audit_task_list(head, read_link, limit=100000):
                 {
                     "direction": direction,
                     "kind": "TRAVERSAL_STOPPED",
-                    "detail": str(exc),
+                    "detail": artifact_core.exception_detail(exc),
                 }
             )
         result["directions"][direction] = {
@@ -227,52 +229,78 @@ def shim_arguments(args):
     return cid, next(iter(namespaces), None)
 
 
-def ancestor_chain(task, limit=512):
-    """real_parent 포인터를 따라 init/PID 1까지 조상 체인을 복원한다.
+@dataclasses.dataclass(frozen=True)
+class AncestryError:
+    """An internal traversal failure; the caller serializes the original exception."""
 
-    로직: real_parent를 거슬러 오르며 주소·PID·명령을 기록한다. NULL·자기참조·
-    순환·한도 도달·PID 1에서 멈춘다. 반환은 가까운 조상부터의 순서다.
+    operation: str
+    address: int | None
+    exception: Exception
+
+
+@dataclasses.dataclass
+class AncestryResult:
+    """Recovered ancestors, nearest first, and any reason traversal stopped early."""
+
+    records: list[dict] = dataclasses.field(default_factory=list)
+    errors: list[AncestryError] = dataclasses.field(default_factory=list)
+
+
+def ancestor_chain(task, limit=512):
+    """Retain a readable prefix and report faults, cycles and traversal limits.
+
+    Null/self parent pointers and a recovered PID 1 are normal endpoints.
+    A known parent address is retained even if dereferencing or reading its
+    fields fails. Errors remain local to this task's ancestry traversal.
     """
-    chain, seen = [], set()
+    result = AncestryResult()
+    seen = set()
     current = task
     while True:
-        address = int(current.vol.offset)
-        if address in seen or len(seen) >= limit:
-            break
-        seen.add(address)
+        address = None
+        operation = "task.address"
+        record = None
         try:
+            address = int(current.vol.offset)
+            operation = "cycle"
+            if address in seen:
+                raise artifact_core.Incomplete("Repeated task in ancestor chain")
+            operation = "limit"
+            if len(seen) >= limit:
+                raise artifact_core.Incomplete(
+                    f"Ancestor traversal limit reached: {limit}"
+                )
+            seen.add(address)
+            operation = "real_parent"
             parent_ptr = current.real_parent
-        except (exceptions.VolatilityException, AttributeError):
-            break
-        if not int(parent_ptr):
-            break
-        parent_address = int(parent_ptr)
-        if parent_address == address:  # init_task는 자기 자신을 부모로 가진다.
-            break
-        parent = parent_ptr.dereference()
-        try:
+            operation = "real_parent.address"
+            parent_address = int(parent_ptr)
+            if not parent_address or parent_address == address:
+                break
             record = {
                 "address": hex(parent_address),
-                "pid": int(parent.tgid),
-                "tid": int(parent.pid),
-                "comm": utility.array_to_string(parent.comm),
+                "pid": None,
+                "tid": None,
+                "comm": None,
             }
-        except (exceptions.VolatilityException, ValueError, AttributeError):
-            chain.append(
-                {
-                    "address": hex(parent_address),
-                    "pid": None,
-                    "tid": None,
-                    "comm": None,
-                    "unreadable": True,
-                }
-            )
+            result.records.append(record)
+            operation = "real_parent.dereference"
+            parent = parent_ptr.dereference()
+            operation = "parent.tgid"
+            record["pid"] = int(parent.tgid)
+            operation = "parent.pid"
+            record["tid"] = int(parent.pid)
+            operation = "parent.comm"
+            record["comm"] = utility.array_to_string(parent.comm)
+        except artifact_core.READ_ERRORS as exc:
+            if record is not None:
+                record["unreadable"] = True
+            result.errors.append(AncestryError(operation, address, exc))
             break
-        chain.append(record)
         if record["pid"] == 1:
             break
         current = parent
-    return chain
+    return result
 
 
 def comm_matches(comm, signature):

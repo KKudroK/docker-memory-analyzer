@@ -172,7 +172,8 @@ def _kernel_range(module, storage_bits=64):
                 integer_type = module.get_type("int")
             except exceptions.SymbolError as exc:
                 raise artifact_core.UnsupportedLayout(
-                    "Untyped cap_last_cap requires an available int type: " + str(exc)
+                    "Untyped cap_last_cap requires an available int type: "
+                    + artifact_core.exception_detail(exc)
                 ) from exc
             # Linux의 cap_last_cap은 int다. 현재 지원하는 x86-64의 signed 32-bit
             # 형식인지 먼저 확인하고, 주소·모듈 재배치는 Volatility API에 맡긴다.
@@ -244,7 +245,10 @@ def _kernel_range(module, storage_bits=64):
             None,
             None,
             artifact_core.observation(
-                "capability_kernel_range", "unsupported", str(exc), **details
+                "capability_kernel_range",
+                "unsupported",
+                artifact_core.exception_detail(exc),
+                **details,
             ),
         )
     except exceptions.SymbolError as exc:
@@ -265,7 +269,7 @@ def _kernel_range(module, storage_bits=64):
             artifact_core.observation(
                 "capability_kernel_range",
                 "read_error",
-                f"Cannot read cap_last_cap: {exc}",
+                f"Cannot read cap_last_cap: {artifact_core.exception_text(exc)}",
                 **details,
             ),
         )
@@ -278,7 +282,7 @@ def _kernel_range(module, storage_bits=64):
             artifact_core.observation(
                 "capability_kernel_range",
                 "read_error",
-                f"Cannot read cap_last_cap: {type(exc).__name__}: {exc}",
+                f"Cannot read cap_last_cap: {artifact_core.exception_text(exc)}",
                 **details,
             ),
         )
@@ -506,13 +510,17 @@ class SecurityReader:
         except artifact_core.UnsupportedLayout as exc:
             self.observations.append(
                 artifact_core.observation(
-                    "user_namespace.initial", "unsupported", str(exc)
+                    "user_namespace.initial",
+                    "unsupported",
+                    artifact_core.exception_detail(exc),
                 )
             )
         except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
             self.observations.append(
                 artifact_core.observation(
-                    "user_namespace.initial", "read_error", str(exc)
+                    "user_namespace.initial",
+                    "read_error",
+                    artifact_core.exception_text(exc),
                 )
             )
 
@@ -621,21 +629,27 @@ class SecurityReader:
             except artifact_core.UnsupportedLayout as exc:
                 observations.append(
                     artifact_core.observation(
-                        "user_namespace.parent_chain", "unsupported", str(exc)
+                        "user_namespace.parent_chain",
+                        "unsupported",
+                        artifact_core.exception_detail(exc),
                     )
                 )
                 break
             except artifact_core.InconsistentData as exc:
                 observations.append(
                     artifact_core.observation(
-                        "user_namespace.parent_chain", "inconsistent", str(exc)
+                        "user_namespace.parent_chain",
+                        "inconsistent",
+                        artifact_core.exception_detail(exc),
                     )
                 )
                 break
             except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
                 observations.append(
                     artifact_core.observation(
-                        "user_namespace.parent_chain", "read_error", str(exc)
+                        "user_namespace.parent_chain",
+                        "read_error",
+                        artifact_core.exception_text(exc),
                     )
                 )
                 break
@@ -709,14 +723,18 @@ class SecurityReader:
                     exc, "capability_evidence", None
                 )
                 observations.append(
-                    artifact_core.observation(name, "unsupported", str(exc))
+                    artifact_core.observation(
+                        name, "unsupported", artifact_core.exception_detail(exc)
+                    )
                 )
             except ValueError as exc:
                 result["capability_evidence"][name] = getattr(
                     exc, "capability_evidence", None
                 )
                 observations.append(
-                    artifact_core.observation(name, "inconsistent", str(exc))
+                    artifact_core.observation(
+                        name, "inconsistent", artifact_core.exception_detail(exc)
+                    )
                 )
             except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
                 result["capability_evidence"][name] = getattr(
@@ -724,7 +742,7 @@ class SecurityReader:
                 )
                 observations.append(
                     artifact_core.observation(
-                        name, "read_error", type(exc).__name__ + ": " + str(exc)
+                        name, "read_error", artifact_core.exception_text(exc)
                     )
                 )
             else:

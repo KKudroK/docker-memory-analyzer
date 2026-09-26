@@ -13,6 +13,7 @@ mount command.  Read failures and multiple aliases are preserved explicitly.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import re
 from collections.abc import Sequence
@@ -140,6 +141,7 @@ def _walk_mount_path(
     max_depth=4096,
     covering_mounts=None,
     require_live_inode=True,
+    diagnostics=None,
 ):
     return path_readers.walk_mount_path(
         root_dentry,
@@ -150,6 +152,7 @@ def _walk_mount_path(
         covering_mounts=covering_mounts,
         require_live_inode=require_live_inode,
         policy=path_readers.MOUNT_PATH,
+        diagnostics=diagnostics,
     )
 
 
@@ -288,7 +291,8 @@ class HostMountResolver:
     when another complete path was found, because alternatives remain unknown.
     """
 
-    def __init__(self, init_task):
+    def __init__(self, init_task, *, diagnostics=None):
+        self.diagnostics = diagnostics
         self._init_task = init_task
         self._host_root_dentry = None
         self._host_root_mnt = None
@@ -299,12 +303,14 @@ class HostMountResolver:
             self._host_root_dentry = init_task.fs.get_root_dentry()
             self._host_root_mnt = init_task.fs.get_root_mnt()
             if not all(
-                obj and artifact_core._object_readable(obj)
+                obj and artifact_core._object_readable(obj, diagnostics=diagnostics)
                 for obj in (self._host_root_dentry, self._host_root_mnt)
             ):
                 raise ValueError("unreadable host root")
             host_namespace = init_task.nsproxy.mnt_ns
-            host_mounts, status = ContainerMounts._mount_points(host_namespace)
+            host_mounts, status = ContainerMounts._mount_points(
+                host_namespace, diagnostics=diagnostics
+            )
             self._index_complete = status == "COMPLETE"
             indexed_vfsmounts = set()
             for host_mnt in host_mounts:
@@ -312,7 +318,8 @@ class HostMountResolver:
                     superblock = host_mnt.get_mnt_sb()
                     host_vfsmnt = host_mnt.get_vfsmnt_current()
                     if not all(
-                        obj and artifact_core._object_readable(obj)
+                        obj
+                        and artifact_core._object_readable(obj, diagnostics=diagnostics)
                         for obj in (superblock, host_vfsmnt)
                     ):
                         self._index_complete = False
@@ -327,7 +334,10 @@ class HostMountResolver:
 
                     parent_vfsmnt = host_mnt.get_vfsmnt_parent()
                     if not (
-                        parent_vfsmnt and artifact_core._object_readable(parent_vfsmnt)
+                        parent_vfsmnt
+                        and artifact_core._object_readable(
+                            parent_vfsmnt, diagnostics=diagnostics
+                        )
                     ):
                         self._index_complete = False
                         continue
@@ -335,7 +345,12 @@ class HostMountResolver:
                     if parent_address == mount_address:
                         continue
                     mountpoint = host_mnt.get_mnt_mountpoint()
-                    if not (mountpoint and artifact_core._object_readable(mountpoint)):
+                    if not (
+                        mountpoint
+                        and artifact_core._object_readable(
+                            mountpoint, diagnostics=diagnostics
+                        )
+                    ):
                         self._index_complete = False
                         continue
                     key = (parent_address, artifact_core._object_address(mountpoint))
@@ -346,7 +361,10 @@ class HostMountResolver:
                     ValueError,
                     exceptions.InvalidAddressException,
                     exceptions.VolatilityException,
-                ):
+                ) as exc:
+                    artifact_core.record_read_error(
+                        diagnostics, "host_mount.index", exc
+                    )
                     self._index_complete = False
                     continue
             if (
@@ -365,7 +383,11 @@ class HostMountResolver:
             exceptions.InvalidAddressException,
             exceptions.VolatilityException,
         ) as exc:
-            vollog.warning("Host mount namespace index is incomplete: %s", exc)
+            artifact_core.record_read_error(diagnostics, "host_mount.setup", exc)
+            vollog.warning(
+                "Host mount namespace index is incomplete: %s",
+                artifact_core.exception_text(exc),
+            )
         if not self._index_complete:
             vollog.warning(
                 "Host mount index is incomplete; host path results are PARTIAL"
@@ -377,9 +399,13 @@ class HostMountResolver:
             source_dentry = mnt.get_mnt_root()
             if not (
                 superblock
-                and artifact_core._object_readable(superblock)
+                and artifact_core._object_readable(
+                    superblock, diagnostics=self.diagnostics
+                )
                 and source_dentry
-                and artifact_core._object_readable(source_dentry)
+                and artifact_core._object_readable(
+                    source_dentry, diagnostics=self.diagnostics
+                )
             ):
                 return path_readers.SourceResolution((), PATH_PARTIAL)
             host_mounts = self._by_superblock.get(
@@ -391,7 +417,8 @@ class HostMountResolver:
             ValueError,
             exceptions.InvalidAddressException,
             exceptions.VolatilityException,
-        ):
+        ) as exc:
+            artifact_core.record_read_error(self.diagnostics, "host_mount.resolve", exc)
             return path_readers.SourceResolution((), PATH_PARTIAL)
 
         resolved = set()
@@ -404,6 +431,7 @@ class HostMountResolver:
                     source_dentry,
                     host_mnt.get_vfsmnt_current(),
                     covering_mounts=self._covering_mounts,
+                    diagnostics=self.diagnostics,
                 )
                 if status == "COMPLETE":
                     resolved.add(path)
@@ -415,7 +443,10 @@ class HostMountResolver:
                 ValueError,
                 exceptions.InvalidAddressException,
                 exceptions.VolatilityException,
-            ):
+            ) as exc:
+                artifact_core.record_read_error(
+                    self.diagnostics, "host_mount.path", exc
+                )
                 complete = False
                 continue
 
@@ -430,7 +461,7 @@ class HostMountResolver:
         )
 
 
-def _bounded_dentry_path(dentry, max_depth: int = 4096) -> str:
+def _bounded_dentry_path(dentry, max_depth: int = 4096, *, diagnostics=None) -> str:
     """Filesystem-relative topology, not host visibility or inode liveness.
 
     Used only for mountinfo's root field.  Follow the complete dentry chain
@@ -441,14 +472,20 @@ def _bounded_dentry_path(dentry, max_depth: int = 4096) -> str:
     seen = set()
     try:
         for _ in range(max_depth):
-            if not (dentry and artifact_core._object_readable(dentry)):
+            if not (
+                dentry
+                and artifact_core._object_readable(dentry, diagnostics=diagnostics)
+            ):
                 return ""
             address = artifact_core._object_address(dentry)
             if address in seen:
                 return ""
             seen.add(address)
             parent = dentry.d_parent
-            if not (parent and artifact_core._object_readable(parent)):
+            if not (
+                parent
+                and artifact_core._object_readable(parent, diagnostics=diagnostics)
+            ):
                 return ""
             if artifact_core._object_address(parent) == address:
                 return "/" + "/".join(reversed(parts))
@@ -464,12 +501,15 @@ def _bounded_dentry_path(dentry, max_depth: int = 4096) -> str:
         ValueError,
         exceptions.InvalidAddressException,
         exceptions.VolatilityException,
-    ):
+    ) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.root_path", exc)
         return ""
     return ""
 
 
-def _bounded_dominating_id(mnt, task, max_nodes: int = 4096) -> int | None:
+def _bounded_dominating_id(
+    mnt, task, max_nodes: int = 4096, *, diagnostics=None
+) -> int | None:
     """Closest reachable master peer-group ID, 0 if absent, None if unknown.
 
     Follows fs/pnode.c's get_dominating_id ordering.  Peer links are resolved
@@ -490,7 +530,9 @@ def _bounded_dominating_id(mnt, task, max_nodes: int = 4096) -> int | None:
         visited_nodes = 0
         vmlinux = None
         while current_master:
-            if not artifact_core._object_readable(current_master):
+            if not artifact_core._object_readable(
+                current_master, diagnostics=diagnostics
+            ):
                 return None
             master_address = artifact_core._object_address(current_master)
             if master_address in master_seen:
@@ -504,7 +546,8 @@ def _bounded_dominating_id(mnt, task, max_nodes: int = 4096) -> int | None:
             group_uncertain = False
             while True:
                 if visited_nodes >= max_nodes or not (
-                    peer and artifact_core._object_readable(peer)
+                    peer
+                    and artifact_core._object_readable(peer, diagnostics=diagnostics)
                 ):
                     return None
                 visited_nodes += 1
@@ -520,6 +563,7 @@ def _bounded_dominating_id(mnt, task, max_nodes: int = 4096) -> int | None:
                         root_vfsmnt,
                         peer.get_mnt_root(),
                         peer.get_vfsmnt_current(),
+                        diagnostics=diagnostics,
                     )
                     if status == "COMPLETE":
                         return group_id
@@ -528,7 +572,10 @@ def _bounded_dominating_id(mnt, task, max_nodes: int = 4096) -> int | None:
 
                 share = peer.mnt_share
                 link = share.next
-                if not (link and artifact_core._object_readable(link)):
+                if not (
+                    link
+                    and artifact_core._object_readable(link, diagnostics=diagnostics)
+                ):
                     return None
                 if artifact_core._object_address(
                     link.prev
@@ -561,13 +608,16 @@ def _bounded_dominating_id(mnt, task, max_nodes: int = 4096) -> int | None:
         ValueError,
         exceptions.InvalidAddressException,
         exceptions.VolatilityException,
-    ):
+    ) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.dominating_id", exc)
         return None
 
 
 def _read_mount_info(
     mnt,
     task,
+    *,
+    diagnostics=None,
 ) -> tuple[mountinfo.MountInfoData | None, tuple[str, ...]]:
     """Read upstream mountinfo fields without its unbounded path traversals.
 
@@ -580,7 +630,10 @@ def _read_mount_info(
     issues: list[str] = []
     try:
         superblock = mnt.get_mnt_sb()
-        if not (superblock and artifact_core._object_readable(superblock)):
+        if not (
+            superblock
+            and artifact_core._object_readable(superblock, diagnostics=diagnostics)
+        ):
             return None, ("decode",)
         mnt_id = int(mnt.mnt_id)
     except (
@@ -590,7 +643,8 @@ def _read_mount_info(
         ValueError,
         exceptions.InvalidAddressException,
         exceptions.VolatilityException,
-    ):
+    ) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.decode", exc)
         return None, ("decode",)
 
     def read_field(name, getter, default):
@@ -603,7 +657,8 @@ def _read_mount_info(
             ValueError,
             exceptions.InvalidAddressException,
             exceptions.VolatilityException,
-        ):
+        ) as exc:
+            artifact_core.record_read_error(diagnostics, "mount." + name, exc)
             issues.append(name)
             return default
 
@@ -634,13 +689,14 @@ def _read_mount_info(
     path_status = "INCOMPLETE"
     try:
         root = mnt.get_mnt_root()
-        mount_root_path = _bounded_dentry_path(root)
+        mount_root_path = _bounded_dentry_path(root, diagnostics=diagnostics)
         container_path, path_status = _walk_mount_path(
             task.fs.get_root_dentry(),
             task.fs.get_root_mnt(),
             root,
             mnt.get_vfsmnt_current(),
             require_live_inode=False,
+            diagnostics=diagnostics,
         )
     except (
         AttributeError,
@@ -649,8 +705,8 @@ def _read_mount_info(
         ValueError,
         exceptions.InvalidAddressException,
         exceptions.VolatilityException,
-    ):
-        pass
+    ) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.path", exc)
     # A detached self-parent namespace sentinel is intentionally outside the
     # task root.  This proven absence is not an unreadable-path failure.
     expected_internal_root = (
@@ -677,7 +733,9 @@ def _read_mount_info(
                 issues.append("propagation")
             else:
                 fields.append(f"master:{master_id}")
-                dominating_id = _bounded_dominating_id(mnt, task)
+                dominating_id = _bounded_dominating_id(
+                    mnt, task, diagnostics=diagnostics
+                )
                 if dominating_id is None:
                     issues.append("propagation")
                 elif dominating_id and dominating_id != master_id:
@@ -691,7 +749,8 @@ def _read_mount_info(
         ValueError,
         exceptions.InvalidAddressException,
         exceptions.VolatilityException,
-    ):
+    ) as exc:
+        artifact_core.record_read_error(diagnostics, "mount.propagation", exc)
         issues.append("propagation")
 
     return mountinfo.MountInfoData(
@@ -727,7 +786,7 @@ class ContainerMounts(plugins.PluginInterface):
     hidden = True  # Exposed through linux.docker.Docker --inspect-mounts.
     _required_framework_version = (2, 13, 0)
     # 1.x marks the category/value TreeGrid output contract.
-    _version = (1, 0, 2)
+    _version = (1, 1, 1)
 
     @classmethod
     def get_requirements(cls) -> list[interfaces.configuration.RequirementInterface]:
@@ -770,16 +829,20 @@ class ContainerMounts(plugins.PluginInterface):
         ]
 
     @staticmethod
-    def _observe_task(task) -> TaskObservation | None:
+    def _observe_task(task, *, diagnostics=None) -> TaskObservation | None:
         try:
             if not (
                 task
                 and task.fs
-                and artifact_core._object_readable(task.fs)
+                and artifact_core._object_readable(task.fs, diagnostics=diagnostics)
                 and task.nsproxy
-                and artifact_core._object_readable(task.nsproxy)
+                and artifact_core._object_readable(
+                    task.nsproxy, diagnostics=diagnostics
+                )
                 and task.nsproxy.mnt_ns
-                and artifact_core._object_readable(task.nsproxy.mnt_ns)
+                and artifact_core._object_readable(
+                    task.nsproxy.mnt_ns, diagnostics=diagnostics
+                )
             ):
                 return None
             pid = int(task.pid)
@@ -794,7 +857,8 @@ class ContainerMounts(plugins.PluginInterface):
             TypeError,
             ValueError,
             exceptions.InvalidAddressException,
-        ):
+        ) as exc:
+            artifact_core.record_read_error(diagnostics, "task.view", exc)
             return None
 
         cgroup_issues = set()
@@ -850,13 +914,17 @@ class ContainerMounts(plugins.PluginInterface):
         self,
         tasks: Sequence[object],
         init_task,
+        *,
+        diagnostics=None,
     ) -> dict[int, list[TaskObservation]]:
         wanted = self._requested_pids()
         try:
             host_namespace = init_task.nsproxy.mnt_ns
             host_address = (
                 artifact_core._object_address(host_namespace)
-                if artifact_core._object_readable(host_namespace)
+                if artifact_core._object_readable(
+                    host_namespace, diagnostics=diagnostics
+                )
                 else None
             )
         except (
@@ -864,7 +932,8 @@ class ContainerMounts(plugins.PluginInterface):
             TypeError,
             ValueError,
             exceptions.InvalidAddressException,
-        ):
+        ) as exc:
+            artifact_core.record_read_error(diagnostics, "host_namespace", exc)
             host_address = None
         if wanted is None and host_address is None:
             vollog.warning(
@@ -875,12 +944,20 @@ class ContainerMounts(plugins.PluginInterface):
         found_pids = set()
         failed = 0
         for task in tasks:
+            task_address = None
             try:
+                task_address = int(task.vol.offset)
                 # Do not read every task's cgroups for a manually selected PID.
                 pid = int(task.pid)
                 if wanted is not None and pid not in wanted:
                     continue
-                observation = self._observe_task(task)
+                task_diagnostics = []
+                observation = self._observe_task(task, diagnostics=task_diagnostics)
+                if diagnostics is not None:
+                    diagnostics.extend(
+                        {**item, "task_address": task_address, "pid": pid}
+                        for item in task_diagnostics
+                    )
                 if observation is None:
                     # Kernel threads normally have no filesystem/namespace
                     # view; that is not a damaged mount in automatic mode.
@@ -896,7 +973,10 @@ class ContainerMounts(plugins.PluginInterface):
                 TypeError,
                 ValueError,
                 exceptions.InvalidAddressException,
-            ):
+            ) as exc:
+                artifact_core.record_read_error(
+                    diagnostics, "task.metadata", exc, task_address=task_address
+                )
                 failed += 1
                 continue
             if wanted is not None:
@@ -984,24 +1064,47 @@ class ContainerMounts(plugins.PluginInterface):
         resolver: HostMountResolver,
         mount_cache=None,
         path_cache=None,
+        *,
+        diagnostics=None,
     ) -> tuple[list[MountRecord], str]:
         """Decode a root view; namespace enumeration and host aliases are reusable."""
         mount_cache = {} if mount_cache is None else mount_cache
         path_cache = {} if path_cache is None else path_cache
         namespace_address = artifact_core._object_address(representative.mnt_ns)
         if namespace_address not in mount_cache:
-            mount_cache[namespace_address] = cls._mount_points(representative.mnt_ns)
+            namespace_diagnostics = []
+            mount_cache[namespace_address] = cls._mount_points(
+                representative.mnt_ns, diagnostics=namespace_diagnostics
+            )
+            if diagnostics is not None:
+                diagnostics.extend(
+                    {**item, "namespace_address": namespace_address}
+                    for item in namespace_diagnostics
+                )
         mounts, traversal_status = mount_cache[namespace_address]
         records: list[MountRecord] = []
         error_counts: dict[str, int] = {}
         seen_mounts = set()
         for mnt in mounts:
+            mount_address = None
+            provenance = {
+                "pid": representative.pid,
+                "namespace_address": namespace_address,
+            }
             try:
                 mount_address = artifact_core._object_address(mnt)
+                provenance["mount_address"] = mount_address
                 if mount_address in seen_mounts:
                     continue
                 seen_mounts.add(mount_address)
-                data, issues = _read_mount_info(mnt, representative.task)
+                mount_diagnostics = []
+                data, issues = _read_mount_info(
+                    mnt, representative.task, diagnostics=mount_diagnostics
+                )
+                if diagnostics is not None:
+                    diagnostics.extend(
+                        {**item, **provenance} for item in mount_diagnostics
+                    )
                 for issue in issues:
                     error_counts[issue] = error_counts.get(issue, 0) + 1
                 if data is None:
@@ -1031,7 +1134,10 @@ class ContainerMounts(plugins.PluginInterface):
                         ValueError,
                         exceptions.InvalidAddressException,
                         exceptions.VolatilityException,
-                    ):
+                    ) as exc:
+                        artifact_core.record_read_error(
+                            diagnostics, "mount.root_identity", exc, **provenance
+                        )
                         root_identity_unknown = True
                         error_counts["root-identity"] = (
                             error_counts.get("root-identity", 0) + 1
@@ -1062,7 +1168,10 @@ class ContainerMounts(plugins.PluginInterface):
                 ValueError,
                 exceptions.InvalidAddressException,
                 exceptions.VolatilityException,
-            ):
+            ) as exc:
+                artifact_core.record_read_error(
+                    diagnostics, "mount.decode", exc, **provenance
+                )
                 error_counts["decode"] = error_counts.get("decode", 0) + 1
                 continue
         if error_counts:
@@ -1117,16 +1226,44 @@ class ContainerMounts(plugins.PluginInterface):
         )
 
     def _generator(self, extended: bool):
+        diagnostics = []
+        try:
+            yield from self._generate_rows(extended, diagnostics)
+        finally:
+            if diagnostics:
+                with self.open("containermounts-diagnostics.json") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "plugin_version": self._version,
+                                "diagnostics": diagnostics,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ).encode("utf-8")
+                    )
+
+    def _generate_rows(self, extended: bool, diagnostics):
         manual = self._requested_pids() is not None
         vmlinux = self.context.modules[self.config["kernel"]]
         init_task = vmlinux.object_from_symbol("init_task")
-        tasks = list(
-            docker_artifacts.DockerArtifacts.list_tasks(
-                self.context, self.config["kernel"]
+        tasks = []
+        task_list_partial = False
+        try:
+            # Extend the existing list so an iterator failure preserves its prefix.
+            tasks.extend(
+                docker_artifacts.DockerArtifacts.list_tasks(
+                    self.context, self.config["kernel"]
+                )
             )
-        )
-        namespaces = self._collect_namespaces(tasks, init_task)
-        resolver = HostMountResolver(init_task)
+        except artifact_core.READ_ERRORS as exc:
+            task_list_partial = True
+            artifact_core.record_read_error(diagnostics, "task_list", exc)
+            vollog.warning(
+                "Task collection incomplete: %s", artifact_core.exception_text(exc)
+            )
+        namespaces = self._collect_namespaces(tasks, init_task, diagnostics=diagnostics)
+        resolver = HostMountResolver(init_task, diagnostics=diagnostics)
         mount_cache, path_cache, view_cache = {}, {}, {}
         emitted_views = 0
         for _namespace_address, observations in sorted(namespaces.items()):
@@ -1142,8 +1279,15 @@ class ContainerMounts(plugins.PluginInterface):
                         resolver,
                         mount_cache=mount_cache,
                         path_cache=path_cache,
+                        diagnostics=diagnostics,
                     )
                 records, read_status = view_cache[view_key]
+                if task_list_partial:
+                    read_status = (
+                        "PARTIAL:task-list"
+                        if read_status == "COMPLETE"
+                        else read_status + ",task-list"
+                    )
                 _runtime, container_id, _pod_id, evidence = self._view_metadata(
                     group, manual
                 )

@@ -17,7 +17,7 @@ import unicodedata  # 제어문자를 분류하고 한글 등 문자의 터미�
 BASE = pathlib.Path(__file__).resolve().parent
 # 버전은 여기서만 정의한다. CLI·Volatility 클래스·감사 JSON이 같은 값을 사용한다.
 # 2.x marks the category/value TreeGrid output contract.
-VERSION_INFO = (2, 0, 2)
+VERSION_INFO = (2, 0, 3)
 VERSION = ".".join(map(str, VERSION_INFO))
 # 실행 조건을 기록한다. 버전 번호 허용 목록이나 실제 검증 환경 목록이 아니다.
 # 새 결과에만 저장하며, 과거 결과에 현재 정책을 소급해서 붙이지 않는다.
@@ -1347,12 +1347,11 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
             if isinstance(exc, ValueError)
             else "read_error"
         )
-        cause = exc
-        while cause is not None:
-            if isinstance(cause, exceptions.InvalidAddressException):
-                status = "read_error"
-                break
-            cause = cause.__cause__
+        if any(
+            isinstance(cause, exceptions.InvalidAddressException)
+            for cause in artifact_core.exception_chain(exc)
+        ):
+            status = "read_error"
         cls._observations(
             member,
             audit,
@@ -1361,7 +1360,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 {
                     "feature": feature,
                     "status": status,
-                    "reason": str(exc),
+                    "reason": artifact_core.exception_detail(exc),
                     "exception": type(exc).__name__,
                 }
             ],
@@ -1460,7 +1459,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     (artifact_core.UnsupportedLayoutError, AttributeError, KeyError),
                 )
                 else "read_error",
-                "reason": str(exc),
+                "reason": artifact_core.exception_detail(exc),
             }
         security = credential_readers.SecurityReader(self.context, module)
         try:
@@ -1565,7 +1564,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                             "pid": tgid,
                             "tid": tid,
                             "task": hex(address),
-                            "error": str(exc),
+                            "error": artifact_core.exception_text(exc),
                         }
                     )
                 # 같은 ID 표식이라도 다른 cgroup 객체는 합치지 않는다.
@@ -1665,7 +1664,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     self._failure(member, audit, "thread_count", exc)
                 audit["members" if group else "unresolved_members"].append(member)
         except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
-            audit["traversal_errors"].append(str(exc))
+            audit["traversal_errors"].append(artifact_core.exception_text(exc))
 
         ids = {key[0] for key in found_groups if key[0].startswith(prefix)}
         if prefix and len(ids) > 1:

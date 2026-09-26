@@ -23,6 +23,7 @@ from volatility3.framework import interfaces
 from volatility3.framework.configuration import requirements
 from volatility3.plugins.linux import pslist
 from volatility3.plugins.linux._artifacts import cgroups as cgroup_readers
+from volatility3.plugins.linux._artifacts import core as artifact_core
 from volatility3.plugins.linux._artifacts import credentials as credential_readers
 from volatility3.plugins.linux._artifacts import files as file_readers
 from volatility3.plugins.linux._artifacts import namespaces as namespace_readers
@@ -40,7 +41,7 @@ class DockerArtifacts(
     implementation fixes require PATCH. Underscored helpers are not public API.
     """
 
-    _version = (1, 0, 1)
+    _version = (1, 1, 1)
     _required_framework_version = (2, 28, 0)
 
     @classmethod
@@ -308,6 +309,32 @@ class DockerArtifacts(
         do not hide later descriptors. Issues include skipped slots and unreadable
         tables; consumers must retain them even when the entries list is empty.
         """
+        evidence = cls.read_file_descriptor_evidence(
+            context,
+            kernel_module_name,
+            task_address,
+            limit=limit,
+            layer_name=layer_name,
+            native_layer_name=native_layer_name,
+        )
+        return evidence["entries"], evidence["issues"]
+
+    @classmethod
+    def read_file_descriptor_evidence(
+        cls,
+        context: interfaces.context.ContextInterface,
+        kernel_module_name: str,
+        task_address: int,
+        *,
+        limit: int = 65536,
+        layer_name: str | None = None,
+        native_layer_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Return entries, issue counts and diagnostics with FD/fault provenance.
+
+        Diagnostic messages retain causal exceptions and memory layer/addresses.
+        A failed slot is omitted from entries and does not stop later slots.
+        """
         cls._positive_integer(limit, "limit")
         if limit > file_readers.MAX_FDS:
             raise ValueError("limit exceeds the supported FD table bound")
@@ -319,10 +346,11 @@ class DockerArtifacts(
             layer_name,
             native_layer_name,
         )
+        diagnostics = []
         entries, issues = file_readers.read_fds(
-            context, kernel_module_name, task, limit=limit
+            context, kernel_module_name, task, limit=limit, diagnostics=diagnostics
         )
-        return entries, dict(issues)
+        return {"entries": entries, "issues": dict(issues), "diagnostics": diagnostics}
 
     @classmethod
     def read_credentials(
@@ -355,7 +383,7 @@ class DockerArtifacts(
                     {
                         "feature": "credentials.identity",
                         "status": "read_error",
-                        "reason": f"{type(exc).__name__}: {exc}",
+                        "reason": artifact_core.exception_text(exc),
                     }
                 )
         return {"credentials": result, "reader_observations": reader.observations}
