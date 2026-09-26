@@ -11,11 +11,14 @@ The official Volatility framework and core Linux plugins are not replaced.
 
 import copy
 import importlib
+import logging
 import re
 
 from volatility3.framework import exceptions, interfaces
 from volatility3.framework.configuration import requirements
 from volatility3.plugins.linux import docker_artifacts
+
+vollog = logging.getLogger(__name__)
 
 # Import only the selected backend here. Volatility itself still discovers
 # all .py plugin files at startup, so this is not isolation from every possible
@@ -87,7 +90,7 @@ class Docker(interfaces.plugins.PluginInterface):
     # MAJOR: incompatible inputs/output; MINOR: compatible additions; PATCH:
     # internal fixes. Reset lower components when bumping MAJOR or MINOR.
     # 3.x accounts for category/value output and the revised task views.
-    _version = (3, 0, 2)
+    _version = (3, 0, 3)
 
     @classmethod
     def get_requirements(cls):
@@ -309,7 +312,13 @@ class Docker(interfaces.plugins.PluginInterface):
         return action, overrides
 
     def run(self):
-        action, overrides = self.resolve_options(self.config)
+        try:
+            action, overrides = self.resolve_options(self.config)
+        except exceptions.VolatilityException as exc:
+            # The CLI hides generic VolatilityException messages. Log only
+            # option validation failures here, then preserve failure semantics.
+            vollog.error("Invalid Docker options: %s", exc)
+            raise
         module_name, entry_name = BACKENDS[action]
         try:
             module = importlib.import_module("volatility3.plugins." + module_name)
