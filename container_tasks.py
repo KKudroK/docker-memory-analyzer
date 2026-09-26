@@ -53,7 +53,7 @@ from volatility3.plugins.linux._artifacts import timing as timing_readers
 
 LOG = logging.getLogger(__name__)
 # 2.x changes the default task table and the triage columns/filter semantics.
-VERSION_INFO = (2, 0, 7)
+VERSION_INFO = (2, 0, 8)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
 
