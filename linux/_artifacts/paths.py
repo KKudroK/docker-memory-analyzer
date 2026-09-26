@@ -81,13 +81,14 @@ def walk_mount_path(
     covering_mounts=None,
     require_live_inode=True,
     policy=FILE_PATH,
+    diagnostics=None,
 ):
     """정확한 (mount, dentry) 루트까지 연결된 경로만 반환한다."""
 
     def readable(obj):
         return (
             not policy.require_truthy or bool(obj)
-        ) and artifact_core._object_readable(obj)
+        ) and artifact_core._object_readable(obj, diagnostics=diagnostics)
 
     names, visited, permitted_cover = [], set(), None
     crossed_mount = False
@@ -150,6 +151,7 @@ def walk_mount_path(
             names.append(name)
             dentry = parent
     except policy.errors as exc:
+        artifact_core.record_read_error(diagnostics, "path.walk", exc)
         return "", "INCOMPLETE:" + type(exc).__name__
     return "", "INCOMPLETE:depth-limit"
 
@@ -163,7 +165,8 @@ class SourceResolution:
 class FileHostMountResolver:
     """파일 dentry를 입력받아 캡처된 호스트 마운트의 보이는 별칭을 찾는다."""
 
-    def __init__(self, host_task, *, logger=None):
+    def __init__(self, host_task, *, logger=None, diagnostics=None):
+        self.diagnostics = diagnostics
         self.root_dentry = self.root_mount = None
         self.by_superblock, self.covering = {}, {}
         self.complete = False
@@ -171,11 +174,17 @@ class FileHostMountResolver:
             self.root_dentry = host_task.fs.get_root_dentry()
             self.root_mount = host_task.fs.get_root_mnt()
             if not (
-                artifact_core._object_readable(self.root_dentry)
-                and artifact_core._object_readable(self.root_mount)
+                artifact_core._object_readable(
+                    self.root_dentry, diagnostics=diagnostics
+                )
+                and artifact_core._object_readable(
+                    self.root_mount, diagnostics=diagnostics
+                )
             ):
                 raise ValueError("unreadable host root")
-            points, state = mount_readers.file_mount_points(host_task.nsproxy.mnt_ns)
+            points, state = mount_readers.file_mount_points(
+                host_task.nsproxy.mnt_ns, diagnostics=diagnostics
+            )
             self.complete = state == "COMPLETE"
             indexed = set()
             for mnt in points:
@@ -185,8 +194,10 @@ class FileHostMountResolver:
                         mnt.get_mnt_sb(),
                     )
                     if not (
-                        artifact_core._object_readable(current)
-                        and artifact_core._object_readable(superblock)
+                        artifact_core._object_readable(current, diagnostics=diagnostics)
+                        and artifact_core._object_readable(
+                            superblock, diagnostics=diagnostics
+                        )
                     ):
                         raise ValueError("unreadable mount")
                     address = artifact_core._object_address(current)
@@ -197,39 +208,49 @@ class FileHostMountResolver:
                         artifact_core._object_address(superblock), []
                     ).append(current)
                     parent = mnt.get_vfsmnt_parent()
-                    if not artifact_core._object_readable(parent):
+                    if not artifact_core._object_readable(
+                        parent, diagnostics=diagnostics
+                    ):
                         raise ValueError("unreadable parent")
                     if artifact_core._object_address(parent) != address:
                         point = mnt.get_mnt_mountpoint()
-                        if not artifact_core._object_readable(point):
+                        if not artifact_core._object_readable(
+                            point, diagnostics=diagnostics
+                        ):
                             raise ValueError("unreadable attachment")
                         key = (
                             artifact_core._object_address(parent),
                             artifact_core._object_address(point),
                         )
                         self.covering.setdefault(key, set()).add(address)
-                except artifact_core.READ_ERRORS:
+                except artifact_core.READ_ERRORS as exc:
+                    artifact_core.record_read_error(
+                        diagnostics, "host_mount.index", exc
+                    )
                     self.complete = False
             if artifact_core._object_address(self.root_mount) not in indexed:
                 self.complete = False
             if any(parent not in indexed for parent, _ in self.covering):
                 self.complete = False
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
+            artifact_core.record_read_error(diagnostics, "host_mount.setup", exc)
             self.complete = False
         if not self.complete:
             (logger or logging.getLogger(__name__)).warning(
                 "Host mount topology incomplete; host aliases may be PARTIAL"
             )
 
-    def resolve(self, dentry, vfsmnt):
+    def resolve(self, dentry, vfsmnt, *, diagnostics=None):
+        if diagnostics is None:
+            diagnostics = self.diagnostics
         try:
             if not (
-                artifact_core._object_readable(dentry)
-                and artifact_core._object_readable(vfsmnt)
+                artifact_core._object_readable(dentry, diagnostics=diagnostics)
+                and artifact_core._object_readable(vfsmnt, diagnostics=diagnostics)
             ):
                 raise ValueError("unreadable file path")
             superblock = vfsmnt.get_mnt_sb()
-            if not artifact_core._object_readable(superblock):
+            if not artifact_core._object_readable(superblock, diagnostics=diagnostics):
                 raise ValueError("unreadable superblock")
             if artifact_core._object_address(
                 dentry.d_sb
@@ -238,7 +259,8 @@ class FileHostMountResolver:
             candidates = self.by_superblock.get(
                 artifact_core._object_address(superblock), ()
             )
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
+            artifact_core.record_read_error(diagnostics, "host_mount.resolve", exc)
             return SourceResolution((), "PARTIAL")
         paths, complete = set(), self.complete
         for candidate in candidates:
@@ -248,6 +270,7 @@ class FileHostMountResolver:
                 dentry,
                 candidate,
                 covering_mounts=self.covering,
+                diagnostics=diagnostics,
             )
             if state == "COMPLETE":
                 paths.add(path)

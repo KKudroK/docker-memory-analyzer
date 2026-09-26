@@ -35,6 +35,7 @@ NAME_ONLY는 이름만 확인된 경우다. 정상 FD가 현재 프로세스의 
 
 import collections
 import dataclasses
+import json
 import logging
 import re
 
@@ -187,20 +188,20 @@ def _cgroup_identity(memberships):
     return None, "", False
 
 
-def _observe_task(task):
+def _observe_task(task, *, diagnostics=None):
     try:
         if (
             not task
             or not task.fs
-            or not artifact_core._object_readable(task.fs)
+            or not artifact_core._object_readable(task.fs, diagnostics=diagnostics)
             or not task.nsproxy
-            or not artifact_core._object_readable(task.nsproxy)
+            or not artifact_core._object_readable(task.nsproxy, diagnostics=diagnostics)
         ):
             return None
         mnt_ns = task.nsproxy.mnt_ns
         root_mnt, root_dentry = task.fs.get_root_mnt(), task.fs.get_root_dentry()
         if not all(
-            obj and artifact_core._object_readable(obj)
+            obj and artifact_core._object_readable(obj, diagnostics=diagnostics)
             for obj in (mnt_ns, root_mnt, root_dentry)
         ):
             return None
@@ -209,7 +210,8 @@ def _observe_task(task):
             artifact_core._object_address(root_mnt),
             artifact_core._object_address(root_dentry),
         )
-    except artifact_core.READ_ERRORS:
+    except artifact_core.READ_ERRORS as exc:
+        artifact_core.record_read_error(diagnostics, "task.view", exc)
         return None
     issues = set()
     memberships = cgroup_readers.read_link_memberships(
@@ -283,7 +285,7 @@ class InspectFiles(plugins.PluginInterface):
 
     hidden = True
     _required_framework_version = (2, 28, 0)
-    _version = (0, 3, 4)
+    _version = (0, 4, 1)
 
     @classmethod
     def get_requirements(cls):
@@ -291,7 +293,7 @@ class InspectFiles(plugins.PluginInterface):
             requirements.VersionRequirement(
                 name="docker_artifacts",
                 component=docker_artifacts.DockerArtifacts,
-                version=(1, 0, 1),
+                version=(1, 1, 0),
             ),
             requirements.ModuleRequirement(
                 name="kernel",
@@ -395,7 +397,7 @@ class InspectFiles(plugins.PluginInterface):
             return "details"
         return value or "files"
 
-    def _task_views(self, wanted, prefix):
+    def _task_views(self, wanted, prefix, *, diagnostics=None):
         views, found, seen = {}, set(), set()
         failures = collections.Counter()
         try:
@@ -405,18 +407,22 @@ class InspectFiles(plugins.PluginInterface):
             host_namespace = initial.nsproxy.mnt_ns
             host_namespace_address = (
                 artifact_core._object_address(host_namespace)
-                if artifact_core._object_readable(host_namespace)
+                if artifact_core._object_readable(
+                    host_namespace, diagnostics=diagnostics
+                )
                 else None
             )
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
+            artifact_core.record_read_error(diagnostics, "host_namespace", exc)
             host_namespace_address = None
-        tasks = docker_artifacts.DockerArtifacts.list_tasks(
-            self.context,
-            self.config["kernel"],
-            include_threads=True,
-        )
         try:
+            tasks = docker_artifacts.DockerArtifacts.list_tasks(
+                self.context,
+                self.config["kernel"],
+                include_threads=True,
+            )
             for task in tasks:
+                address = None
                 try:
                     address = artifact_core._object_address(task)
                     if address in seen:
@@ -434,7 +440,13 @@ class InspectFiles(plugins.PluginInterface):
                         if wanted is not None:
                             found.add(tgid)
                         continue
-                    observation = _observe_task(task)
+                    task_diagnostics = []
+                    observation = _observe_task(task, diagnostics=task_diagnostics)
+                    if diagnostics is not None:
+                        diagnostics.extend(
+                            {**item, "task_address": address, "pid": tgid, "tid": tid}
+                            for item in task_diagnostics
+                        )
                     if observation is None and wanted is None:
                         # 자동 모드는 소속 근거를 못 읽은 host task를 컨테이너로 추측하지 않는다.
                         if task.fs and task.nsproxy:
@@ -523,9 +535,13 @@ class InspectFiles(plugins.PluginInterface):
                                 tid,
                                 observation,
                             )
-                except artifact_core.READ_ERRORS:
+                except artifact_core.READ_ERRORS as exc:
+                    artifact_core.record_read_error(
+                        diagnostics, "task_metadata", exc, task_address=address
+                    )
                     failures["task-metadata"] += 1
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
+            artifact_core.record_read_error(diagnostics, "task_list", exc)
             failures["task-list"] += 1
         if wanted is not None and wanted - found:
             vollog.warning(
@@ -552,7 +568,7 @@ class InspectFiles(plugins.PluginInterface):
         )
 
     def _read_fds(self, task, limit):
-        return docker_artifacts.DockerArtifacts.read_file_descriptors(
+        return docker_artifacts.DockerArtifacts.read_file_descriptor_evidence(
             self.context,
             self.config["kernel"],
             int(task.vol.offset),
@@ -562,8 +578,26 @@ class InspectFiles(plugins.PluginInterface):
         )
 
     def _generator(self, output_view):
+        diagnostics = []
+        try:
+            yield from self._generate_rows(output_view, diagnostics)
+        finally:
+            if diagnostics:
+                with self.open("containerfiles-diagnostics.json") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "plugin_version": self._version,
+                                "diagnostics": diagnostics,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ).encode("utf-8")
+                    )
+
+    def _generate_rows(self, output_view, diagnostics):
         wanted, prefix, limit = self._options()
-        views = self._task_views(wanted, prefix)
+        views = self._task_views(wanted, prefix, diagnostics=diagnostics)
         if not views:
             vollog.warning(
                 "No task views selected; use --pids for an explicit known host process"
@@ -574,14 +608,24 @@ class InspectFiles(plugins.PluginInterface):
         )
         kernel = self.context.modules[self.config["kernel"]]
         resolver = path_readers.FileHostMountResolver(
-            kernel.object_from_symbol("init_task"), logger=vollog
+            kernel.object_from_symbol("init_task"),
+            logger=vollog,
+            diagnostics=diagnostics,
         )
         table_cache, file_cache, namespace_cache = {}, {}, {}
         counts = collections.Counter()
         for view in views:
             if view.files_address not in table_cache:
                 table_cache[view.files_address] = self._read_fds(view.task, limit)
-            entries, table_issues = table_cache[view.files_address]
+            table = table_cache[view.files_address]
+            entries, table_issues = table["entries"], table["issues"]
+            provenance = {
+                "pid": view.tgid,
+                "tid": view.tid,
+                "task_address": int(view.task.vol.offset),
+                "files_address": view.files_address,
+            }
+            diagnostics.extend({**item, **provenance} for item in table["diagnostics"])
             if table_issues:
                 vollog.warning(
                     "PID/TID %s/%s FD table incomplete: %s",
@@ -595,26 +639,48 @@ class InspectFiles(plugins.PluginInterface):
                     view.observation.mnt_ns
                 )
                 if namespace_address not in namespace_cache:
+                    namespace_diagnostics = []
                     namespace_cache[namespace_address] = (
-                        mount_readers.namespace_covering(view.observation.mnt_ns)
+                        mount_readers.namespace_covering(
+                            view.observation.mnt_ns, diagnostics=namespace_diagnostics
+                        )
+                    )
+                    diagnostics.extend(
+                        {**item, "namespace_address": namespace_address}
+                        for item in namespace_diagnostics
                     )
                 covering, namespace_complete = namespace_cache[namespace_address]
             try:
                 comm = _safe_text(utility.array_to_string(view.task.comm))
-            except artifact_core.READ_ERRORS:
+            except artifact_core.READ_ERRORS as exc:
+                artifact_core.record_read_error(
+                    diagnostics, "task_name", exc, **provenance
+                )
                 comm = "-"
             for fd, filp in entries:
                 file_address = artifact_core._object_address(filp)
                 if file_address not in file_cache:
                     file_cache[file_address] = file_readers.file_facts(filp, resolver)
                 facts = file_cache[file_address]
+                file_provenance = {**provenance, "fd": fd, "file_address": file_address}
+                diagnostics.extend(
+                    {**item, **file_provenance} for item in facts.diagnostics
+                )
                 if (
                     self.config.get("unlinked-only", False)
                     and facts.state != "UNLINKED"
                 ):
                     continue
+                path_diagnostics = []
                 path, path_status = file_readers.container_path(
-                    view.task, facts, covering, namespace_complete
+                    view.task,
+                    facts,
+                    covering,
+                    namespace_complete,
+                    diagnostics=path_diagnostics,
+                )
+                diagnostics.extend(
+                    {**item, **file_provenance} for item in path_diagnostics
                 )
                 issues = set(view.issues) | set(facts.issues)
                 issues.update(table_issues)

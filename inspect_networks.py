@@ -723,7 +723,7 @@ class Collector(artifact_core.CollectionSession):
                 "stage": stage,
                 "address": hex(obj.vol.offset) if hasattr(obj, "vol") else str(obj),
                 "error": type(exc).__name__,
-                "detail": str(exc),
+                "detail": artifact_core.exception_detail(exc),
             }
         )
 
@@ -1395,7 +1395,7 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
     hidden = True  # Exposed through linux.docker.Docker --inspect-networks.
     _required_framework_version = (2, 22, 0)
     # 12.x marks the category/value TreeGrid output contract.
-    _version = (12, 0, 2)
+    _version = (12, 0, 3)
 
     @classmethod
     def get_requirements(cls):

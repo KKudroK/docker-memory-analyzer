@@ -16,24 +16,26 @@ DCACHE_DISCONNECTED = 0x20
 MAX_FDS = 1048576
 
 
-def access_mode(filp):
+def access_mode(filp, *, diagnostics=None):
     """inode.i_mode(권한)가 아닌 이 열린 file의 접근 모드를 읽는다."""
     try:
         mode = int(filp.f_mode)
         if mode & FMODE_PATH:
             return "PATH"
         return {0: "NONE", 1: "R", 2: "W", 3: "RW"}[mode & 3]
-    except artifact_core.READ_ERRORS:
+    except artifact_core.READ_ERRORS as exc:
+        artifact_core.record_read_error(diagnostics, "file.f_mode", exc)
         try:
             flags = int(filp.f_flags)
             if flags & O_PATH:
                 return "PATH"
             return {0: "R", 1: "W", 2: "RW"}.get(flags & 3, "UNKNOWN")
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
+            artifact_core.record_read_error(diagnostics, "file.f_flags", exc)
             return "UNKNOWN"
 
 
-def name_state(dentry, inode, file_flags, fs_type):
+def name_state(dentry, inode, file_flags, fs_type, *, diagnostics=None):
     """이름의 현재 연결만 설명한다. i_nlink == 0을 삭제 사건으로 해석하지 않는다."""
     if fs_type in {"sockfs", "pipefs"}:
         return "N/A"
@@ -42,9 +44,9 @@ def name_state(dentry, inode, file_flags, fs_type):
     try:
         if not (
             dentry
-            and artifact_core._object_readable(dentry)
+            and artifact_core._object_readable(dentry, diagnostics=diagnostics)
             and inode
-            and artifact_core._object_readable(inode)
+            and artifact_core._object_readable(inode, diagnostics=diagnostics)
         ):
             return "UNKNOWN"
         parent_address = artifact_core._object_address(dentry.d_parent)
@@ -70,11 +72,12 @@ def name_state(dentry, inode, file_flags, fs_type):
             return "UNKNOWN"
         # 양의 i_nlink라도 해당 이름은 unlink되었을 수 있다(다른 hardlink).
         return "UNLINKED"
-    except artifact_core.READ_ERRORS:
+    except artifact_core.READ_ERRORS as exc:
+        artifact_core.record_read_error(diagnostics, "file.name_state", exc)
         return "UNKNOWN"
 
 
-def scan_fd_array(array, count):
+def scan_fd_array(array, count, *, diagnostics=None):
     """한 슬롯의 page fault 때문에 뒤쪽 FD까지 사라지지 않도록 분리해서 읽는다."""
     entries, issues = [], collections.Counter()
     for fd in range(count):
@@ -84,8 +87,9 @@ def scan_fd_array(array, count):
             # 행을 만들지 않고 누락 슬롯 수를 전체 판독 상태에 남긴다.
             if artifact_core._object_address(filp):
                 entries.append((fd, filp))
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
             issues["fd-slot-unreadable"] += 1
+            artifact_core.record_read_error(diagnostics, "fd_slot", exc, fd=fd)
     return entries, issues
 
 
@@ -108,41 +112,55 @@ class FileFacts:
     host_status: str = "PARTIAL"
     special_name: str = ""
     issues: set = dataclasses.field(default_factory=set)
+    diagnostics: list = dataclasses.field(default_factory=list)
 
 
 def file_facts(filp, resolver):
     """경로/선택 필드 하나가 손상되어도 이미 발견한 FD 행은 보존한다."""
     result = FileFacts()
-    if not artifact_core._object_readable(filp):
+    if not artifact_core._object_readable(filp, diagnostics=result.diagnostics):
         result.issues.add("file-unreadable")
         return result
-    result.access = access_mode(filp)
+    result.access = access_mode(filp, diagnostics=result.diagnostics)
     if result.access == "UNKNOWN":
         result.issues.add("access")
     for member, target in (("f_flags", "file_flags"), ("f_mode", "raw_mode")):
         try:
             setattr(result, target, int(getattr(filp, member)))
-        except artifact_core.READ_ERRORS:
+        except artifact_core.READ_ERRORS as exc:
             result.issues.add(member)
+            artifact_core.record_read_error(result.diagnostics, "file." + member, exc)
     try:
         result.inode = filp.get_inode()
-        if not (result.inode and artifact_core._object_readable(result.inode)):
+        if not (
+            result.inode
+            and artifact_core._object_readable(
+                result.inode, diagnostics=result.diagnostics
+            )
+        ):
             raise ValueError("unreadable inode")
         result.kind = result.inode.get_inode_type() or "UNKNOWN"
         result.inode_number = int(result.inode.i_ino)
         result.nlink = int(result.inode.i_nlink)
-    except artifact_core.READ_ERRORS:
+    except artifact_core.READ_ERRORS as exc:
         result.issues.add("inode")
+        artifact_core.record_read_error(result.diagnostics, "file.inode", exc)
     try:
         result.dentry = filp.get_dentry()
         result.vfsmnt = filp.get_vfsmnt()
         if not (
-            artifact_core._object_readable(result.dentry)
-            and artifact_core._object_readable(result.vfsmnt)
+            artifact_core._object_readable(
+                result.dentry, diagnostics=result.diagnostics
+            )
+            and artifact_core._object_readable(
+                result.vfsmnt, diagnostics=result.diagnostics
+            )
         ):
             raise ValueError("unreadable f_path")
         superblock = result.vfsmnt.get_mnt_sb()
-        if not artifact_core._object_readable(superblock):
+        if not artifact_core._object_readable(
+            superblock, diagnostics=result.diagnostics
+        ):
             raise ValueError("unreadable superblock")
         result.fs_type = artifact_core.read_file_cstring(superblock.s_type.name, 256)
         # 동일 주소공간의 VFS 객체 관계만 비교한다. 경로 문자열 접두어를
@@ -156,14 +174,19 @@ def file_facts(filp, resolver):
             != artifact_core._object_address(result.dentry.d_inode)
         ):
             raise ValueError("file/dentry inode mismatch")
-    except artifact_core.READ_ERRORS:
+    except artifact_core.READ_ERRORS as exc:
         result.issues.add("f-path-or-superblock")
+        artifact_core.record_read_error(result.diagnostics, "file.f_path", exc)
         # 관계 불일치로 얻은 객체를 경로 확정에 사용하지 않는다.
         result.dentry = None
         result.vfsmnt = None
 
     result.state = name_state(
-        result.dentry, result.inode, result.file_flags, result.fs_type
+        result.dentry,
+        result.inode,
+        result.file_flags,
+        result.fs_type,
+        diagnostics=result.diagnostics,
     )
     if result.state == "UNKNOWN":
         result.issues.add("name-state")
@@ -183,15 +206,20 @@ def file_facts(filp, resolver):
                 result.special_name = "anon_inode:" + (name if not issue else "?")
                 if issue:
                     result.issues.add("anonymous-name")
-            except artifact_core.READ_ERRORS:
+            except artifact_core.READ_ERRORS as exc:
                 result.special_name = "anon_inode:?"
                 result.issues.add("anonymous-name")
+                artifact_core.record_read_error(
+                    result.diagnostics, "file.anonymous_name", exc
+                )
         result.host_status = "N/A"
         return result
 
     if result.dentry is not None and result.vfsmnt is not None:
         # UNLINKED라도 살아 있는 bind mount alias가 남을 수 있다. 일괄 제외하지 않는다.
-        resolution = resolver.resolve(result.dentry, result.vfsmnt)
+        resolution = resolver.resolve(
+            result.dentry, result.vfsmnt, diagnostics=result.diagnostics
+        )
         result.host_paths = resolution.paths
         result.host_status = resolution.status
         if resolution.status == "PARTIAL":
@@ -199,7 +227,7 @@ def file_facts(filp, resolver):
     return result
 
 
-def container_path(task, facts, covering, index_complete):
+def container_path(task, facts, covering, index_complete, *, diagnostics=None):
     """현재 경로, 이름 연결이 끊긴 경로, 잔존 basename을 혼동하지 않는다."""
     if facts.special_name:
         return facts.special_name, "N/A"
@@ -217,6 +245,7 @@ def container_path(task, facts, covering, index_complete):
             facts.dentry,
             facts.vfsmnt,
             covering_mounts=covering,
+            diagnostics=diagnostics,
         )
         if status == "COMPLETE":
             if index_complete:
@@ -234,6 +263,7 @@ def container_path(task, facts, covering, index_complete):
                 facts.dentry,
                 facts.vfsmnt,
                 require_live_inode=True,
+                diagnostics=diagnostics,
             )
             if topology_status == "OUTSIDE_ROOT":
                 status = "OUTSIDE_ROOT"
@@ -245,6 +275,7 @@ def container_path(task, facts, covering, index_complete):
             facts.dentry,
             facts.vfsmnt,
             require_live_inode=False,
+            diagnostics=diagnostics,
         )
         if residual_status == "COMPLETE":
             if status == "UNLINKED":
@@ -259,15 +290,18 @@ def container_path(task, facts, covering, index_complete):
                 "PARTIAL" if status.startswith("INCOMPLETE:") else "NAME_ONLY"
             )
         return "", "PARTIAL" if status.startswith("INCOMPLETE:") else "UNRESOLVED"
-    except artifact_core.READ_ERRORS:
+    except artifact_core.READ_ERRORS as exc:
+        artifact_core.record_read_error(diagnostics, "container_path", exc)
         return "", "PARTIAL"
 
 
-def read_fds(context, kernel_name, task, limit=65536):
+def read_fds(context, kernel_name, task, limit=65536, *, diagnostics=None):
     issues = collections.Counter()
     try:
         files = task.files
-        if not (files and artifact_core._object_readable(files)):
+        if not (
+            files and artifact_core._object_readable(files, diagnostics=diagnostics)
+        ):
             raise ValueError("unreadable files_struct")
         descriptor_table = files.fdt if files.has_member("fdt") else files
         count = int(descriptor_table.max_fds)
@@ -303,9 +337,10 @@ def read_fds(context, kernel_name, task, limit=65536):
             layer_name=base_pointer.vol.native_layer_name,
             native_layer_name=base_pointer.vol.native_layer_name,
         )
-        entries, slot_issues = scan_fd_array(array, count)
+        entries, slot_issues = scan_fd_array(array, count, diagnostics=diagnostics)
         issues.update(slot_issues)
         return entries, issues
-    except artifact_core.READ_ERRORS:
+    except artifact_core.READ_ERRORS as exc:
         issues["fd-table"] += 1
+        artifact_core.record_read_error(diagnostics, "fd_table", exc)
         return [], issues
