@@ -210,17 +210,28 @@ def read_argv(context, task, policy, *, limit=None):
 
 
 def shim_arguments(args):
-    """shim 명령행의 분리된 ID·namespace 인자를 해석하고 누락·충돌·ID 형식을 검사한다.
+    """shim의 공백형·등호형 ID/namespace를 읽고 누락·충돌·ID 형식을 검사한다.
 
-    로직: ID·namespace 플래그의 다음 인자를 모아 값의 개수와 컨테이너 ID 형식을 검사한다.
+    로직: 옵션과 값을 함께 소비하고 --에서 종료한다. 동일 값은 합치고 서로 다른 값은 충돌로 거부한다.
     """
     ids, namespaces = set(), set()
-    for index, arg in enumerate(args):
-        if arg not in ("-id", "--id", "-namespace", "--namespace"):
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        flag, separator, value = arg.partition("=")
+        index += 1
+        if flag not in ("-id", "--id", "-namespace", "--namespace"):
             continue
-        if index + 1 == len(args) or args[index + 1].startswith("-"):
-            raise ValueError("Shim flag has no value")
-        (ids if arg in ("-id", "--id") else namespaces).add(args[index + 1])
+        if not separator:
+            if index >= len(args) or args[index].startswith("-"):
+                raise ValueError("Shim flag has no value")
+            value = args[index]
+            index += 1
+        if not value:
+            raise ValueError("Shim flag has an empty value")
+        (ids if flag in ("-id", "--id") else namespaces).add(value)
     if len(ids) != 1 or len(namespaces) > 1:
         raise ValueError("Missing or conflicting shim ID/namespace flags")
     cid = next(iter(ids))
