@@ -60,6 +60,8 @@ def identity_cgroup_candidates(paths):
 
 def identity_member_id(task):
     """One complete own-cgroup ID; ancestry and namespace never grant membership."""
+    if task.get("task_status") in ("residual", "unverified"):
+        return None
     ids = identity_cgroup_candidates(task.get("cgroup_paths", []))
     if (
         len(ids) != 1
@@ -90,10 +92,28 @@ def identity_runtime_argv(c, task):
 
 
 def identity_collect(c, records):
-    by_address = {r["address"]: r for r in records}
+    by_object = {
+        (r.get("layer_name", c.kernel.layer_name), r["address"]): r for r in records
+    }
+    by_address = {}
+    for record in records:
+        aliases = record.get(
+            "address_aliases",
+            [
+                {
+                    "address": record["address"],
+                    "layer_name": record.get("layer_name", c.kernel.layer_name),
+                }
+            ],
+        )
+        for alias in aliases:
+            if alias["layer_name"] == c.kernel.layer_name:
+                by_address[alias["address"]] = record
     shims = {}
     for task in c.tasks:
-        record = by_address.get(hex(task.vol.offset))
+        if not c.task_references_allowed(task):
+            continue
+        record = by_object.get((c.task_key(task)[0], hex(task.vol.offset)))
         if record is None:
             continue
         record["parent"] = c.read(
@@ -113,13 +133,15 @@ def identity_collect(c, records):
             if arg in ("-id", "--id") and re.fullmatch("[0-9a-f]{64}", args[i + 1])
         ]
         if ids:
-            shims[record["address"]] = sorted(set(ids))
-            record["shim_container_candidates"] = shims[record["address"]]
+            key = (record.get("layer_name", c.kernel.layer_name), record["address"])
+            shims[key] = sorted(set(ids))
+            record["shim_container_candidates"] = shims[key]
     for record in records:
         node, seen = (record, set())
         while node.get("parent") in by_address:
-            address = node["parent"]
-            if address == node["address"]:
+            parent = by_address[node["parent"]]
+            address = (parent.get("layer_name", c.kernel.layer_name), parent["address"])
+            if parent is node:
                 if node.get("pid") != 0:
                     c.issue(
                         "identity.ancestry",
@@ -143,7 +165,7 @@ def identity_collect(c, records):
                 elif set(record["container_candidates"]) != set(shims[address]):
                     record["identity_conflict"] = True
                 break
-            node = by_address[address]
+            node = parent
     for ns in c.nets.values():
         candidates = set()
         for record in records:
@@ -304,6 +326,8 @@ def sockets_collect(c, task_records=None):
     files_cache = {}
     file_cache = {}
     for task in c.tasks:
+        if not c.task_references_allowed(task):
+            continue
 
         def task_fds(*, task=task):
             if not task.files:
@@ -547,8 +571,17 @@ def context_task_ids(task):
     return [cid] if cid else []
 
 
+def identity_current_tasks(records):
+    """Prevent a residual PID generation from replacing a current FD owner."""
+    tasks = {}
+    for task in records:
+        if task.get("task_status") not in ("residual", "unverified"):
+            tasks[task["pid"]] = task
+    return tasks
+
+
 def context_build(report):
-    tasks = {t["pid"]: t for t in report["tasks"]}
+    tasks = identity_current_tasks(report["tasks"])
     nets = {n["address"]: n for n in report["namespaces"]}
     sockets = {s["socket"]: s for s in report["sockets"]}
     contexts = {}
@@ -696,9 +729,25 @@ def context_build(report):
         "unresolved_tasks": [
             t["address"]
             for t in report["tasks"]
-            if t.get("container_candidates") and (not context_task_ids(t))
+            if t.get("container_candidates")
+            and t.get("task_status") not in ("residual", "unverified")
+            and (not context_task_ids(t))
         ],
-        "scope": "complete own-cgroup runtime ID references; not authenticated runtime inventory",
+        "residual_tasks": [
+            {
+                "address": t["address"],
+                "layer_name": t.get("layer_name"),
+                "pid": t["pid"],
+                "tgid": t["tgid"],
+                "exit_state": t.get("exit_state"),
+                "container_candidates": t.get("container_candidates", []),
+                "cgroup_paths": t.get("cgroup_paths", []),
+                "confidence": "historical_reference_only",
+            }
+            for t in report["tasks"]
+            if t.get("task_status") == "residual"
+        ],
+        "scope": "current task references with complete own-cgroup runtime IDs; residual references kept separately; not authenticated runtime inventory",
         "relation_policy": "only reciprocal UNIX peer or shared kernel object; no endpoint correlation",
     }
 
@@ -713,26 +762,62 @@ class Collector(artifact_core.CollectionSession):
         self.limit = 100000
         self.cgroup_cache = {}
         self.errors = []
+        self.candidate_observations = []
+        self._active_task = None
         self.nets = {}
+        self.namespace_candidates = {}
         self.tasks = []
+        self.task_evidence = {}
+        self.task_objects = {}
         self.init_net_address = None
 
     def issue(self, stage, obj, exc):
-        self.errors.append(
-            {
-                "stage": stage,
-                "address": hex(obj.vol.offset) if hasattr(obj, "vol") else str(obj),
-                "error": type(exc).__name__,
-                "detail": artifact_core.exception_detail(exc),
-            }
-        )
+        entry = {
+            "stage": stage,
+            "address": hex(obj.vol.offset) if hasattr(obj, "vol") else str(obj),
+            "error": type(exc).__name__,
+            "detail": artifact_core.exception_detail(exc),
+        }
+        task = getattr(self, "_active_task", None)
+        target = self.errors
+        if task is not None:
+            key = self.task_key(task)
+            evidence = self.task_evidence.get(key, {})
+            status = evidence.get("task_status", "linked")
+            entry.update(
+                task_address=hex(key[1]),
+                task_layer_name=key[0],
+                task_status=status,
+                discovery_sources=evidence.get("discovery_sources", []),
+            )
+            if status in ("residual", "unverified"):
+                entry["kind"] = (
+                    "residual_reference_failure"
+                    if status == "residual"
+                    else "candidate_read_failure"
+                )
+                target = self.candidate_observations
+            else:
+                entry["kind"] = "current_read_failure"
+        target.append(entry)
+
+    @property
+    def failure_count(self):
+        """Count every failed read, including historical candidate observations."""
+        return len(self.errors) + len(getattr(self, "candidate_observations", []))
 
     def read(self, stage, obj, fn, default=None, *, args=()):
+        previous = getattr(self, "_active_task", None)
+        evidence = getattr(self, "task_evidence", {})
+        if evidence and hasattr(obj, "vol") and self.task_key(obj) in evidence:
+            self._active_task = obj
         try:
             return fn(*args)
         except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
             self.issue(stage, obj, exc)
             return default
+        finally:
+            self._active_task = previous
 
     def walk(self, head, typename, member):
         return task_readers.walk_list(
@@ -760,19 +845,40 @@ class Collector(artifact_core.CollectionSession):
 
     def namespace(self, net, source):
         address = int(net.vol.offset)
-        if not address:
-            raise ValueError("NULL network namespace")
         if address not in self.nets:
+            candidate = self.namespace_candidates.setdefault(
+                address,
+                {"address": hex(address), "sources": [], "status": "unverified"},
+            )
+            if source not in candidate["sources"]:
+                candidate["sources"].append(source)
+            if "reason" in candidate:
+                return None
+
+            def read_inode():
+                # This backend supports Intel64 kernel virtual objects only.
+                if not address & ((self.layer.address_mask + 1) >> 1):
+                    raise ValueError(
+                        "network namespace is not a kernel virtual address"
+                    )
+                inode = namespace_readers.namespace_inum(net)
+                if inode <= 0:
+                    raise ValueError("network namespace has no positive inode")
+                return inode
+
+            inode = self.read("net.inum", net, read_inode)
+            if inode is None:
+                candidate["reason"] = "namespace address/inode validation failed"
+                return None
             self.nets[address] = {
                 "object": net,
                 "address": hex(address),
                 "sources": [],
                 "pids": [],
                 "container_candidates": [],
+                "inode": inode,
             }
-            self.nets[address]["inode"] = self.read(
-                "net.inum", net, lambda: namespace_readers.namespace_inum(net)
-            )
+            del self.namespace_candidates[address]
         if source not in self.nets[address]["sources"]:
             self.nets[address]["sources"].append(source)
         return self.nets[address]
@@ -784,7 +890,7 @@ class Collector(artifact_core.CollectionSession):
         cache_key = int(css.vol.offset)
         if cache_key in self.cgroup_cache:
             return list(self.cgroup_cache[cache_key])
-        errors_before = len(self.errors)
+        errors_before = self.failure_count
         groups = cgroup_readers.effective_cgroups(css, read=self.read)
         paths = []
         for group in groups:
@@ -793,7 +899,7 @@ class Collector(artifact_core.CollectionSession):
             )
             if path is not None and path not in paths:
                 paths.append(path)
-        if len(self.errors) == errors_before:
+        if self.failure_count == errors_before:
             self.cgroup_cache[cache_key] = tuple(paths)
         return paths
 
@@ -805,19 +911,196 @@ class Collector(artifact_core.CollectionSession):
             policy=cgroup_readers.CgroupPathPolicy.NETWORK,
         )[0]
 
-    def append_tasks(self, iterator, seen):
-        """Consume a stock task iterator with a bounded output and deduplication by PID."""
+    def task_key(self, task):
+        """Identify an object in its own address layer, including scan objects."""
+        return (
+            getattr(task.vol, "layer_name", self.kernel.layer_name),
+            int(task.vol.offset),
+        )
+
+    def task_references_allowed(self, task):
+        """Use live references only from linked or structurally consistent tasks."""
+        evidence = self.task_evidence.get(self.task_key(task), {})
+        return evidence.get("task_status", "linked") in ("linked", "validated_scan")
+
+    def task_physical_key(self, task):
+        """Translate virtual aliases before comparing with physical scan hits."""
+        key = self.task_key(task)
+        if key[0] != self.kernel.layer_name:
+            return key
+        layer = getattr(self, "layer", None)
+        if not hasattr(layer, "mapping"):
+            return key
+        mapping = self.read(
+            "task.physical_address",
+            task,
+            lambda: next(layer.mapping(key[1], 1)),
+        )
+        if mapping is None:
+            return key
+        return (mapping[4], mapping[2])
+
+    def task_virtual_alias(self, task, evidence, physical):
+        """Distinguish kernel task objects from byte copies in scan memory.
+
+        Leaders have a group_leader self-reference; threads have reciprocal
+        thread-list links. Both must map back to the scanned physical object.
+        Unlinked but consistent self-linked tasks remain eligible for analysis.
+        """
+        if self.task_key(task)[0] == self.kernel.layer_name:
+            return
+        if evidence["task_status"] != "validated_scan":
+            return
+        try:
+            if int(task.pid) == int(task.tgid):
+                address = int(task.group_leader)
+            else:
+                member = (
+                    "thread_node" if task.has_member("thread_node") else "thread_group"
+                )
+                head = task.member(member)
+                forward = int(head.next.dereference().prev)
+                backward = int(head.prev.dereference().next)
+                if forward != backward:
+                    raise ValueError("thread-list backlinks disagree")
+                address = forward - (head.vol.offset - task.vol.offset)
+            virtual_task = self.obj("task_struct", address)
+            mapping = next(self.layer.mapping(virtual_task.vol.offset, 1))
+            evidence["self_reference_address"] = hex(virtual_task.vol.offset)
+            evidence["self_reference_physical"] = hex(mapping[2])
+            if (mapping[4], mapping[2]) != physical:
+                raise ValueError(
+                    "self-reference maps to a different physical task; possible copied or reused candidate"
+                )
+            alias = {
+                "address": hex(virtual_task.vol.offset),
+                "layer_name": self.kernel.layer_name,
+            }
+            if alias not in evidence["address_aliases"]:
+                evidence["address_aliases"].append(alias)
+        except Exception as exc:  # noqa: BLE001 - Keep rejected scan evidence and the exact validation failure.
+            evidence["task_status"] = "unverified"
+            evidence["validation"].append(
+                {
+                    "check": "self_reference",
+                    "error": type(exc).__name__,
+                    "detail": artifact_core.exception_detail(exc),
+                }
+            )
+
+    def residual_cgroups(self, task):
+        """Read historical paths as candidates, never as present membership.
+
+        A surviving cgroup path can remain useful even after files/nsproxy have
+        been detached. Readability does not prove the old css_set was not reused.
+        """
+        if task.cgroups and not task.cgroups.is_readable():
+            # Recover the actual Volatility fault layer/address when available.
+            self.layer.read(int(task.cgroups), 1)
+            raise ValueError(
+                f"unreadable residual css_set pointer {int(task.cgroups):#x}"
+            )
+        return self.cgroups(task)
+
+    def classify_task(self, task, source):
+        """Retain candidates while distinguishing linked, residual and scan evidence.
+
+        Readable scan fields are corroboration, not proof that a task is live or
+        that all its historical references still identify the original objects.
+        A failed stock is_valid check alone never discards an exit-state record.
+        """
+        evidence = {
+            "task_status": "unverified",
+            "validation": [],
+            "exit_state": None,
+            "discovery_sources": [source],
+        }
+
+        def check(name, reader):
+            try:
+                valid = bool(reader())
+            except Exception as exc:  # noqa: BLE001 - Preserve failed candidate checks as evidence.
+                evidence["validation"].append(
+                    {
+                        "check": name,
+                        "error": type(exc).__name__,
+                        "detail": artifact_core.exception_detail(exc),
+                    }
+                )
+                return False
+            if not valid:
+                evidence["validation"].append(
+                    {"check": name, "detail": "inconsistent candidate fields"}
+                )
+            return valid
+
+        def exit_state():
+            evidence["exit_state"] = int(task.exit_state)
+            return evidence["exit_state"] in (0, 0x10, 0x20, 0x30)
+
+        ids_valid = check("pid_tgid", lambda: int(task.pid) > 0 and int(task.tgid) > 0)
+        state_valid = check("exit_state", exit_state)
+        if state_valid and evidence["exit_state"] and ids_valid:
+            evidence["task_status"] = "residual"
+        elif not source.startswith("PsScan"):
+            # A partially readable linked task must still supply independent FDs.
+            evidence["task_status"] = "linked"
+        elif ids_valid and state_valid:
+            valid = check("task_structure", task.is_valid)
+            leader_valid = check(
+                "group_leader",
+                lambda: (
+                    int(task.group_leader.pid) == int(task.tgid)
+                    and int(task.group_leader.tgid) == int(task.tgid)
+                ),
+            )
+            parent_valid = check(
+                "real_parent",
+                lambda: (
+                    bool(task.real_parent)
+                    and int(task.real_parent.pid) >= 0
+                    and int(task.real_parent.tgid) >= 0
+                ),
+            )
+            if valid and leader_valid and parent_valid:
+                evidence["task_status"] = "validated_scan"
+        return evidence
+
+    def append_tasks(self, iterator, seen, source="PsList"):
+        """Merge aliases of one object; preserve distinct objects sharing a PID."""
         for count, task in enumerate(iterator):
             if count >= self.limit:
                 raise ValueError("task iterator output budget exceeded")
-            pid = int(task.pid)
-            if pid not in seen:
-                seen.add(pid)
-                self.tasks.append(task)
+            key = self.task_key(task)
+            physical = self.task_physical_key(task)
+            alias = {"address": hex(key[1]), "layer_name": key[0]}
+            if physical in seen:
+                original = self.task_objects[physical]
+                evidence = self.task_evidence[self.task_key(original)]
+                if source not in evidence["discovery_sources"]:
+                    evidence["discovery_sources"].append(source)
+                if alias not in evidence["address_aliases"]:
+                    evidence["address_aliases"].append(alias)
+                continue
+            seen.add(physical)
+            self.tasks.append(task)
+            self.task_objects[physical] = task
+            evidence = self.classify_task(task, source)
+            evidence["address_aliases"] = [alias]
+            evidence["physical_address"] = (
+                hex(physical[1]) if physical[0] != self.kernel.layer_name else None
+            )
+            evidence["physical_layer_name"] = (
+                physical[0] if physical[0] != self.kernel.layer_name else None
+            )
+            self.task_evidence[key] = evidence
+            self.task_virtual_alias(task, evidence, physical)
 
     def discover_tasks(self):
         """Reuse stock process discovery; supplement with psscan for unlinked tasks."""
         self.tasks = []
+        self.task_evidence = {}
+        self.task_objects = {}
         seen = set()
         leaders = docker_artifacts.DockerArtifacts.list_tasks(
             self.context, self.kernel.name, include_threads=False
@@ -825,6 +1108,15 @@ class Collector(artifact_core.CollectionSession):
         self.read(
             "tasks.list", "PsList.list_tasks", self.append_tasks, args=(leaders, seen)
         )
+        for leader in list(self.tasks):
+            if self.task_references_allowed(leader):
+                self.read(
+                    "tasks.threads",
+                    leader,
+                    self.append_thread_tasks,
+                    args=(leader, seen),
+                )
+        linked_count = len(self.tasks)
         try:
             from volatility3.plugins.linux import psscan
 
@@ -835,21 +1127,53 @@ class Collector(artifact_core.CollectionSession):
                 "tasks.psscan",
                 "PsScan.scan_tasks",
                 self.append_tasks,
-                args=(hidden_leaders, seen),
+                args=(hidden_leaders, seen, "PsScan"),
             )
         except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
             self.issue("tasks.psscan", "PsScan.scan_tasks", exc)
-        for leader in list(self.tasks):
+        for leader in list(self.tasks[linked_count:]):
+            if not self.task_references_allowed(leader):
+                continue
             self.read(
                 "tasks.threads", leader, self.append_thread_tasks, args=(leader, seen)
             )
 
     def append_thread_tasks(self, leader, seen):
-        self.append_tasks(leader.get_threads(), seen)
+        evidence = self.task_evidence.get(self.task_key(leader), {})
+        sources = evidence.get("discovery_sources", [])
+        source = "PsScan" if any(s.startswith("PsScan") for s in sources) else "PsList"
+        self.append_tasks(leader.get_threads(), seen, source + ".task.get_threads")
+
+    def task_record(self, task):
+        """Expose provenance without presenting a scan hit as list membership."""
+        key = self.task_key(task)
+        evidence = self.task_evidence.get(key)
+        if evidence is None:
+            evidence = self.classify_task(task, "provided_task")
+            self.task_evidence[key] = evidence
+        confidence = {
+            "linked": "reachable_task_object",
+            "validated_scan": "consistent_scan_candidate",
+            "residual": "residual_task_candidate",
+            "unverified": "unverified_scan_candidate",
+        }
+        return {
+            "address": hex(task.vol.offset),
+            "layer_name": key[0],
+            "native_layer_name": getattr(task.vol, "native_layer_name", key[0]),
+            "pid": int(task.pid),
+            "tgid": int(task.tgid),
+            "comm": utility.array_to_string(task.comm),
+            "container_candidates": [],
+            "source": ", ".join(evidence["discovery_sources"]),
+            "confidence": confidence[evidence["task_status"]],
+            **evidence,
+        }
 
     def collect_namespaces(self):
         """Resolve relocated symbols and register namespaces through one reader."""
         self.nets = {}
+        self.namespace_candidates = {}
         self.init_net_address = None
         if self.kernel.has_symbol("net_namespace_list"):
             list_head = "net_namespace_list"
@@ -868,9 +1192,12 @@ class Collector(artifact_core.CollectionSession):
                 "init_net", "init_net", self.symbol, args=("init_net", "net")
             )
             if init_net is not None:
-                # Use the same relocated, layer-masked object address as task pointers.
-                self.init_net_address = hex(int(init_net.vol.offset))
-                self.read("net", init_net, self.namespace, args=(init_net, "init_net"))
+                entry = self.read(
+                    "net", init_net, self.namespace, args=(init_net, "init_net")
+                )
+                if entry is not None:
+                    # Use the same relocated, layer-masked address as task pointers.
+                    self.init_net_address = entry["address"]
 
     def collect_tasks(self):
         self.discover_tasks()
@@ -879,33 +1206,50 @@ class Collector(artifact_core.CollectionSession):
             record = self.read(
                 "task.identity",
                 task,
-                lambda task=task: {
-                    "address": hex(task.vol.offset),
-                    "pid": int(task.pid),
-                    "tgid": int(task.tgid),
-                    "comm": utility.array_to_string(task.comm),
-                    "container_candidates": [],
-                    "source": "PsList.list_tasks + task.get_threads",
-                    "confidence": "reachable_task_object",
-                },
+                self.task_record,
+                args=(task,),
             )
             if record is None:
                 continue
-            errors_before = len(self.errors)
-            paths = self.read("task.cgroups", task, self.cgroups, [], args=(task,))
+            status = record["task_status"]
+            record["collection_scope"] = (
+                "identity_only"
+                if status == "unverified"
+                else "residual_cgroup_reference"
+                if status == "residual"
+                else "current_references"
+            )
+            errors_before = self.failure_count
+            paths = []
+            if status != "unverified":
+                reader = self.residual_cgroups if status == "residual" else self.cgroups
+                paths = self.read("task.cgroups", task, reader, [], args=(task,))
             record["cgroup_paths"] = paths
-            record["cgroup_complete"] = len(self.errors) == errors_before
+            record["cgroup_complete"] = (
+                status != "unverified" and self.failure_count == errors_before
+            )
+            record["cgroup_reference_status"] = (
+                "residual_reference"
+                if status == "residual"
+                else "unverified"
+                if status == "unverified"
+                else "current_reference"
+            )
             record["container_candidates"] = identity_cgroup_candidates(paths)
             record["identity_evidence"] = (
                 "cgroup_path_candidate"
                 if record["container_candidates"]
                 else "unresolved"
             )
-            proxy = self.read(
-                "task.nsproxy",
-                task,
-                lambda task=task: task.nsproxy.dereference() if task.nsproxy else None,
-            )
+            proxy = None
+            if self.task_references_allowed(task):
+                proxy = self.read(
+                    "task.nsproxy",
+                    task,
+                    lambda task=task: (
+                        task.nsproxy.dereference() if task.nsproxy else None
+                    ),
+                )
             if proxy is not None:
                 net = self.read(
                     "task.net",
@@ -915,12 +1259,21 @@ class Collector(artifact_core.CollectionSession):
                     ),
                 )
                 if net is not None:
-                    ns = self.namespace(net, "task.nsproxy.net_ns")
-                    ns["pids"].append(record["pid"])
-                    ns["container_candidates"] = sorted(
-                        set(ns["container_candidates"] + record["container_candidates"])
+                    ns = self.read(
+                        "task.namespace",
+                        task,
+                        self.namespace,
+                        args=(net, "task.nsproxy.net_ns"),
                     )
-                    record["namespace"] = ns["address"]
+                    if ns is not None:
+                        ns["pids"].append(record["pid"])
+                        ns["container_candidates"] = sorted(
+                            set(
+                                ns["container_candidates"]
+                                + record["container_candidates"]
+                            )
+                        )
+                        record["namespace"] = ns["address"]
             for field in ("start_time", "start_boottime"):
                 if task.has_member(field):
                     record[field] = self.read(
@@ -935,6 +1288,15 @@ class Collector(artifact_core.CollectionSession):
         for pid, duplicates in by_pid.items():
             if len(duplicates) > 1:
                 for record in duplicates:
+                    record["pid_reused"] = True
+                current = [
+                    r
+                    for r in duplicates
+                    if r["task_status"] in ("linked", "validated_scan")
+                ]
+                if len(current) < 2:
+                    continue
+                for record in current:
                     record["pid_conflict"] = True
                 self.issue(
                     "task.pid_conflict",
@@ -1053,24 +1415,6 @@ class Collector(artifact_core.CollectionSession):
         self.collect_namespaces()
         tasks = self.collect_tasks()
         identity_collect(self, tasks)
-        for task in self.tasks:
-            proxy = self.read(
-                "task.nsproxy",
-                task,
-                lambda task=task: task.nsproxy.dereference() if task.nsproxy else None,
-            )
-            if proxy:
-                net = self.read(
-                    "nsproxy.net_ns",
-                    proxy,
-                    lambda proxy=proxy: (
-                        proxy.net_ns.dereference() if proxy.net_ns else None
-                    ),
-                )
-                if net:
-                    self.read(
-                        "net", net, self.namespace, args=(net, "task.nsproxy.net_ns")
-                    )
         members = {task.get("namespace") for task in tasks if identity_member_id(task)}
         unsupported = []
         for ns in self.nets.values():
@@ -1158,8 +1502,10 @@ class Collector(artifact_core.CollectionSession):
                 {k: v for k, v in ns.items() if k != "object"}
                 for ns in self.nets.values()
             ],
+            "namespace_candidates": list(self.namespace_candidates.values()),
             "interfaces": interfaces,
             "errors": self.errors,
+            "candidate_observations": self.candidate_observations,
             "summary": {
                 "tasks": len(tasks),
                 "namespaces": len(self.nets),
@@ -1168,8 +1514,15 @@ class Collector(artifact_core.CollectionSession):
                 "sockets": len(socket_rows),
                 "conntrack": len(flow_rows),
                 "errors": len(self.errors),
+                "candidate_observations": len(self.candidate_observations),
+                "unverified_namespaces": len(self.namespace_candidates),
             },
         }
+        report["summary"]["task_status_counts"] = {}
+        for task in tasks:
+            status = task.get("task_status", "linked")
+            counts = report["summary"]["task_status_counts"]
+            counts[status] = counts.get(status, 0) + 1
         report["container_context"] = context_build(report)
         for key in ("containers", "relations", "structural_relations"):
             report["summary"][key] = len(report["container_context"][key])
@@ -1267,6 +1620,30 @@ def views_rows(report, view, prefixes=None):
                     views_text(error["error"] + ": " + error["detail"]),
                 ),
             )
+        for item in report.get("candidate_observations", []):
+            detail = (
+                f"task={item['task_address']} layer={item['task_layer_name']} "
+                f"{item['error']}: {item['detail']}"
+            )
+            yield (
+                0,
+                (
+                    "residual" if item["task_status"] == "residual" else "candidate",
+                    views_text(item["stage"]),
+                    str(item["address"]),
+                    views_text(detail),
+                ),
+            )
+        for item in report.get("namespace_candidates", []):
+            yield (
+                0,
+                (
+                    "unresolved",
+                    "namespace.validation",
+                    item["address"],
+                    views_text(item["reason"]),
+                ),
+            )
         for item in report.get("unsupported", []):
             yield (
                 0,
@@ -1278,7 +1655,35 @@ def views_rows(report, view, prefixes=None):
                 ),
             )
         for task in report["tasks"]:
-            if task.get("container_candidates") and (not identity_member_id(task)):
+            status = task.get("task_status", "linked")
+            for observation in task.get("validation", []):
+                detail = f"PID={task['pid']} source={task.get('source')} {observation.get('error', 'validation')}: {observation['detail']}"
+                yield (
+                    0,
+                    (
+                        "candidate" if status == "unverified" else "error",
+                        "task.validation." + observation["check"],
+                        task["address"],
+                        views_text(detail),
+                    ),
+                )
+            if status == "residual" and task.get("container_candidates"):
+                yield (
+                    0,
+                    (
+                        "residual",
+                        "task.state",
+                        task["address"],
+                        views_text(
+                            f"PID={task['pid']} exit_state={task.get('exit_state')} historical cgroup reference; excluded from current membership"
+                        ),
+                    ),
+                )
+            elif (
+                status != "unverified"
+                and task.get("container_candidates")
+                and (not identity_member_id(task))
+            ):
                 yield (
                     0,
                     (
@@ -1395,7 +1800,7 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
     hidden = True  # Exposed through linux.docker.Docker --inspect-networks.
     _required_framework_version = (2, 22, 0)
     # 12.x marks the category/value TreeGrid output contract.
-    _version = (12, 0, 3)
+    _version = (12, 1, 0)
 
     @classmethod
     def get_requirements(cls):
@@ -1494,6 +1899,17 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
                 error["detail"],
                 error.get("affected_holders", []),
             )
+        for item in report.get("candidate_observations", []):
+            vollog.debug(
+                "Candidate observation kind=%s task=%s layer=%s stage=%s object=%s type=%s detail=%s",
+                item["kind"],
+                item["task_address"],
+                item["task_layer_name"],
+                item["stage"],
+                item["address"],
+                item["error"],
+                item["detail"],
+            )
         for item in report.get("unsupported", []):
             vollog.debug(
                 "Unsupported feature=%s object=%s reason=%s",
@@ -1522,7 +1938,7 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
         ]
 
     def _generator(self, report):
-        tasks = {task["pid"]: task for task in report["tasks"]}
+        tasks = identity_current_tasks(report["tasks"])
         nets = {net["address"]: net for net in report["namespaces"]}
         eligible = {
             pid: plugin_container_member_id(task) for pid, task in tasks.items()
