@@ -1,0 +1,8 @@
+# Match the Volatility framework's Ruff rules.
+# https://github.com/volatilityfoundation/volatility3/blob/develop/pyproject.toml
+line-length = 88
+target-version = "py38"
+
+[lint]
+select = ["F", "E", "W", "G", "PIE", "UP"]
+ignore = ["E501"]
