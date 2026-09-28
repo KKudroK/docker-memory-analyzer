@@ -459,12 +459,16 @@ def sockets_collect(c, task_records=None):
             start_row = len(rows)
             indices = []
             fdt, count = sockets_fd_table(task.files.dereference(), c.limit)
+            # fd is file **. Dereferencing it reads slot zero before the
+            # per-slot failure boundary, hiding later pages if that slot faults.
             fds = (
-                utility.array_of_pointers(
-                    fdt.fd.dereference(),
-                    count,
-                    c.kernel.symbol_table_name + "!file",
-                    c.context,
+                c.context.object(
+                    c.kernel.symbol_table_name + "!array",
+                    offset=int(fdt.fd),
+                    count=count,
+                    subtype=fdt.fd.vol.subtype,
+                    layer_name=fdt.fd.vol.native_layer_name,
+                    native_layer_name=fdt.fd.vol.native_layer_name,
                 )
                 if count
                 else []
@@ -1917,7 +1921,7 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
     hidden = True  # Exposed through linux.docker.Docker --inspect-networks.
     _required_framework_version = (2, 22, 0)
     # 12.x marks the category/value TreeGrid output contract.
-    _version = (12, 2, 1)
+    _version = (12, 2, 2)
 
     @classmethod
     def get_requirements(cls):

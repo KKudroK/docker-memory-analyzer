@@ -90,7 +90,7 @@ class Docker(interfaces.plugins.PluginInterface):
     # MAJOR: incompatible inputs/output; MINOR: compatible additions; PATCH:
     # internal fixes. Reset lower components when bumping MAJOR or MINOR.
     # 3.x accounts for category/value output and the revised task views.
-    _version = (3, 2, 1)
+    _version = (3, 2, 2)
 
     @classmethod
     def get_requirements(cls):
@@ -98,7 +98,7 @@ class Docker(interfaces.plugins.PluginInterface):
             requirements.VersionRequirement(
                 name="docker_artifacts",
                 component=docker_artifacts.DockerArtifacts,
-                version=(1, 2, 0),
+                version=(1, 3, 0),
             ),
             requirements.ModuleRequirement(
                 name="kernel",
