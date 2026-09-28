@@ -53,7 +53,7 @@ from volatility3.plugins.linux._artifacts import timing as timing_readers
 
 LOG = logging.getLogger(__name__)
 # 2.x changes the default task table and the triage columns/filter semantics.
-VERSION_INFO = (2, 1, 0)
+VERSION_INFO = (2, 1, 1)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
 
@@ -172,7 +172,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             requirements.VersionRequirement(
                 name="docker_artifacts",
                 component=docker_artifacts.DockerArtifacts,
-                version=(1, 2, 0),
+                version=(1, 3, 0),
             ),
             requirements.ModuleRequirement(
                 name="kernel",
@@ -459,16 +459,15 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 layer_name=task.vol.layer_name,
                 native_layer_name=task.vol.native_layer_name,
             )
-            leader = task.group_leader.dereference()
-            leader_chain = docker_artifacts.DockerArtifacts.read_pid_chain(
-                self.context,
-                self.config["kernel"],
-                int(leader.vol.offset),
-                layer_name=leader.vol.layer_name,
-                native_layer_name=leader.vol.native_layer_name,
-            )
             detail["PIDNS"] = chain[-1]["namespace"]
             detail["NSTID"] = chain[-1]["id"]
+            leader_chain = docker_artifacts.DockerArtifacts.read_process_pid_chain(
+                self.context,
+                self.config["kernel"],
+                int(task.vol.offset),
+                layer_name=task.vol.layer_name,
+                native_layer_name=task.vol.native_layer_name,
+            )
             detail["NSPID"] = next(
                 x["id"] for x in leader_chain if x["namespace"] == detail["PIDNS"]
             )

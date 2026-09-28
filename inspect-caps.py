@@ -17,7 +17,7 @@ import unicodedata  # 제어문자를 분류하고 한글 등 문자의 터미�
 BASE = pathlib.Path(__file__).resolve().parent
 # 버전은 여기서만 정의한다. CLI·Volatility 클래스·감사 JSON이 같은 값을 사용한다.
 # 2.x marks the category/value TreeGrid output contract.
-VERSION_INFO = (2, 0, 3)
+VERSION_INFO = (2, 0, 4)
 VERSION = ".".join(map(str, VERSION_INFO))
 # 실행 조건을 기록한다. 버전 번호 허용 목록이나 실제 검증 환경 목록이 아니다.
 # 새 결과에만 저장하며, 과거 결과에 현재 정책을 소급해서 붙이지 않는다.
@@ -1262,7 +1262,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
             requirements.VersionRequirement(
                 name="docker_artifacts",
                 component=docker_artifacts.DockerArtifacts,
-                version=(1, 0, 1),
+                version=(1, 3, 0),
             ),
             requirements.ModuleRequirement(
                 name="kernel",
@@ -1629,12 +1629,18 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     member[field] = None
                 try:
                     pid_chain = self._pid_chain(task, module)
-                    leader_chain = self._pid_chain(
-                        task.group_leader.dereference(), module
-                    )
                     member["pid_chain"] = pid_chain
                     member["PIDNS"] = pid_chain[-1]["namespace"]
                     member["NSTID"] = pid_chain[-1]["id"]
+                    leader_chain = (
+                        docker_artifacts.DockerArtifacts.read_process_pid_chain(
+                            self.context,
+                            self.config["kernel"],
+                            int(task.vol.offset),
+                            layer_name=task.vol.layer_name,
+                            native_layer_name=task.vol.native_layer_name,
+                        )
+                    )
                     member["NSPID"] = next(
                         x["id"]
                         for x in leader_chain

@@ -41,7 +41,7 @@ class DockerArtifacts(
     implementation fixes require PATCH. Underscored helpers are not public API.
     """
 
-    _version = (1, 2, 0)
+    _version = (1, 3, 0)
     _required_framework_version = (2, 28, 0)
 
     @classmethod
@@ -231,6 +231,35 @@ class DockerArtifacts(
             native_layer_name,
         )
         return namespace_readers.read_pid_chain(
+            task, cls._kernel(context, kernel_module_name)
+        )
+
+    @classmethod
+    def read_process_pid_chain(
+        cls,
+        context: interfaces.context.ContextInterface,
+        kernel_module_name: str,
+        task_address: int,
+        *,
+        layer_name: str | None = None,
+        native_layer_name: str | None = None,
+    ) -> list[dict[str, int]]:
+        """Return the linked group leader's validated host-to-inner PID chain.
+
+        Requires leader PID/TGID to match task TGID, a leader self-reference
+        and matching PID namespace chains. No PID-only lookup or fallback is
+        performed. Unreadable/inconsistent links raise; callers may retain
+        independently collected thread evidence from read_pid_chain.
+        """
+        task = cls._object(
+            context,
+            kernel_module_name,
+            "task_struct",
+            task_address,
+            layer_name,
+            native_layer_name,
+        )
+        return namespace_readers.read_process_pid_chain(
             task, cls._kernel(context, kernel_module_name)
         )
 

@@ -142,6 +142,43 @@ def read_pid_chain(task, module):
         ) from exc
 
 
+def read_process_pid_chain(task, module):
+    """Follow and validate group_leader before interpreting its TID as a PID."""
+    tid, tgid = int(task.pid), int(task.tgid)
+    pointer = task.group_leader
+    address = int(pointer)
+    if tid <= 0 or tgid <= 0 or not address:
+        raise ValueError(
+            f"group_leader={address:#x}: invalid task PID={tid} TGID={tgid} or null link"
+        )
+    leader = pointer.dereference()
+    leader_pid, leader_tgid = int(leader.pid), int(leader.tgid)
+    if leader_pid != tgid or leader_tgid != tgid:
+        raise ValueError(
+            f"group_leader={address:#x}: leader PID={leader_pid} TGID={leader_tgid} "
+            f"does not identify task PID={tid} TGID={tgid}"
+        )
+    if int(leader.vol.offset) != address or int(leader.group_leader) != address:
+        raise ValueError(f"group_leader={address:#x}: leader self-reference mismatch")
+    if (
+        tid == tgid
+        and task.vol.layer_name == leader.vol.layer_name
+        and int(task.vol.offset) != address
+    ):
+        raise ValueError(
+            f"group_leader={address:#x}: process leader points to another task"
+        )
+    # Follow pointers, never look up a different task using a matching PID alone.
+    # Threads in a thread group must share the same active PID namespace chain.
+    task_chain = read_pid_chain(task, module)
+    leader_chain = read_pid_chain(leader, module)
+    if [row["namespace"] for row in task_chain] != [
+        row["namespace"] for row in leader_chain
+    ]:
+        raise ValueError(f"group_leader={address:#x}: PID namespace chains disagree")
+    return leader_chain
+
+
 def _pid_namespace_values(task) -> tuple[int | None, int | None]:
     """Return (namespace inode, PID as seen in the innermost PID namespace)."""
 
