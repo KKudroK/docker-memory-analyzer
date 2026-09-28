@@ -38,7 +38,7 @@ from volatility3.plugins.linux._artifacts import timing as timing_readers
 vollog = logging.getLogger(__name__)
 # This function backend has no PluginInterface class; version its evidence
 # from one tuple. 2.x marks the task-linked summary replacing lifecycle output.
-VERSION = (2, 0, 4)
+VERSION = (2, 1, 0)
 LIMIT = 100000
 FILE_LIMIT = 16 * 1024 * 1024
 SETTINGS_MOUNT_LIMIT = 2048
@@ -616,32 +616,63 @@ class Collector(artifact_core.CollectionSession):
                 continue
 
             def decode(*, address=address, row=row, task=task):
-                """shim 인자에서 ID·runtime namespace를 읽고 moby 또는 기존 ID 근거에 따라 Docker 귀속 여부를 기록한다.
-
-                로직: 인자에서 ID·namespace를 해석하고 moby 또는 이미 알려진 ID와 일치하는지 기록한다.
-                """
+                """Keep explicit runtime scope even when the ID is not a Docker ID."""
                 args = self.argv(task)
-                cid, namespace = task_readers.shim_arguments(args)
+                identity = task_readers.shim_metadata(args)
+                cid = identity["container_id"]
+                namespace = identity["runtime_namespace"]
                 record = {
                     "task": row["address"],
                     "pid": row["pid"],
                     "container_id": cid,
                     "runtime_namespace": namespace,
                     "argv": args,
-                    "attributed": namespace == "moby" or cid in known,
+                    "raw_id": identity["raw_id"],
+                    "errors": identity["errors"],
+                    "attributed": cid is not None
+                    and (namespace == "moby" or (namespace is None and cid in known)),
                     "direct_children": [],
                 }
                 self.report["shims"].append(record)
-                if record["attributed"]:
-                    shims[address] = record
+                shims[address] = record
 
             self.read("shim identity", task, decode)
         for row in self.report["tasks"]:
+            # Runtime scope is counterevidence for descendants as well as the
+            # direct child. It must not become positive ancestry-only membership.
+            node, seen = row, set()
+            while node.get("real_parent") in self.task_rows:
+                parent = node["real_parent"]
+                if parent in seen or len(seen) >= LIMIT:
+                    self.issue(
+                        "shim ancestry",
+                        row["address"],
+                        ValueError("parent cycle/limit"),
+                    )
+                    break
+                seen.add(parent)
+                ancestor = shims.get(parent)
+                if ancestor is not None:
+                    namespace = ancestor["runtime_namespace"]
+                    row["runtime_namespace"] = namespace
+                    if namespace not in (None, "moby") and row["container_ids"]:
+                        row["identity_conflicts"].append(
+                            {
+                                "source": "shim_namespace",
+                                "runtime_namespace": namespace,
+                                "shim_task": ancestor["task"],
+                                "reason": "Docker cgroup ID conflicts with explicit non-moby runtime namespace",
+                            }
+                        )
+                    break
+                node = self.task_rows[parent]
             shim = shims.get(row.get("real_parent"))
             if shim is None:
                 continue
             cid = shim["container_id"]
             shim["direct_children"].append(row["address"])
+            if not shim["attributed"]:
+                continue
             row["direct_shim"] = {
                 "task": shim["task"],
                 "pid": shim["pid"],

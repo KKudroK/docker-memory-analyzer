@@ -41,7 +41,7 @@ class DockerArtifacts(
     implementation fixes require PATCH. Underscored helpers are not public API.
     """
 
-    _version = (1, 1, 1)
+    _version = (1, 2, 0)
     _required_framework_version = (2, 28, 0)
 
     @classmethod
@@ -119,6 +119,37 @@ class DockerArtifacts(
         return task_readers.list_tasks(
             context, kernel_module_name, include_threads=include_threads
         )
+
+    @classmethod
+    def read_shim_identity(
+        cls,
+        context: interfaces.context.ContextInterface,
+        kernel_module_name: str,
+        task_address: int,
+        *,
+        policy: str,
+        limit: int | None = None,
+        layer_name: str | None = None,
+        native_layer_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Read shim argv and retain independently decoded identity fields.
+
+        Returns argv, raw_id, runtime_namespace, container_id and errors.
+        Memory failures propagate. Syntax/ID validation errors are returned;
+        container_id is None on any such error, while independently readable
+        fields survive. A valid ID is a candidate, not runtime attribution.
+        The caller must first identify the task as a shim candidate.
+        """
+        argv = cls.read_task_argv(
+            context,
+            kernel_module_name,
+            task_address,
+            policy=policy,
+            limit=limit,
+            layer_name=layer_name,
+            native_layer_name=native_layer_name,
+        )
+        return dict(task_readers.shim_metadata(argv), argv=argv)
 
     @classmethod
     def read_task_argv(

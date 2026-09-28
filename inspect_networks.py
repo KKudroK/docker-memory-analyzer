@@ -80,6 +80,38 @@ def identity_parent_address(task):
     return hex(int(task.real_parent))
 
 
+def identity_conflict(record, kind, **evidence):
+    """Keep the conflicting evidence alongside the attribution guard."""
+    record["identity_conflict"] = True
+    conflict = dict(kind=kind, **evidence)
+    conflicts = record.setdefault("identity_conflicts", [])
+    if conflict not in conflicts:
+        conflicts.append(conflict)
+
+
+def identity_runtime_scope(record, shim, namespaces):
+    """Runtime namespace is counterevidence, never proof of cgroup membership."""
+    namespace = shim["runtime_namespace"]
+    record["runtime_namespace"] = namespace
+    if namespace is None:
+        return
+    docker_paths = any(
+        re.search(
+            r"(?:^|/)(?:docker-[0-9a-f]{64}\.scope|docker/[0-9a-f]{64})(?:/|$)", path
+        )
+        for path in record.get("cgroup_paths", [])
+    )
+    if namespace != "moby" and docker_paths:
+        identity_conflict(
+            record, "NON_MOBY_RUNTIME_NAMESPACE", runtime_namespace=namespace
+        )
+    scopes = namespaces.get(shim["container_id"], set())
+    if len(scopes) > 1 and not (namespace == "moby" and docker_paths):
+        identity_conflict(
+            record, "RUNTIME_NAMESPACE_COLLISION", runtime_namespaces=sorted(scopes)
+        )
+
+
 def identity_runtime_argv(c, task):
     return docker_artifacts.DockerArtifacts.read_task_argv(
         c.context,
@@ -109,7 +141,7 @@ def identity_collect(c, records):
         for alias in aliases:
             if alias["layer_name"] == c.kernel.layer_name:
                 by_address[alias["address"]] = record
-    shims = {}
+    shims, runtime_namespaces = {}, {}
     for task in c.tasks:
         if not c.task_references_allowed(task):
             continue
@@ -121,22 +153,56 @@ def identity_collect(c, records):
         )
         comm = record["comm"]
         if record["pid"] != record["tgid"]:
+            record["group_leader"] = c.read(
+                "identity.group_leader",
+                task,
+                lambda task=task: hex(int(task.group_leader)),
+            )
             continue
         if not comm.startswith("containerd-shim"):
             continue
         args = c.read(
             "identity.runtime_argv", task, identity_runtime_argv, [], args=(c, task)
         )
-        ids = [
-            args[i + 1]
-            for i, arg in enumerate(args[:-1])
-            if arg in ("-id", "--id") and re.fullmatch("[0-9a-f]{64}", args[i + 1])
-        ]
-        if ids:
-            key = (record.get("layer_name", c.kernel.layer_name), record["address"])
-            shims[key] = sorted(set(ids))
-            record["shim_container_candidates"] = shims[key]
+        identity = dict(task_readers.shim_metadata(args), argv=args)
+        key = (record.get("layer_name", c.kernel.layer_name), record["address"])
+        shims[key] = identity
+        record["shim_identity"] = identity
+        cid = identity["container_id"]
+        record["shim_container_candidates"] = [cid] if cid else []
+        if cid and identity["runtime_namespace"] is not None:
+            runtime_namespaces.setdefault(cid, set()).add(identity["runtime_namespace"])
     for record in records:
+        key = (record.get("layer_name", c.kernel.layer_name), record["address"])
+        leader = record
+        if record.get("group_leader"):
+            leader = by_address.get(record["group_leader"], {})
+            key = (leader.get("layer_name", c.kernel.layer_name), leader.get("address"))
+        shim = shims.get(key)
+        if shim is None:
+            continue
+        record["shim_task"] = leader["address"]
+        if leader["pid"] != record["tgid"]:
+            identity_conflict(
+                record, "SHIM_GROUP_LEADER_MISMATCH", shim_task=leader["address"]
+            )
+            continue
+        identity_runtime_scope(record, shim, runtime_namespaces)
+        cid = shim["container_id"]
+        own_ids = identity_cgroup_candidates(record.get("cgroup_paths", []))
+        if cid and own_ids and own_ids != [cid]:
+            identity_conflict(
+                record,
+                "SHIM_ID_CGROUP_MISMATCH",
+                shim_id=cid,
+                cgroup_ids=own_ids,
+                shim_task=leader["address"],
+            )
+    for record in records:
+        if record.get("shim_task"):
+            # A nested shim has its own runtime identity. Its parent's argv
+            # must not overwrite that scope, including on the shim's threads.
+            continue
         node, seen = (record, set())
         while node.get("parent") in by_address:
             parent = by_address[node["parent"]]
@@ -158,12 +224,23 @@ def identity_collect(c, records):
                 break
             seen.add(address)
             if address in shims:
-                record["shim_ancestry_candidates"] = shims[address]
+                shim = shims[address]
+                record["shim_ancestor"] = parent["address"]
+                identity_runtime_scope(record, shim, runtime_namespaces)
+                ids = [shim["container_id"]] if shim["container_id"] else []
+                record["shim_ancestry_candidates"] = ids
+                if not ids:
+                    break
                 if not record["container_candidates"]:
-                    record["container_candidates"] = shims[address]
+                    record["container_candidates"] = ids
                     record["identity_evidence"] = "shim_argv_ancestry_candidate"
-                elif set(record["container_candidates"]) != set(shims[address]):
-                    record["identity_conflict"] = True
+                elif set(record["container_candidates"]) != set(ids):
+                    identity_conflict(
+                        record,
+                        "CGROUP_SHIM_ID_MISMATCH",
+                        shim_ids=ids,
+                        cgroup_ids=record["container_candidates"],
+                    )
                 break
             node = parent
     for ns in c.nets.values():
@@ -1493,7 +1570,7 @@ class Collector(artifact_core.CollectionSession):
                 "requested_features": sorted(features),
                 "kernel_virtual_offset": hex(self.kernel.offset),
                 "traversal_limit": self.limit,
-                "identity_policy": "complete unique own-cgroup ID, checked against shim ancestry; addresses identify snapshot objects",
+                "identity_policy": "complete unique own-cgroup ID, checked against runtime namespace and own/ancestor shim ID; shim threads use group_leader; addresses identify snapshot objects",
                 "collection_scope": "FD holders across tasks for sharing evidence; interface/conntrack context restricted to confirmed non-host container namespaces",
                 "snapshot_limit": "live acquisition may smear time; successful parsing is not exhaustive coverage",
             },
@@ -1800,7 +1877,7 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
     hidden = True  # Exposed through linux.docker.Docker --inspect-networks.
     _required_framework_version = (2, 22, 0)
     # 12.x marks the category/value TreeGrid output contract.
-    _version = (12, 1, 0)
+    _version = (12, 2, 0)
 
     @classmethod
     def get_requirements(cls):

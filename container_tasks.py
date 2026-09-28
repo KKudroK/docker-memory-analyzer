@@ -53,7 +53,7 @@ from volatility3.plugins.linux._artifacts import timing as timing_readers
 
 LOG = logging.getLogger(__name__)
 # 2.x changes the default task table and the triage columns/filter semantics.
-VERSION_INFO = (2, 0, 8)
+VERSION_INFO = (2, 1, 0)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
 
@@ -172,7 +172,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             requirements.VersionRequirement(
                 name="docker_artifacts",
                 component=docker_artifacts.DockerArtifacts,
-                version=(1, 0, 1),
+                version=(1, 2, 0),
             ),
             requirements.ModuleRequirement(
                 name="kernel",
@@ -302,8 +302,8 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
     def _shim_identity(self, task, readers, address, *, errors):
         """shim 후보의 명령행에서 컨테이너 ID·runtime namespace를 해석한다.
 
-        로직: 인자를 shim_arguments로 해석해 ID·namespace를 얻고 shim 자신의 cgroup
-        ID도 함께 읽어, 소속 교차 검증의 근거로 보존한다.
+        로직: 공통 API로 ID·namespace를 독립적으로 읽고 검증 진단을 보존한다.
+        유효한 Docker ID 후보는 shim 자신의 cgroup ID와 함께 교차 검증한다.
         """
         pid = None
         try:
@@ -311,7 +311,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         except artifact_core.READ_ERRORS as exc:
             errors.append(read_error_text("shim_pid", address, exc))
         try:
-            argv = docker_artifacts.DockerArtifacts.read_task_argv(
+            identity = docker_artifacts.DockerArtifacts.read_shim_identity(
                 self.context,
                 self.config["kernel"],
                 int(task.vol.offset),
@@ -333,34 +333,27 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 "task": hex(address),
                 "pid": pid,
                 "container_id": None,
+                "raw_id": None,
                 "runtime_namespace": None,
                 "argv": [],
                 "cgroup_id": None,
                 "attributed": False,
                 "error": reason,
             }
-        try:
-            cid, namespace = task_readers.shim_arguments(argv)
-        except ValueError as exc:
-            return {
-                "task": hex(address),
-                "pid": pid,
-                "container_id": None,
-                "runtime_namespace": None,
-                "argv": argv,
-                "cgroup_id": None,
-                "attributed": False,
-                "error": str(exc),
-            }
+        cid = identity["container_id"]
+        namespace = identity["runtime_namespace"]
         return {
             "task": hex(address),
             "pid": pid,
             "container_id": cid,
+            "raw_id": identity["raw_id"],
             "runtime_namespace": namespace,
-            "argv": argv,
-            "cgroup_id": self._cgroup_container_id(task, readers, errors=errors),
-            "attributed": namespace == "moby" or cid is not None,
-            "error": None,
+            "argv": identity["argv"],
+            "cgroup_id": self._cgroup_container_id(task, readers, errors=errors)
+            if cid is not None
+            else None,
+            "attributed": cid is not None,
+            "error": "; ".join(identity["errors"]) or None,
         }
 
     # ---- 태스크 상세 (구 9번) + 교차 검증 (구 10번) --------------------------
@@ -548,7 +541,20 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     "runtime_namespace": shim["runtime_namespace"],
                     "shim_cgroup_id": shim["cgroup_id"],
                     "attributed": shim["attributed"],
+                    "raw_id": shim.get("raw_id"),
+                    "error": shim.get("error"),
                 }
+                if shim.get("error"):
+                    detail["observations"].append(
+                        {
+                            "source": "shim_identity",
+                            "status": "unresolved",
+                            "shim_task": shim["task"],
+                            "raw_id": shim.get("raw_id"),
+                            "runtime_namespace": shim["runtime_namespace"],
+                            "reason": shim["error"],
+                        }
+                    )
                 break
         detail["shim_lineage"] = shim_lineage
 
@@ -590,7 +596,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     "shim_lineage_id": shim_cid,
                 }
             )
-        if shim_lineage and runtime_ns is not None and runtime_ns != "moby":
+        if sources and runtime_ns is not None and runtime_ns != "moby":
             conflicts.append(
                 {
                     "kind": "NON_MOBY_RUNTIME_NAMESPACE",
