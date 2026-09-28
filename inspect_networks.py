@@ -62,6 +62,8 @@ def identity_member_id(task):
     """One complete own-cgroup ID; ancestry and namespace never grant membership."""
     if task.get("task_status") in ("residual", "unverified"):
         return None
+    if any(item.get("check") == "group_leader" for item in task.get("validation", [])):
+        return None
     ids = identity_cgroup_candidates(task.get("cgroup_paths", []))
     if (
         len(ids) != 1
@@ -123,6 +125,40 @@ def identity_runtime_argv(c, task):
     )
 
 
+def identity_thread_leader(record, by_address):
+    """Require an observed current leader before applying its runtime identity.
+
+    A broken link leaves membership unresolved without disabling raw FD reads.
+    Never replace address evidence with a PID-only join to another task object.
+    """
+    address = record.get("group_leader")
+    leader = by_address.get(address)
+    if leader is None:
+        reason = "leader address is null, unreadable or absent from collected tasks"
+    elif leader.get("task_status") in ("residual", "unverified"):
+        reason = "leader is not a current task"
+    elif leader.get("pid_conflict"):
+        reason = "leader PID belongs to multiple current task objects"
+    elif leader.get("pid") != record["tgid"] or leader.get("tgid") != record["tgid"]:
+        reason = (
+            f"leader PID={leader.get('pid')} TGID={leader.get('tgid')} "
+            "does not identify this thread's process leader"
+        )
+    else:
+        return leader
+    observation = {
+        "check": "group_leader",
+        "detail": (
+            f"group_leader={address} TGID={record['tgid']}: {reason}; "
+            "container membership unresolved; raw FD evidence retained"
+        ),
+    }
+    validation = record.setdefault("validation", [])
+    if observation not in validation:
+        validation.append(observation)
+    return None
+
+
 def identity_collect(c, records):
     by_object = {
         (r.get("layer_name", c.kernel.layer_name), r["address"]): r for r in records
@@ -173,10 +209,14 @@ def identity_collect(c, records):
         if cid and identity["runtime_namespace"] is not None:
             runtime_namespaces.setdefault(cid, set()).add(identity["runtime_namespace"])
     for record in records:
+        if record.get("task_status") in ("residual", "unverified"):
+            continue
         key = (record.get("layer_name", c.kernel.layer_name), record["address"])
         leader = record
-        if record.get("group_leader"):
-            leader = by_address.get(record["group_leader"], {})
+        if record["pid"] != record["tgid"]:
+            leader = identity_thread_leader(record, by_address)
+            if leader is None:
+                continue
             key = (leader.get("layer_name", c.kernel.layer_name), leader.get("address"))
         shim = shims.get(key)
         if shim is None:
@@ -1877,7 +1917,7 @@ class InspectNetworks(interfaces.plugins.PluginInterface):
     hidden = True  # Exposed through linux.docker.Docker --inspect-networks.
     _required_framework_version = (2, 22, 0)
     # 12.x marks the category/value TreeGrid output contract.
-    _version = (12, 2, 0)
+    _version = (12, 2, 1)
 
     @classmethod
     def get_requirements(cls):

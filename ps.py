@@ -38,7 +38,7 @@ from volatility3.plugins.linux._artifacts import timing as timing_readers
 vollog = logging.getLogger(__name__)
 # This function backend has no PluginInterface class; version its evidence
 # from one tuple. 2.x marks the task-linked summary replacing lifecycle output.
-VERSION = (2, 1, 0)
+VERSION = (2, 1, 1)
 LIMIT = 100000
 FILE_LIMIT = 16 * 1024 * 1024
 SETTINGS_MOUNT_LIMIT = 2048
@@ -247,6 +247,7 @@ class Collector(artifact_core.CollectionSession):
             {},
         )
         self.backward_recovered_tasks = set()
+        self.runtime_scopes = {}
         self.skipped = {}
         self.init, self.boot = None, None
 
@@ -655,15 +656,8 @@ class Collector(artifact_core.CollectionSession):
                 if ancestor is not None:
                     namespace = ancestor["runtime_namespace"]
                     row["runtime_namespace"] = namespace
-                    if namespace not in (None, "moby") and row["container_ids"]:
-                        row["identity_conflicts"].append(
-                            {
-                                "source": "shim_namespace",
-                                "runtime_namespace": namespace,
-                                "shim_task": ancestor["task"],
-                                "reason": "Docker cgroup ID conflicts with explicit non-moby runtime namespace",
-                            }
-                        )
+                    self.runtime_scopes[row["address"]] = ancestor
+                    self.check_runtime_scope(row)
                     break
                 node = self.task_rows[parent]
             shim = shims.get(row.get("real_parent"))
@@ -689,6 +683,24 @@ class Collector(artifact_core.CollectionSession):
             else:
                 row["container_ids"] = [cid]
                 row["identity_sources"].append("shim_direct_child")
+
+    def check_runtime_scope(self, row):
+        """Apply retained namespace counterevidence after any ID enrichment."""
+        shim = self.runtime_scopes.get(row["address"])
+        if (
+            shim is None
+            or shim["runtime_namespace"] in (None, "moby")
+            or not row["container_ids"]
+        ):
+            return
+        conflict = {
+            "source": "shim_namespace",
+            "runtime_namespace": shim["runtime_namespace"],
+            "shim_task": shim["task"],
+            "reason": "Docker ID conflicts with explicit non-moby runtime namespace",
+        }
+        if conflict not in row["identity_conflicts"]:
+            row["identity_conflicts"].append(conflict)
 
     def mount_namespace(self, task, entity=None):
         """태스크의 nsproxy에서 mount namespace를 찾아 공통 네임스페이스 기록에 등록한다.
@@ -835,6 +847,7 @@ class Collector(artifact_core.CollectionSession):
                 row["container_ids"] = sorted(ids)
                 row["identity_sources"].append("standard_bind_mount")
                 row["identity_mounts"] = [r["address"] for r in evidence]
+                self.check_runtime_scope(row)
 
     def collect_identity(self):
         """관찰 태스크가 있으면 shim과 조건부 마운트 분석으로 컨테이너 식별 정보를 보완한다.
