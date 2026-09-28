@@ -209,12 +209,17 @@ def read_argv(context, task, policy, *, limit=None):
     return value.split("\0")
 
 
-def shim_arguments(args):
-    """shim의 공백형·등호형 ID/namespace를 읽고 누락·충돌·ID 형식을 검사한다.
+def shim_metadata(args):
+    """Retain independently readable fields, without granting Docker membership.
 
-    로직: 옵션과 값을 함께 소비하고 --에서 종료한다. 동일 값은 합치고 서로 다른 값은 충돌로 거부한다.
+    Raw runtime IDs need not be Docker IDs. Only an unambiguous 64-hex ID
+    with well-formed identity flags becomes ``container_id``. A bad ID does
+    not discard a readable namespace; malformed or conflicting namespace
+    flags never yield a namespace chosen by argument order.
     """
-    ids, namespaces = set(), set()
+    values = {"id": set(), "namespace": set()}
+    invalid = set()
+    errors = []
     index = 0
     while index < len(args):
         arg = args[index]
@@ -224,20 +229,44 @@ def shim_arguments(args):
         index += 1
         if flag not in ("-id", "--id", "-namespace", "--namespace"):
             continue
+        field = flag.lstrip("-")
         if not separator:
             if index >= len(args) or args[index].startswith("-"):
-                raise ValueError("Shim flag has no value")
+                invalid.add(field)
+                errors.append("Shim flag has no value")
+                continue
             value = args[index]
             index += 1
         if not value:
-            raise ValueError("Shim flag has an empty value")
-        (ids if flag in ("-id", "--id") else namespaces).add(value)
+            invalid.add(field)
+            errors.append("Shim flag has an empty value")
+            continue
+        values[field].add(value)
+    ids, namespaces = values["id"], values["namespace"]
     if len(ids) != 1 or len(namespaces) > 1:
-        raise ValueError("Missing or conflicting shim ID/namespace flags")
-    cid = next(iter(ids))
-    if not re.fullmatch(r"[0-9a-f]{64}", cid):
-        raise ValueError("Invalid shim container ID")
-    return cid, next(iter(namespaces), None)
+        errors.append("Missing or conflicting shim ID/namespace flags")
+    raw_id = next(iter(ids)) if len(ids) == 1 and "id" not in invalid else None
+    namespace = (
+        next(iter(namespaces))
+        if len(namespaces) == 1 and "namespace" not in invalid
+        else None
+    )
+    if raw_id is not None and not re.fullmatch(r"[0-9a-f]{64}", raw_id):
+        errors.append("Invalid shim container ID")
+    return {
+        "raw_id": raw_id,
+        "runtime_namespace": namespace,
+        "container_id": raw_id if not errors else None,
+        "errors": list(dict.fromkeys(errors)),
+    }
+
+
+def shim_arguments(args):
+    """Strict compatibility wrapper: reject invalid ID or namespace flags."""
+    result = shim_metadata(args)
+    if result["errors"]:
+        raise ValueError(result["errors"][0])
+    return result["container_id"], result["runtime_namespace"]
 
 
 @dataclasses.dataclass(frozen=True)
