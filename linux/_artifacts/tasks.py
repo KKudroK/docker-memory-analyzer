@@ -1,4 +1,7 @@
-"""Task-list strategies and argv readers, with explicit legacy policies."""
+"""Enumerate and validate Linux task lists for Docker analysis backends.
+The readers support detector, inventory, capability, task, network, and file collection.
+Forward/reverse links are audited and partial bounded traversal remains visible.
+"""
 
 from __future__ import annotations
 
@@ -13,17 +16,18 @@ from . import core as artifact_core
 
 
 def audit_task_list(head, read_link, limit=100000):
-    """태스크 연결 목록을 양방향으로 검사하고, 도달한 노드·연결 불일치·순회 중단 내역을 반환한다.
+    """Audit the task list in both directions and report traversal integrity.
 
-    로직: 정방향과 역방향을 따로 순회해 역연결을 검사하고 발견 노드를 합친다. 합집합이 완전한 목록이라는 뜻은 아니다.
+    Walk forward and backward independently, validate reverse links, and merge
+    discovered nodes. The union is evidence, not a claim that the list is complete.
     """
     result = {"head": hex(head), "directions": {}, "issues": []}
     cache = {}
 
     def link(address, field):
-        """노드의 연결 포인터를 읽고 결과를 캐시해 같은 주소·필드의 중복 읽기를 줄인다.
+        """Read and cache a node link to avoid duplicate reads of the same field.
 
-        로직: 주소와 필드를 키로 읽기 결과를 저장한 뒤 재요청에는 캐시 값을 사용한다.
+        Cache the result by object address and member name for later requests.
         """
         key = address, field
         if key not in cache:
@@ -112,7 +116,7 @@ def audit_task_list(head, read_link, limit=100000):
 
 
 def list_tasks(context, kernel_name, *, include_threads=None):
-    # None preserves the stock default used by mount views.
+
     if include_threads is None:
         return pslist.PsList.list_tasks(context, kernel_name)
     return pslist.PsList.list_tasks(

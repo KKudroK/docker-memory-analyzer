@@ -1,18 +1,7 @@
-"""Task-linked Docker container summaries for stock Volatility 3 >= 2.28.0.
-
-Run via ``vol ... -p ./plugins linux.docker.Docker --ps``. Each full container ID
-has one category/value block. A representative is chosen from an observed
-namespace init or attributed direct shim child; ambiguous cases remain unknown.
-Only that representative's start time, effective UID and capability are read.
-Configured Privileged comes from matching cached hostconfig.json, never a
-PID 1 capability comparison. Cache freshness cannot be established from presence.
-
-The reachable leader list is audited in both directions. Identity uses task
-cgroups, shim arguments/direct children and conditional standard bind mounts.
-Settings recovery follows verified standard bind mounts to each task-linked
-container directory. It keeps only fully recovered Privileged values and
-validation evidence, not general settings. The output has no lifecycle
-classifier. ps_evidence.json uses schema 5.
+"""Build container inventory and representative-process summaries from memory.
+The --ps option correlates cgroups, shim arguments, namespaces, and verified mounts.
+It reports representative PID, start time, credentials, attribution, and cached
+Privileged configuration while keeping ambiguity explicit in ps_evidence.json.
 """
 
 import datetime
@@ -36,8 +25,8 @@ from volatility3.plugins.linux._artifacts import tasks as task_readers
 from volatility3.plugins.linux._artifacts import timing as timing_readers
 
 vollog = logging.getLogger(__name__)
-# This function backend has no PluginInterface class; version its evidence
-# from one tuple. 2.x marks the task-linked summary replacing lifecycle output.
+
+
 VERSION = (2, 1, 1)
 LIMIT = 100000
 FILE_LIMIT = 16 * 1024 * 1024
@@ -65,9 +54,9 @@ class DuplicateJSONKey(ValueError):
 
 
 def utc(seconds, nanoseconds=0):
-    """초·나노초 값을 UTC 시각 문자열로 변환하며, 시각이 미확인이면 None을 반환한다.
+    """Convert seconds and nanoseconds to a UTC timestamp, or return None.
 
-    로직: 입력 범위를 검사하고 UTC 기준 시각으로 바꾼 뒤 나노초 자릿수를 붙인다.
+    Validate the input range, convert the epoch seconds, and append nanoseconds.
     """
     if seconds is None:
         return None
@@ -81,9 +70,9 @@ def utc(seconds, nanoseconds=0):
 
 
 def unique_pairs(pairs):
-    """JSON 키·값 쌍을 사전으로 만들고, 중복 키가 있으면 오류로 처리한다.
+    """Build a dictionary from JSON pairs and reject duplicate keys.
 
-    로직: 키를 순서대로 사전에 넣고 기존 키가 다시 나타나면 예외를 발생시킨다.
+    Insert keys in order and raise when an existing key appears again.
     """
     result = {}
     for key, value in pairs:
@@ -94,9 +83,9 @@ def unique_pairs(pairs):
 
 
 def prefix_json(raw):
-    """일부만 복구된 JSON의 연속된 앞부분에서 완전하게 읽힌 최상위 키·값 쌍만 추출한다.
+    """Recover complete top-level pairs from the contiguous prefix of partial JSON.
 
-    로직: 앞에서부터 완전하게 해석된 최상위 키·값만 보관하며 불완전한 뒤쪽 데이터에서 멈춘다.
+    Retain fully decoded pairs from the start and stop at incomplete trailing data.
     """
     text = raw.decode("utf-8", errors="surrogateescape")
     decoder = json.JSONDecoder(object_pairs_hook=unique_pairs)
@@ -136,21 +125,22 @@ def prefix_json(raw):
 
 
 def json_object(raw):
-    """중복 키를 검사하며 JSON을 해석하고, 최상위 값이 객체인지 확인한다.
+    """Decode JSON with duplicate-key detection and require a top-level object.
 
-    로직: 중복 키 검사기를 적용해 JSON을 읽고 결과가 사전인지 확인한다.
+    Apply the pair validator and verify that the decoded result is a dictionary.
     """
     obj = json.loads(raw, object_pairs_hook=unique_pairs)
     if not isinstance(obj, dict):
-        # The parsed JSON value violates the schema; retain parse-error handling.
-        raise ValueError("Metadata is not an object")  # noqa: TRY004
+
+        raise ValueError("Metadata is not an object")
     return obj
 
 
 def select_representative(rows, cid):
-    """ID 충돌이 없는 태스크에서 namespace PID 1 또는 직접 shim 자식으로 유일한 대표를 선정한다.
+    """Select one evidenced namespace init or direct shim child as representative.
 
-    로직: 충돌 없는 태스크를 추린 뒤 유일한 namespace PID 1을 우선하고, 필요하면 귀속된 직접 shim 자식을 사용한다. PID 크기로 고르지 않는다.
+    Consider only conflict-free tasks, prefer a unique namespace PID 1, and use
+    an attributed direct shim child when appropriate. Never select by lowest PID.
     """
     eligible = [
         r
@@ -189,9 +179,10 @@ def select_representative(rows, cid):
 
 class Collector(artifact_core.CollectionSession):
     def __init__(self, context, kernel_name):
-        """분석 context와 커널 계층을 연결하고, 수집 결과·출처·오류·중복 방지 저장소를 초기화한다.
+        """Initialize kernel access, evidence, errors, provenance, and lookup stores.
 
-        로직: 커널 모듈·메모리 계층을 조회하고 단계별 증거·오류를 담을 보고서와 조회용 사전을 만든다.
+        Resolve the kernel module and layer, then create the staged report and
+        address-indexed collections used throughout inventory generation.
         """
         super().__init__(context, kernel_name)
         self.stage = "tasks"
@@ -269,16 +260,16 @@ class Collector(artifact_core.CollectionSession):
         return source.nanoseconds
 
     def address(self, obj):
-        """Volatility 객체의 메모리 오프셋 또는 전달된 주소를 정수로 반환한다.
+        """Return a Volatility object's memory offset or a supplied address as int.
 
-        로직: vol 속성이 있으면 객체 오프셋을, 없으면 전달된 값 자체를 정수로 바꾼다.
+        Prefer obj.vol.offset when present; otherwise convert the value directly.
         """
         return int(obj.vol.offset) if hasattr(obj, "vol") else int(obj)
 
     def location(self, obj):
-        """객체의 가상 주소와 계층을 기록하고, 변환 가능하면 하위 계층의 이름·오프셋도 덧붙인다.
+        """Record an object's virtual location and mapped lower-layer location.
 
-        로직: 가상 주소를 기록한 다음 주소 변환이 성공하면 매핑된 계층과 오프셋을 추가한다.
+        Always retain the virtual address and add mapping details when translation succeeds.
         """
         address = self.address(obj)
         result = {"layer": self.kernel.layer_name, "virtual": hex(address)}
@@ -290,9 +281,9 @@ class Collector(artifact_core.CollectionSession):
         return result
 
     def issue(self, operation, obj, exc):
-        """수집 오류를 종류별로 구분해 단계·작업·주소·예외명·상세 내용과 함께 기록한다.
+        """Classify and record a collection error with stage, address, and detail.
 
-        로직: 주소를 문자열로 만들고 예외 종류를 판별해 현재 단계의 errors 목록에 추가한다.
+        Normalize the address, classify the exception, and append it to the current stage.
         """
         try:
             address = hex(self.address(obj))
@@ -321,9 +312,9 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def read(self, operation, obj, function, default=None):
-        """읽기·해석 함수를 실행하고, 처리 대상 예외가 발생하면 오류를 기록한 뒤 기본값을 반환한다.
+        """Run a read or decode operation and isolate expected failures.
 
-        로직: 요청한 함수를 호출하고 지정된 예외만 잡아 issue에 남긴 뒤 기본값으로 돌아간다.
+        Record supported exception types through issue and return the supplied default.
         """
         try:
             return function()
@@ -348,9 +339,9 @@ class Collector(artifact_core.CollectionSession):
         return artifact_core.bounded(iterator, LIMIT)
 
     def namespace(self, ptr, kind, entity=None):
-        """네임스페이스 주소·식별 번호를 중복 없이 기록하고, 관련 태스크와의 연결을 추가한다.
+        """Record each namespace once and associate it with referencing tasks.
 
-        로직: 포인터를 역참조해 주소별 기록을 재사용하고, 요청된 태스크 주소를 연결한다.
+        Dereference the pointer, reuse the address-indexed record, and append the entity.
         """
         if not ptr:
             return None
@@ -390,9 +381,10 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def task_list(self, head, member, kind):
-        """양방향에서 발견한 태스크를 합쳐 검증·반환하고, 목록 무결성과 역방향 복구 여부를 기록한다.
+        """Merge and validate tasks found by bidirectional list traversal.
 
-        로직: 목록 양방향 순회 결과를 합쳐 task_struct를 검증한다. 불일치·역방향 복구를 증거와 오류에 남긴다.
+        Validate recovered task_struct objects and retain integrity mismatches and
+        backward-only recovery as explicit evidence.
         """
         mask = self.layer.address_mask
         offset = self.kernel.get_type("task_struct").relative_child_offset(member)
@@ -445,9 +437,9 @@ class Collector(artifact_core.CollectionSession):
             task = self.obj("task_struct", (address - offset) & mask)
 
             def validate(*, task=task):
-                """발견한 태스크의 PID·TGID·group_leader와 comm 읽기 가능 여부를 확인한다.
+                """Validate PID, TGID, group_leader, and comm for a reachable task.
 
-                로직: PID와 TGID가 양수이고 group_leader가 있으며 comm을 읽을 수 있는지 확인한다.
+                Require positive IDs, a group leader, and a readable command name.
                 """
                 if int(task.pid) <= 0 or int(task.tgid) <= 0 or not task.group_leader:
                     raise artifact_core.Incomplete(
@@ -474,9 +466,10 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def stage_run(self, name, function):
-        """수집 단계를 실행하고 결과 수·오류 수·상태·수집 범위·소요 시간을 coverage에 기록한다.
+        """Run one collection stage and record count, errors, scope, status, and time.
 
-        로직: 수집 함수를 오류 격리 경로로 실행한 뒤 레코드·오류 수로 상태를 정하고 범위와 시간을 기록한다.
+        Execute through the isolated read path and derive coverage from collected
+        records and new errors.
         """
         self.stage = name
         errors, started = len(self.report["errors"]), time.perf_counter()
@@ -515,9 +508,9 @@ class Collector(artifact_core.CollectionSession):
         }
 
     def cgroup(self, group, source):
-        """cgroup 경로에서 Docker ID를 추출하고 주소·경로·메모리 위치를 중복 없이 저장한다.
+        """Extract Docker IDs and store each cgroup once by address.
 
-        로직: 주소가 처음 발견됐을 때 경로·Docker ID·위치를 만들고 이후에는 저장된 기록을 반환한다.
+        Create its path, IDs, and memory location on first observation, then reuse the record.
         """
         address = self.address(group)
         if address not in self.cgroups:
@@ -533,16 +526,16 @@ class Collector(artifact_core.CollectionSession):
         return self.cgroups[address][1]
 
     def collect_tasks(self):
-        """프로세스 리더를 수집하고 PID·부모·명령·PID namespace·cgroup ID 및 충돌 정보를 기록한다.
+        """Collect process leaders and their PID, parent, command, namespace, and cgroup evidence.
 
-        로직: 리더 목록을 모은 뒤 각 task의 PID·명령·namespace·cgroup을 읽고 ID 출처와 충돌을 정리한다.
+        Record identity sources and conflicts after reading each reachable leader.
         """
         self.init = self.symbol("init_task", "task_struct")
 
         def leaders():
-            """검증된 태스크 목록에서 PID와 TGID가 같은 프로세스 리더를 주소별로 저장한다.
+            """Store process leaders whose PID equals TGID from the validated task list.
 
-            로직: 양방향 목록에서 얻은 task 중 pid와 tgid가 일치하는 항목을 주소별로 저장한다.
+            Index qualifying tasks by address after bidirectional traversal.
             """
             for task in self.task_list(self.init.tasks, "tasks", "process_leaders"):
                 if int(task.pid) == int(task.tgid):
@@ -572,9 +565,9 @@ class Collector(artifact_core.CollectionSession):
             )
 
             def pid_chain(*, row=row, task=task):
-                """PID namespace 계층을 읽고 호스트 PID 일치 여부와 네임스페이스 누락을 검사한다.
+                """Read the PID namespace chain and validate its host PID and namespaces.
 
-                로직: PID 계층을 수집하고 첫 PID가 호스트 PID와 맞는지, namespace가 모두 있는지 확인한다.
+                Require the first PID to match the task and every level to name a namespace.
                 """
                 chain = self.pid_chain(task)
                 if chain and (
@@ -603,9 +596,9 @@ class Collector(artifact_core.CollectionSession):
                 )
 
     def collect_shims(self):
-        """shim 이름·인자로 Docker 귀속을 확인하고, 직접 자식의 ID를 보완하거나 기존 ID와의 충돌을 기록한다.
+        """Attribute Docker shims and enrich direct children without hiding conflicts.
 
-        로직: shim 후보의 인자를 읽어 귀속 여부를 정한 뒤 직접 자식에게 ID를 연결하거나 충돌을 남긴다.
+        Decode shim arguments, decide attribution, and attach or dispute the ID on direct children.
         """
         known = set()
         for row in self.report["tasks"]:
@@ -639,8 +632,8 @@ class Collector(artifact_core.CollectionSession):
 
             self.read("shim identity", task, decode)
         for row in self.report["tasks"]:
-            # Runtime scope is counterevidence for descendants as well as the
-            # direct child. It must not become positive ancestry-only membership.
+
+
             node, seen = row, set()
             while node.get("real_parent") in self.task_rows:
                 parent = node["real_parent"]
@@ -703,18 +696,18 @@ class Collector(artifact_core.CollectionSession):
             row["identity_conflicts"].append(conflict)
 
     def mount_namespace(self, task, entity=None):
-        """태스크의 nsproxy에서 mount namespace를 찾아 공통 네임스페이스 기록에 등록한다.
+        """Read a task's mount namespace and register it in the shared namespace store.
 
-        로직: nsproxy의 mnt_ns 포인터를 확인하고 공통 namespace 수집 함수에 전달한다.
+        Validate nsproxy.mnt_ns before passing it to the common namespace collector.
         """
         if not task.nsproxy or not task.nsproxy.mnt_ns:
             return None
         return self.namespace(task.nsproxy.mnt_ns, "mnt", entity)
 
     def bind_mount_record(self, mount, task, ns):
-        """표준 설정 파일의 bind mount 원천 경로를 복원하고, 경로에서 확인한 컨테이너 ID를 기록한다.
+        """Recover a standard settings bind source and record its container ID.
 
-        로직: 표준 /etc 파일의 마운트만 골라 원천 dentry 경로를 복원하고 ID·파일명 일치를 검사한다.
+        Restrict the check to standard /etc files and validate both ID and filename.
         """
         source = self.standard_bind_source(mount, task)
         if source is None:
@@ -732,9 +725,9 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def standard_bind_source(self, mount, task):
-        """표준 /etc bind mount의 원천 파일과 컨테이너 디렉터리를 검증해 반환한다.
+        """Validate and return the source file and directory of a standard /etc bind.
 
-        로직: 파일명을 먼저 확인하고, mount 경로·상위 dentry·전체 원천 경로의 ID가 일치하는지 검사한다.
+        Check the filename, visible mount path, parent dentry, and source-path ID together.
         """
         root = mount.get_mnt_root().dereference()
         filename = root.d_name.name_as_str()
@@ -769,9 +762,10 @@ class Collector(artifact_core.CollectionSession):
         return cid, path, source, directory
 
     def collect_mount_identity(self):
-        """ID 미확인 태스크의 비호스트 mount namespace를 조사하고, 오류·충돌 없이 유일한 ID가 확인되면 보완한다.
+        """Use non-host mount namespaces to enrich otherwise unidentified tasks.
 
-        로직: 미식별 태스크를 mount namespace별로 묶어 표준 bind 원천을 조사한다. ID가 유일하고 순회가 완전할 때만 보완한다.
+        Group tasks by namespace and accept a standard-bind ID only when it is unique,
+        conflict-free, and obtained from a complete traversal.
         """
         unknown = [r for r in self.report["tasks"] if not r["container_ids"]]
         if not unknown or self.init is None:
@@ -807,14 +801,14 @@ class Collector(artifact_core.CollectionSession):
             for row in rows:
                 prior_ids.update(row["container_ids"])
             if len(prior_ids) > 1:
-                continue  # Shared namespace with conflicting membership is not an ID fallback.
+                continue
             task = self.tasks[int(unresolved[0]["address"], 16)]
             start, errors = len(self.report["mounts"]), len(self.report["errors"])
 
             def scan(*, ns=ns, task=task):
-                """대상 mount namespace의 마운트를 한도 내 순회하며 표준 bind mount의 ID 근거를 수집한다.
+                """Collect standard-bind identity evidence from a bounded namespace traversal.
 
-                로직: namespace의 마운트를 제한된 개수만 순회하며 각 마운트에서 bind ID 근거를 읽는다.
+                Inspect each reachable mount for a validated bind-source ID.
                 """
                 namespace = self.obj("mnt_namespace", int(ns, 16))
                 for mnt in self.bounded(mount_readers.stock_mount_points(namespace)):
@@ -842,7 +836,7 @@ class Collector(artifact_core.CollectionSession):
                     )
                 continue
             if len(self.report["errors"]) != errors:
-                continue  # An incomplete namespace can conceal conflicting bind sources.
+                continue
             for row in unresolved:
                 row["container_ids"] = sorted(ids)
                 row["identity_sources"].append("standard_bind_mount")
@@ -850,9 +844,9 @@ class Collector(artifact_core.CollectionSession):
                 self.check_runtime_scope(row)
 
     def collect_identity(self):
-        """관찰 태스크가 있으면 shim과 조건부 마운트 분석으로 컨테이너 식별 정보를 보완한다.
+        """Enrich observed tasks through shim evidence and conditional mount analysis.
 
-        로직: 태스크가 없으면 건너뛰고, 있으면 shim 수집과 조건부 mount 식별을 차례로 수행한다.
+        Skip when no leaders were observed; otherwise run both identity sources in order.
         """
         if not self.tasks:
             self.skipped["identity"] = "No observed process leaders to attribute"
@@ -861,9 +855,9 @@ class Collector(artifact_core.CollectionSession):
         self.read("conditional mount identity", "tasks", self.collect_mount_identity)
 
     def collect_selection(self):
-        """태스크를 전체 컨테이너 ID별로 묶고 대표 선정 결과·연결 태스크·출처·충돌을 후보에 저장한다.
+        """Group tasks by full container ID and store representative-selection evidence.
 
-        로직: 검증된 전체 ID로 태스크를 묶고 대표를 정해 후보별 출처·연관 태스크·충돌 상태를 저장한다.
+        Preserve linked tasks, sources, and conflicts for every validated candidate ID.
         """
         groups = {}
         for row in self.report["tasks"]:
@@ -896,9 +890,9 @@ class Collector(artifact_core.CollectionSession):
             self.report["containers"].append(obj)
 
     def collect_details(self):
-        """대표가 선정된 컨테이너에 대해 해당 프로세스의 PID·명령·시작 시각·실행 권한을 수집한다.
+        """Collect PID, command, start time, and credentials for selected representatives.
 
-        로직: 선정된 대표 주소의 task를 찾아 시각과 cred를 읽는다. 대표가 없으면 권한을 추정하지 않는다.
+        Resolve the selected task and read timing and cred; never infer credentials without one.
         """
         if not self.containers:
             self.skipped["details"] = "No task-linked container candidates"
@@ -923,9 +917,9 @@ class Collector(artifact_core.CollectionSession):
             obj["representative"] = record
 
             def credentials(*, record=record, task=task):
-                """대표 태스크의 cred를 확인하고 credential 위치·Effective UID·effective capability를 기록한다.
+                """Read a representative task's credential location, EUID, and capabilities.
 
-                로직: cred 포인터를 역참조해 위치·euid·cap_effective를 각각 오류 격리 경로로 읽는다.
+                Dereference cred and isolate failures for each credential field.
                 """
                 if not task.has_member("cred") or not task.cred:
                     raise artifact_core.Unsupported(
@@ -935,9 +929,9 @@ class Collector(artifact_core.CollectionSession):
                 record["credential_location"] = self.location(cred)
 
                 def effective_uid():
-                    """euid를 val 필드가 있는 구조 또는 정수 형태에 맞춰 읽는다.
+                    """Read euid from either a val-wrapped structure or an integer.
 
-                    로직: euid에 val 멤버가 있으면 그 필드를 사용하고 아니면 값을 직접 정수로 읽는다.
+                    Use the val member when present and otherwise convert the value directly.
                     """
                     value = cred.member("euid")
                     return credential_readers.kernel_id(value, require_member_api=True)
@@ -952,9 +946,10 @@ class Collector(artifact_core.CollectionSession):
             self.read("representative credentials", task, credentials)
 
     def collect_settings(self):
-        """검증된 bind mount 원천 디렉터리에서만 hostconfig.json을 조회한다.
+        """Search hostconfig.json only under verified bind-source directories.
 
-        로직: 컨테이너별 mount namespace에서 표준 bind 원천을 찾아 직계 자식만 제한 시간 내에 확인한다.
+        Find standard bind sources per container namespace and inspect direct children
+        within explicit time and count limits.
         """
         if not self.containers:
             self.skipped["settings"] = (
@@ -1017,9 +1012,9 @@ class Collector(artifact_core.CollectionSession):
                     state=state,
                     task=task,
                 ):
-                    """한 namespace의 마운트에서 컨테이너 ID와 일치하는 표준 bind 원천을 찾는다.
+                    """Find standard bind sources matching a container ID in one namespace.
 
-                    로직: 개수·시간 한도를 확인하고 검증된 디렉터리 주소를 중복 없이 기록한다.
+                    Enforce count and time limits and retain unique verified directories.
                     """
                     for mount in mount_readers.stock_mount_points(namespace):
                         if (
@@ -1099,9 +1094,9 @@ class Collector(artifact_core.CollectionSession):
                     root_path=root_path,
                     state=state,
                 ):
-                    """다른 컨테이너가 검증한 containers 디렉터리에서 대상 ID만 조회한다.
+                    """Look up one target ID under a containers directory verified by a peer.
 
-                    로직: 직계 자식을 제한 시간·개수 안에서 열거해 정확히 일치하는 ID를 찾는다.
+                    Enumerate direct children within time and count limits for an exact match.
                     """
                     for child in root.get_subdirs():
                         if (
@@ -1145,16 +1140,16 @@ class Collector(artifact_core.CollectionSession):
     def lookup_settings_file(
         self, cid, directory, parent_path, state, deadline, source_complete
     ):
-        """검증된 컨테이너 디렉터리의 직계 자식에서 hostconfig.json만 복구한다.
+        """Recover only hostconfig.json from direct children of a verified directory.
 
-        로직: 자식 조회·파일 복구가 모두 끝난 경우에만 해당 ID의 설정 검색을 완료로 표시한다.
+        Mark the settings search complete only after child lookup and recovery both finish.
         """
         before = len(self.report["errors"])
 
         def find_file():
-            """디렉터리 자식을 제한 시간·개수 안에서 열거하고 대상 inode를 복구한다.
+            """Enumerate bounded directory children and recover the target inode.
 
-            로직: 이름이 hostconfig.json인 양수 dentry만 페이지 캐시 복구로 전달한다.
+            Pass only positive hostconfig.json dentries to page-cache recovery.
             """
             for child in directory.get_subdirs():
                 if (
@@ -1186,9 +1181,10 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def merge_settings(self):
-        """복구한 Privileged 값과 ID의 충돌을 검사해 컨테이너 설정 값·출처·충돌 상태를 반영한다.
+        """Merge recovered Privileged values while preserving identity conflicts.
 
-        로직: 같은 ID의 hostconfig 기록을 찾아 bool 값과 ID 충돌을 비교한다. 유일하고 충돌이 없을 때만 설정을 확정한다.
+        Compare Boolean values and IDs across hostconfig records, accepting a setting
+        only when the result is unique, complete, and conflict-free.
         """
         for cid, obj in self.containers.items():
             rows = [
@@ -1240,18 +1236,19 @@ class Collector(artifact_core.CollectionSession):
                 obj["association"] = "CONFLICT"
 
     def collect(self):
-        """tasks·identity·selection·details·settings 단계를 순서대로 실행하고 전체 수집 보고서를 반환한다.
+        """Run tasks, identity, selection, details, and settings in order.
 
-        로직: 정해진 STAGES 순서로 collect_* 함수를 호출하고 누적 보고서를 반환한다.
+        Invoke each collect_* method in STAGES order and return the accumulated report.
         """
         for stage in STAGES:
             self.stage_run(stage, getattr(self, "collect_" + stage))
         return self.report
 
     def read_vmemmap_base(self):
-        """vmemmap_base의 실제 타입을 검증해 읽고, 타입 정보가 없을 때만 대상 커널의 포인터 폭·바이트 순서를 사용한다.
+        """Read vmemmap_base after validating its concrete symbol type.
 
-        로직: 심볼 타입이 있으면 정수 폭·부호를 확인해 읽는다. 타입이 없을 때만 대상 ABI 형식으로 읽으며 타입 오류·읽기 실패에는 재시도하지 않는다.
+        Validate integer width and signedness when type data exists; otherwise use
+        the target kernel pointer width and byte order without masking type errors.
         """
         word = self.kernel.get_type("pointer").vol.data_format
         if word.signed or word.length * 8 != self.layer.bits_per_register:
@@ -1274,8 +1271,8 @@ class Collector(artifact_core.CollectionSession):
                 )
             base = int(self.kernel.object_from_symbol("vmemmap_base"))
         else:
-            # Some ISFs provide global addresses without variable types. Only
-            # this known address-valued global uses the native-word fallback.
+
+
             address = self.layer.canonicalize(
                 self.kernel.get_absolute_symbol_address("vmemmap_base")
                 & self.layer.address_mask
@@ -1289,9 +1286,10 @@ class Collector(artifact_core.CollectionSession):
         return base
 
     def recover_privileged(self, inode, path, cid):
-        """hostconfig.json의 캐시 페이지를 복구해 Privileged를 읽고, 누락 범위·파싱 상태·ID 충돌을 기록한다.
+        """Recover cached hostconfig.json pages and read the Privileged field.
 
-        로직: inode의 캐시 페이지를 모아 연속된 데이터만 JSON으로 해석한다. 누락·중복·ID 충돌을 기록하고 bool Privileged만 채택한다.
+        Parse only contiguous recovered bytes, record holes, duplicates, and ID
+        conflicts, and accept Privileged only when it is Boolean.
         """
         if cid not in self.containers:
             return
@@ -1318,17 +1316,17 @@ class Collector(artifact_core.CollectionSession):
         page_size = self.layer.page_size
 
         def recover():
-            """inode의 페이지 캐시 항목을 한도 내 순회하고 각 페이지의 내용 읽기·검증을 수행한다.
+            """Traverse bounded inode cache entries and validate each page's content.
 
-            로직: 페이지 캐시 항목을 순회하면서 각 page의 데이터 검증 함수를 호출한다.
+            Invoke the isolated content reader for every reachable cache page.
             """
             for page_address in self.bounded(storage.get_entries(mapping.i_pages)):
                 page = self.obj("page", page_address)
 
                 def content(*, page=page):
-                    """페이지의 mapping·파일 오프셋을 검증해 바이트를 읽고, 중복 데이터 충돌을 검사하며 페이지 해시를 기록한다.
+                    """Validate page mapping and offset, then read, hash, and compare bytes.
 
-                    로직: mapping과 파일 오프셋을 검사한 뒤 실제 페이지 바이트를 읽고 해시·충돌을 기록한다.
+                    Reject conflicting duplicate data at the same file offset.
                     """
                     if int(page.mapping) != int(inode.i_mapping):
                         raise ValueError("Cached page mapping backlink mismatch")
@@ -1336,7 +1334,7 @@ class Collector(artifact_core.CollectionSession):
                         index = int(page.index)
                     elif self.kernel.has_type("folio"):
                         folio = self.obj("folio", page.vol.offset)
-                        # Both views must agree on the mapping member offset.
+
                         if folio.mapping.vol.offset != page.mapping.vol.offset:
                             raise artifact_core.Unsupported(
                                 "folio/page mapping layout differs"
@@ -1421,16 +1419,16 @@ class Collector(artifact_core.CollectionSession):
 
 
 def vertical_presentation(report):
-    """컨테이너 요약을 ID순으로 정렬해 컨테이너당 하나의 category·value 세로 출력 블록으로 구성한다.
+    """Render one category/value block per container, sorted by ID.
 
-    로직: ID로 정렬한 컨테이너에서 대표·권한·출처 값을 추려 category/value 행을 만든다.
+    Select representative, credential, and provenance fields for vertical output.
     """
     rows = []
 
     def cell(value):
-        """미확인 값은 하이픈으로 표시하고, 나머지 값은 줄바꿈·탭을 이스케이프한 문자열로 변환한다.
+        """Render unknown values as hyphens and escape tabs and newlines.
 
-        로직: None·빈 값은 하이픈으로 바꾸고 문자열의 탭·줄바꿈을 한 줄 표시에 맞게 이스케이프한다.
+        Keep every value on one display line without inventing missing data.
         """
         return (
             "-"
@@ -1460,9 +1458,9 @@ def vertical_presentation(report):
 
 
 def run_ps(context, kernel_name, open_file):
-    """통합 Docker 플러그인의 --ps 결과와 증거 파일을 생성한다.
+    """Generate --ps output and its evidence file for the unified Docker plugin.
 
-    로직: Collector로 수집한 보고서를 JSON으로 저장하고, 오류를 경고한 뒤 세로형 TreeGrid를 반환한다.
+    Save the Collector report as JSON, warn about errors, and return a vertical TreeGrid.
     """
     report = Collector(context, kernel_name).collect()
     with open_file("ps_evidence.json") as output:

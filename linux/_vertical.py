@@ -1,4 +1,7 @@
-"""Render one collected record as a category/value block, like Docker --ps."""
+"""Render wide Docker-analysis records as readable category/value blocks.
+Detector, process, mount, network, and capability views use it to avoid wide tables.
+It changes presentation only; each backend still owns values and evidence semantics.
+"""
 
 from volatility3.framework import renderers
 from volatility3.framework.renderers import format_hints

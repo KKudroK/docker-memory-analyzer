@@ -1,7 +1,7 @@
-"""Credential values and evidence readers with explicit layout checks.
-
-The inventory mask reader retains its narrower supported layouts; the audit
-decoder also records raw bytes and unknown bits. Neither evaluates privilege.
+"""Recover task credentials and capability evidence for container analyses.
+Process, capability, and task views use these readers for IDs, capability sets,
+user namespaces, and security state with explicit kernel-layout validation.
+Raw bytes and unknown bits are preserved, and the reader never decides privilege.
 """
 
 from volatility3.framework import exceptions, objects
@@ -33,9 +33,10 @@ def namespace_inum(namespace):
 
 
 def capability_mask(value):
-    """실제 val/cap 필드의 타입·크기를 검증해 capability 비트마스크를 읽고, 미지원 구조는 오류로 알린다.
+    """Read a capability mask after validating the concrete val/cap field layout.
 
-    로직: val 또는 cap 필드를 골라 부호·폭·배열 길이를 검증하고 비트마스크로 결합한다. 알 수 없는 구조를 0으로 처리하지 않는다.
+    Select the val or cap field, validate signedness, width, and array length,
+    then combine the values into a mask. Unknown layouts are never treated as zero.
     """
     fields = [name for name in ("val", "cap") if value.has_member(name)]
     if len(fields) != 1:
@@ -46,9 +47,9 @@ def capability_mask(value):
         raise artifact_core.Unsupported("Capability exceeds its structure")
 
     def unsigned(t, sizes):
-        """타입이 포인터가 아닌 부호 없는 정수이며 허용된 크기인지 검사한다.
+        """Check that the type is a supported unsigned integer, not a pointer.
 
-        로직: 객체 타입·부호·크기를 확인해 허용된 정수 타입인지 반환한다.
+        Inspect the object class, signedness, and width before accepting it.
         """
         return (
             issubclass(t.vol.object_class, objects.Integer)
@@ -96,7 +97,7 @@ def _unsigned(value, width, cap, raw):
     result = int(value)
     if not 0 <= result < (1 << (width * 8)):
         raise ValueError("Capability integer exceeds its unsigned storage width")
-    # 심볼 객체가 해석한 값과 보고서에 보존할 바이트가 같은 위치·값을 가리키는지 확인한다.
+
     if result != int.from_bytes(
         raw[relative : relative + width], fmt.byteorder, signed=False
     ):
@@ -105,8 +106,8 @@ def _unsigned(value, width, cap, raw):
 
 
 def _read_mask(cap, raw):
-    # 정수의 크기/바이트 순서는 심볼에서 읽는다. cap 배열은 기존 Linux 규칙대로
-    # 원소 0이 하위 비트다. 임의의 다른 멤버 이름이나 포인터를 권한으로 추정하지 않는다.
+
+
     if isinstance(cap, objects.Pointer):
         raise artifact_core.UnsupportedLayout(
             "A capability pointer is not a stored capability mask"
@@ -152,8 +153,8 @@ def _read_mask(cap, raw):
 
 
 def _kernel_range(module, storage_bits=64):
-    # 보조 범위의 실패가 이미 읽은 capability 마스크·바이트를 무효화하지 않게 한다.
-    # 타입 보완 근거는 범위 관측에만 남긴다. 정상적인 기존 타입은 덮어쓰지 않는다.
+
+
     details = {}
     try:
         if not module.has_symbol("cap_last_cap"):
@@ -175,8 +176,8 @@ def _kernel_range(module, storage_bits=64):
                     "Untyped cap_last_cap requires an available int type: "
                     + artifact_core.exception_detail(exc)
                 ) from exc
-            # Linux의 cap_last_cap은 int다. 현재 지원하는 x86-64의 signed 32-bit
-            # 형식인지 먼저 확인하고, 주소·모듈 재배치는 Volatility API에 맡긴다.
+
+
             if (
                 getattr(integer_type.vol, "object_class", None) is not objects.Integer
                 or integer_type.size != 4
@@ -187,8 +188,8 @@ def _kernel_range(module, storage_bits=64):
                     "Untyped cap_last_cap requires a signed 32-bit little-endian int type"
                 )
             details["object_type"] = integer_type.vol.type_name
-            # object_from_symbol은 'int' 문자열에 심볼 테이블명을 붙이지 않는다.
-            # 현재 모듈에서 찾은 템플릿을 넘겨 같은 커널의 정수형을 사용한다.
+
+
             value = module.object_from_symbol("cap_last_cap", object_type=integer_type)
         else:
             value = module.object_from_symbol("cap_last_cap")
@@ -273,9 +274,9 @@ def _kernel_range(module, storage_bits=64):
                 **details,
             ),
         )
-    except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
-        # TypeError·ValueError·기타 보조 조회 실패도 범위만 미확인으로 남긴다.
-        # 원시 capability 자체의 읽기/구조 검사는 이 예외 경계 밖에서 수행한다.
+    except Exception as exc:
+
+
         return (
             None,
             None,
@@ -310,7 +311,7 @@ def decode_capability(context, module, cap):
     try:
         raw_mask, layout, storage_bits = _read_mask(cap, raw)
     except Exception as exc:
-        # 해석 실패도 원시 증거는 유지한다. None을 0 또는 빈 집합으로 바꾸지 않는다.
+
         exc.capability_evidence = {
             "virtual_address": hex(int(cap.vol.offset)),
             "size": size,
@@ -326,10 +327,10 @@ def decode_capability(context, module, cap):
             "out_of_range_bits": None,
         }
         raise
-    # _kernel_range는 보조 관측이다. 실패해도 아래 원시 증거와 이름 해석은 계속한다.
+
     kernel_mask, last_cap, range_observation = _kernel_range(module, storage_bits)
-    # 표시용 decoded_mask와 원래 저장된 raw_mask를 분리한다. 커널 범위 밖 비트나
-    # 설치된 이름 목록에 없는 비트도 JSON에서 사라지지 않게 보존한다.
+
+
     decoded_mask = raw_mask if kernel_mask is None else raw_mask & kernel_mask
     known_mask = (1 << len(linux.CAPABILITIES)) - 1
     unknown_bits = raw_mask & ~known_mask
@@ -367,14 +368,14 @@ def decode_capability(context, module, cap):
             )
         )
     text = ", ".join(names)
-    # all은 확인된 커널 capability 범위의 모든 비트라는 뜻이며 호스트 접근 허용 판정이 아니다.
+
     if kernel_mask is not None and raw_mask == kernel_mask and not unknown_bits:
         text = "all"
     if out_of_range:
         suffix = "[out_of_range: " + ", ".join(_bit_labels(out_of_range)) + "]"
         text = (text + " " + suffix).lstrip()
-    # text는 표시용, evidence는 재검증용 원시 값, observations는 해석의 지원·일관성 상태다.
-    # 호출자는 빈 text(읽힌 권한 없음)와 판독 예외(읽지 못함)를 별도로 처리한다.
+
+
     return {
         "text": text,
         "evidence": {
@@ -423,8 +424,8 @@ def anonymous_member(obj, name, depth=0):
 
 
 def map_kernel_id(extents, value):
-    # cred에서 읽은 커널 ID를 해당 user namespace에서 보이는 ID로 변환한다.
-    # kernel_first 구간에 대응하는 항목이 없으면 추정 ID 대신 None을 반환한다.
+
+
     matches = [
         e["namespace_first"] + value - e["kernel_first"]
         for e in extents
@@ -444,7 +445,7 @@ def read_id_map(idmap, module):
     if count == 0:
         return []
     source = anonymous_member(idmap, "extent")
-    # 작은 매핑은 구조체 안의 extent, 큰 매핑은 forward가 가리키는 별도 배열에 저장된다.
+
     if count <= len(source):
         values = [source[i] for i in range(count)]
     else:
@@ -515,7 +516,7 @@ class SecurityReader:
                     artifact_core.exception_detail(exc),
                 )
             )
-        except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        except Exception as exc:
             self.observations.append(
                 artifact_core.observation(
                     "user_namespace.initial",
@@ -579,7 +580,7 @@ class SecurityReader:
                     "uid_map": None,
                     "gid_map": None,
                 }
-                # 필드 판독 전에 노드를 넣어 이후 오류가 나도 도달한 주소와 부분 관측을 남긴다.
+
                 result["chain_leaf_to_initial"].append(node)
                 feature = "user_namespace." + hex(key)
                 node["inum"] = artifact_core.capture(
@@ -644,7 +645,7 @@ class SecurityReader:
                     )
                 )
                 break
-            except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+            except Exception as exc:
                 observations.append(
                     artifact_core.observation(
                         "user_namespace.parent_chain",
@@ -654,8 +655,8 @@ class SecurityReader:
                 )
                 break
         if chain_complete and self.initial_address is not None:
-            # user namespace 적용 범위는 init_user_ns까지의 주소·부모·level 연결로 확인한다.
-            # EUID 0이나 namespace 번호만으로 초기 namespace라고 추정하지 않는다.
+
+
             result["scope"] = (
                 "initial_user_namespace"
                 if address == self.initial_address
@@ -675,8 +676,8 @@ class SecurityReader:
         return result
 
     def credentials(self, cred):
-        # 입력은 역참조된 cred 객체다. 현재 cred인지 real_cred인지는 호출자가 구분하며,
-        # 여기서는 각 객체를 독립적으로 읽어 두 자격 증명의 관측이 서로 덮어쓰이지 않게 한다.
+
+
         observations = []
         result = {
             "address": hex(int(cred.vol.offset)),
@@ -736,7 +737,7 @@ class SecurityReader:
                         name, "inconsistent", artifact_core.exception_detail(exc)
                     )
                 )
-            except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+            except Exception as exc:
                 result["capability_evidence"][name] = getattr(
                     exc, "capability_evidence", None
                 )
@@ -841,7 +842,7 @@ class SecurityReader:
         )
 
     def enrich_identity(self, result, cred):
-        # credentials()의 결과에 ID 적용 범위를 덧붙인다. CAPS 판독 성공 여부와는 독립적이다.
+
         observations = result.setdefault("observations", [])
         result["user_namespace"] = {
             "scope": "unknown",
@@ -861,7 +862,7 @@ class SecurityReader:
             result["user_namespace"] = scope
             observations.extend(scope["observations"])
         chain = result["user_namespace"]["chain_leaf_to_initial"]
-        # 체인의 첫 노드가 이 cred의 user namespace이므로 해당 노드의 ID 매핑을 사용한다.
+
         leaf = chain[0] if chain else {}
         for name, value in result["ids_kernel"].items():
             mappings = leaf.get("uid_map" if "uid" in name else "gid_map")
@@ -897,7 +898,7 @@ class SecurityReader:
                 )
 
     def seccomp(self, task):
-        # 모드·선언 개수·필터 연결을 관측한다. BPF 명령을 평가해 syscall 허용 여부를 계산하지 않는다.
+
         observations = []
         result = {
             "mode": None,
@@ -1019,12 +1020,12 @@ class SecurityReader:
         observed = artifact_core.capture(
             observations, "seccomp.filter_chain", walk_filters
         )
-        # 중간에 끊겨도 도달한 필터 수는 남긴다. 실제 전체 개수로 쓸 수 있는지는 chain_complete로 구분한다.
+
         result["observed_filter_count"] = len(result["filters"])
         result["chain_complete"] = observed is not None
         if observed is not None:
             if declared is None:
-                # 선언 필드가 없을 때는 끝까지 읽은 체인의 길이만 대체 개수로 사용한다.
+
                 result["filter_count"], result["filter_count_source"] = (
                     observed,
                     "complete_filter_chain",
@@ -1110,8 +1111,8 @@ class SecurityReader:
         return result
 
     def mounts(self, task):
-        # CAPS 비교에 필요한 namespace와 프로세스 루트 주소만 수집한다.
-        # 마운트 목록은 읽지 않으므로 빈 목록 대신 명시적인 미수집 상태를 남긴다.
+
+
         observations = []
         result = {
             "namespace_address": None,

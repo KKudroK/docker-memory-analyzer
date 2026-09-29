@@ -1,36 +1,9 @@
-# SPDX-License-Identifier: MIT
-"""Docker의 --inspect-files 옵션: 컨테이너의 열린 FD와 파일 경로 분석.
+"""Analyze open file descriptors owned by container tasks in Linux memory.
+The --inspect-files option reports paths, access modes, host aliases, inode facts,
+and unlinked-name state through files, hosts, and details views.
+It describes current open files, not closed descriptors, history, or file contents.
 
-대상 환경: Volatility 3 2.28.0, Intel Linux, 덤프와 일치하는 kernel ISF.
-linux.docker.Docker를 통해 실행하는 내부 분석 모듈이다. cgroup 소속,
-마운트 목록, 파일 경로는 linux/_artifacts의 공통 판독기와 Volatility 공식 API로 읽는다.
-
-실행 예시 (전역 옵션은 플러그인 이름 앞):
-    vol -p ./plugins -s SYMBOLS -f MEMORY linux.docker.Docker --inspect-files
-    vol -p ./plugins -s SYMBOLS -f MEMORY linux.docker.Docker --inspect-files --view hosts
-    vol -p ./plugins -s SYMBOLS -f MEMORY linux.docker.Docker --inspect-files --view details
-    vol -p ./plugins -s SYMBOLS -f MEMORY linux.docker.Docker --inspect-files --pids 4283
-
-모든 보기는 Record / Field / Value 3열 세로형이다. Container, PID/TID,
-FD도 각각 한 행으로 표시한다. 같은 FD의 항목은 같은 Record 번호로 묶는다.
-Record는 실행 결과 안의 순번이며 커널 객체 ID나 실행 간 고정 식별자가 아니다.
-files / hosts / details는 표시할 항목만 바꾸며 출력 방향은 동일하다.
---extended는 details 보기의 별칭이다. PID/TID는 공유 FD 테이블의 대표 태스크다.
-동일 프로세스의 동일 files_struct/root/소속만 중복 제거한다. 다른 프로세스,
-다른 FD 번호, 별도 파일 테이블을 가진 스레드는 합치지 않는다.
-컨테이너 ID는 충돌 없는 최소 12자리로 표시하며 --full-id로 원문을 출력한다.
-JSON도 같은 규칙이므로 증거용 JSON에는 --full-id를 사용한다.
-JSON/CSV도 같은 3열 구조이며, Record로 묶고 Field/Value를 읽으면 된다.
-
-UNLINKED는 d_unlinked() 형태의 이름 연결 상태이지 삭제 행위의 입증이 아니다.
-익명 객체, 이름 없는 임시 파일, 읽기 실패를 구분한다. 파일 내용은 추출하지
-않으며, 닫힌 FD/과거 이력/VMA에만 남은 파일/overlay backing layer는 범위 밖이다.
-호스트 경로는 확인된 mount alias이며 원래 mount 명령이나 접근 권한이 아니다.
-details 보기의 Read Status는 판독 상태이며 위험도/점수가 아니다.
-기본 State의 *는 일부 정보 판독 실패를 뜻하며 details에서 사유를 확인한다.
-NAME_ONLY는 이름만 확인된 경우다. 정상 FD가 현재 프로세스의 루트 밖을
-가리키는 경우도 포함하며, 호스트 경로는 별도로 확인할 수 있다.
-일부 제어문자·비UTF8 파일명은 현재 판독 범위 밖이다.
+SPDX-License-Identifier: MIT
 """
 
 import collections
@@ -61,7 +34,7 @@ vollog = logging.getLogger(__name__)
 MAX_TASKS = 1000000
 
 
-# 실제 cgroup 소속과 런타임 조상 관계 판독.
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,7 +114,7 @@ _CGROUP_ID_PATTERNS = tuple(
     for pattern, runtime, kind, source in _CGROUP_ID_PATTERNS
 )
 
-# task.comm의 15바이트 절단만 허용한다. 일반 런처 이름은 근거가 아니다.
+
 RUNTIME_SUPERVISORS = (
     ("containerd-shim", "containerd"),
     ("conmon", "podman/cri-o"),
@@ -154,7 +127,7 @@ RUNTIME_SUPERVISORS = (
 
 
 def _cgroup_identity(memberships):
-    """알려진 runtime 경로만 식별하며 중첩·계층 간 ID 충돌은 보류한다."""
+    """Recognize known runtime paths and defer nested or cross-level ID conflicts."""
     matches = []
     for membership in memberships:
         for pattern, runtime, kind, source in _CGROUP_ID_PATTERNS:
@@ -244,7 +217,7 @@ def _observe_task(task, *, diagnostics=None):
 
 
 def _safe_text(value):
-    """터미널 제어문자는 이스케이프한다. 의미 있는 공백은 삭제하지 않는다."""
+    """Escape terminal control characters without removing meaningful whitespace."""
     return "".join(
         f"\\x{ord(char):02x}" if ord(char) < 32 or ord(char) == 127 else char
         for char in str(value)
@@ -252,7 +225,7 @@ def _safe_text(value):
 
 
 def _display_ids(identifiers, full=False):
-    """짧은 ID끼리 충돌하면 구별될 때까지 확장한다. 내부 소속 ID는 항상 원문이다."""
+    """Extend colliding short IDs until unique while retaining full internal IDs."""
     identifiers = sorted({identifier for identifier in identifiers if identifier})
     if full:
         return {identifier: identifier for identifier in identifiers}
@@ -448,7 +421,7 @@ class InspectFiles(plugins.PluginInterface):
                             for item in task_diagnostics
                         )
                     if observation is None and wanted is None:
-                        # 자동 모드는 소속 근거를 못 읽은 host task를 컨테이너로 추측하지 않는다.
+
                         if task.fs and task.nsproxy:
                             failures["task-membership-or-view"] += 1
                         continue
@@ -464,9 +437,9 @@ class InspectFiles(plugins.PluginInterface):
                                 task_readers.comm_matches(command, signature)
                                 for signature, _ in RUNTIME_SUPERVISORS
                             )
-                            # shim 자체의 FD를 컨테이너 내부 FD로 오인하지 않는다.
-                            # 강한 cgroup 근거가 있으면 host MNT NS 공유 컨테이너도
-                            # 허용하지만, supervisor 단독 근거는 분리된 NS를 요구한다.
+
+
+
                             related = (
                                 not itself_supervisor
                                 and artifact_core._object_address(observation.mnt_ns)
@@ -511,8 +484,8 @@ class InspectFiles(plugins.PluginInterface):
                             artifact_core._object_address(observation.mnt_ns),
                             observation.root_key,
                         )
-                    # 같은 프로세스의 같은 FD table만 합친다. 다른 프로세스의
-                    # 공유 FD, 스레드 전용 FD table, 다른 root/cgroup은 보존한다.
+
+
                     key = (tgid, files_address, view_key, owner)
                     if key not in views:
                         views[key] = TaskView(
@@ -691,17 +664,17 @@ class InspectFiles(plugins.PluginInterface):
                 counts["rows"] += 1
                 counts[facts.state] += 1
                 displayed_path = _safe_text(path) or "-"
-                # 식별자도 가로 열로 반복하지 않고 FD 묶음 안의 세로 항목으로 둔다.
-                # counts['rows']는 출력할 FD마다 한 번 증가하므로 여러 별칭이나
-                # 공유 TID가 있어도 하나의 FD는 같은 Record 번호를 유지한다.
+
+
+
                 fields = [
                     ("Container", id_display.get(view.container_id, "-")),
                     ("PID/TID", f"{view.tgid}/{view.tid}"),
                     ("FD", str(fd)),
                 ]
                 if output_view == "files":
-                    # 상태에 별표가 있으면 해당 행의 일부 정보를 못 읽은 것이다.
-                    # 임의로 경로를 자르지 않으며 details에서 그 사유를 확인한다.
+
+
                     state = facts.state + ("*" if issues else "")
                     fields.extend(
                         [
@@ -711,7 +684,7 @@ class InspectFiles(plugins.PluginInterface):
                         ]
                     )
                 elif output_view == "hosts":
-                    # 별칭 여러 개를 긴 셀 하나에 이어 붙이지 않고 각각 한 행으로.
+
                     fields.extend(
                         ("Host Path", _safe_text(alias))
                         for alias in facts.host_paths or ("-",)
@@ -763,13 +736,13 @@ class InspectFiles(plugins.PluginInterface):
                             ),
                         ]
                     )
-                    # 스레드 목록도 길게 합치지 않는다. 여러 TID가 같은 테이블을
-                    # 공유할 때만 별도 행으로 나열한다.
+
+
                     if len(view.members) > 1:
                         fields.extend(
                             ("Shared TID", str(tid)) for tid in sorted(view.members)
                         )
-                # 콘솔/JSON/CSV 모두 같은 구조를 사용하며 실제 값은 자르지 않는다.
+
                 for label, value in fields:
                     yield 0, (counts["rows"], label, value)
         if counts["partial"]:

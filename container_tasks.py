@@ -1,37 +1,9 @@
-# SPDX-License-Identifier: MIT
-"""Docker의 --container-tasks 옵션: 태스크·스레드 상세와 shim 계보·소속 교차 검증.
+"""Analyze container processes, threads, and Docker membership evidence.
+The --container-tasks option reports host/namespace PIDs, credentials, and cgroups.
+It compares cgroup attribution with runtime shim ancestry and preserves conflicts.
+Summary, detail, triage, and audit views use the same collected task evidence.
 
-linux.docker.Docker를 통해 실행하는 내부 분석 모듈이다.
-저장소의 공유 패키지(linux/_artifacts)의 판독기를 재사용한다.
-
-실행:
-    vol -p ./plugins -s ./symbols -f memory.lime linux.docker.Docker --container-tasks
-    vol -p ./plugins -s ./symbols -f memory.lime linux.docker.Docker --container-tasks --details
-    vol -p ./plugins -s ./symbols -f memory.lime linux.docker.Docker --container-tasks --triage
-
-통합한 두 기능:
-
-- (구 9번) 컨테이너 내부 프로세스·스레드 상세
-  컨테이너 ID 필터, Host PID, NS PID, 부모 PID, 명령행, 시작 시각, Effective UID,
-  capability, cgroup 경로. 소속 PID/TID 연결과 스레드 상세 조회를 제공한다.
-
-- (구 10번) 전체 shim 계보·소속 교차 검증
-  태스크의 조상 체인을 real_parent로 추적해 shim 후손을 연결하고, shim ID,
-  runtime namespace, cgroup ID를 비교하여 소속 근거와 충돌을 기록한다.
-
-태스크·shim 수집 결과는 두 기능이 공유한다(1차 순회에서 한 번만 수집).
-
-옵션:
-    --container 접두사: 특정 컨테이너만 표시한다. 6에서 64자리 16진수 고유
-    접두사 하나를 받는다.
-    --triage: 소속 근거의 불일치가 기록된 태스크만 한 행씩 표시한다.
-    cgroup ID와 shim ID를 나란히 비교하고 계보는 audit JSON에 보존한다.
-    옵션이 없으면 핵심 요약 표, --details는 기존 상세 표를 보여준다.
-    전체 수집 근거는 화면과 무관하게 언제나 containertasks-audit.json에 남긴다.
-    표는 표시용이며, 소속 불일치가 곧 악성 행위를 뜻하지는 않는다.
-
-지원 정책은 저장소의 다른 분석과 같다. 커널 버전 번호가 아니라 심볼 구조로
-판독기를 선택하며, 미지원 구조는 임의로 채우지 않고 명시적으로 남긴다.
+SPDX-License-Identifier: MIT
 """
 
 import datetime
@@ -45,14 +17,14 @@ from volatility3.framework.objects import utility
 from volatility3.plugins.linux import docker_artifacts, pslist
 from volatility3.plugins.linux._artifacts import cgroups as cgroup_readers
 
-# 메모리 판독은 공유 패키지에 맡기고 소속 교차 검증과 출력은 여기서 처리한다.
+
 from volatility3.plugins.linux._artifacts import core as artifact_core
 from volatility3.plugins.linux._artifacts import credentials as credential_readers
 from volatility3.plugins.linux._artifacts import tasks as task_readers
 from volatility3.plugins.linux._artifacts import timing as timing_readers
 
 LOG = logging.getLogger(__name__)
-# 2.x changes the default task table and the triage columns/filter semantics.
+
 VERSION_INFO = (2, 1, 1)
 VERSION = ".".join(map(str, VERSION_INFO))
 UTC = datetime.timezone.utc
@@ -75,10 +47,10 @@ def read_error_text(feature, task_address, exc):
 
 
 def short_id(value):
-    """64자리 컨테이너 ID를 표시용으로 앞 12자리만 남긴다.
+    """Shorten a 64-character container ID to twelve characters for display.
 
-    로직: 64자리 16진수면 앞 12자리로 줄이고, 아니면 원래 값을 그대로 둔다.
-    필터와 audit JSON은 전체 ID를 쓰므로 표시에만 영향을 준다.
+    Non-container values remain unchanged. Filtering and audit JSON retain the
+    complete ID, so this transformation affects presentation only.
     """
     if isinstance(value, str) and FULL_ID.fullmatch(value):
         return value[:SHORT_ID_LEN]
@@ -86,9 +58,9 @@ def short_id(value):
 
 
 def abbrev_path(value):
-    """경로 문자열 안의 64자리 해시를 앞 12자리로 축약한다.
+    """Abbreviate 64-character hashes embedded in paths to twelve characters.
 
-    로직: cgroup 경로 등에 박힌 64자리 컨테이너 ID를 짧게 줄여 한 줄에 들어오게 한다.
+    This keeps cgroup and related paths readable in single-line output.
     """
     if isinstance(value, str):
         return HEX64.sub(lambda m: m.group(0)[:SHORT_ID_LEN], value)
@@ -96,16 +68,16 @@ def abbrev_path(value):
 
 
 def truncate(value, limit=CMDLINE_MAX):
-    """긴 문자열을 표시용으로 자르고 끝에 생략 표시를 붙인다."""
+    """Truncate long display strings and append an ellipsis."""
     if isinstance(value, str) and len(value) > limit:
         return value[:limit] + "…"
     return value
 
 
 def utc(seconds, nanoseconds=0):
-    """부팅 기준 초·나노초를 UTC datetime으로 바꾼다.
+    """Convert epoch seconds and nanoseconds into a UTC datetime.
 
-    로직: epoch 기준 초를 UTC로 변환한 뒤 나노초를 마이크로초로 더한다.
+    Convert seconds first, then add nanoseconds at microsecond precision.
     """
     return datetime.datetime.fromtimestamp(seconds, UTC) + datetime.timedelta(
         microseconds=nanoseconds // 1000
@@ -113,11 +85,10 @@ def utc(seconds, nanoseconds=0):
 
 
 def identify_docker(chain):
-    """루트→말단 cgroup 체인에서 가장 가까운 Docker 표식 조상을 고른다.
+    """Select the nearest Docker marker in a root-to-leaf cgroup chain.
 
-    로직: docker-<id>.scope 또는 docker/<id> 형태를 찾아 가장 나중(가장 가까운)
-    표식을 컨테이너 ID로 삼는다. 표식이 없으면 None을 반환한다. inspect-caps의
-    동일 함수를 그대로 옮긴 것으로, 소속 판독기에 그대로 전달한다.
+    Recognize docker-<id>.scope and docker/<id>, keeping the deepest match as
+    the container ID. Return None when no supported marker is present.
     """
     found = None
     for index, node in enumerate(chain):
@@ -142,7 +113,7 @@ def identify_docker(chain):
 
 
 class _Timing(artifact_core.CollectionSession):
-    """공통 시간 판독기의 결과를 이 옵션의 UTC datetime 형식으로 변환한다."""
+    """Adapt shared timing-reader results to this analysis's UTC datetime format."""
 
     def __init__(self, context, kernel_name):
         super().__init__(context, kernel_name)
@@ -201,13 +172,13 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             ),
         ]
 
-    # ---- 공유 판독기 준비 ----------------------------------------------------
+
 
     def _readers(self, module):
-        """소속·보안·시작시각·PID 판독기를 구성한다.
+        """Construct membership, security, timing, and PID namespace readers.
 
-        로직: 소속 판독기와 보안 판독기, 시작시각 판독기, PID namespace 레이아웃을
-        각각 준비한다. 하나가 실패해도 나머지 계층은 독립적으로 사용한다.
+        Initialize each reader independently so one unsupported layer does not
+        prevent the remaining evidence sources from being used.
         """
         readers = {"layout": {}}
         try:
@@ -215,7 +186,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 module, identify_docker
             )
             readers["layout"]["membership"] = readers["resolver"].compatibility
-        except Exception as exc:  # noqa: BLE001 - 계층 독립 실행을 위해 광범위하게 잡는다.
+        except Exception as exc:
             readers["resolver"] = None
             readers["layout"]["membership"] = {
                 "feature": "container_membership",
@@ -232,7 +203,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             readers["layout"]["security"] = security_observations
         try:
             readers["timing"] = _Timing(self.context, self.config["kernel"])
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             readers["timing"] = None
             readers["layout"]["timing"] = {
                 "feature": "process_timing",
@@ -245,7 +216,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     self.context, self.config["kernel"]
                 )
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             compatibility = dict(
                 getattr(
                     exc,
@@ -257,7 +228,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             readers["layout"]["pid_namespace"] = compatibility
         return readers
 
-    # ---- 조상 체인 추적 (구 10번) --------------------------------------------
+
 
     @staticmethod
     def _ancestors(task, limit=ANCESTRY_LIMIT):
@@ -283,27 +254,27 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         return observations
 
     def _cgroup_container_id(self, task, readers, *, errors):
-        """태스크 cgroup의 Docker 소속 ID만 뽑는다(없으면 None).
+        """Return the Docker membership ID decoded from a task cgroup, if any.
 
-        로직: 소속 판독기로 태스크 cgroup을 해석해 표식 ID를 반환한다. 판독 실패는
-        audit의 수집 오류 목록에 기록하므로 후보에서 제외된 태스크의 실패도 보존한다.
+        Record resolution failures in the audit error list so evidence lost
+        before candidate selection remains visible.
         """
         if readers["resolver"] is None:
             return None
         try:
             _cset, _cgroup, _chain, group = readers["resolver"].resolve(task)
-        except Exception as exc:  # noqa: BLE001 - 후보 판독 실패를 기록하고 다음 태스크를 수집한다.
+        except Exception as exc:
             errors.append(read_error_text("container_membership", task.vol.offset, exc))
             return None
         return group["id"] if group else None
 
-    # ---- shim 신원 (구 10번, 1차 순회에서 공유 수집) --------------------------
+
 
     def _shim_identity(self, task, readers, address, *, errors):
-        """shim 후보의 명령행에서 컨테이너 ID·runtime namespace를 해석한다.
+        """Decode container ID and runtime namespace from a shim candidate's argv.
 
-        로직: 공통 API로 ID·namespace를 독립적으로 읽고 검증 진단을 보존한다.
-        유효한 Docker ID 후보는 shim 자신의 cgroup ID와 함께 교차 검증한다.
+        Read both fields independently through the shared API, retain validation
+        diagnostics, and cross-check valid IDs against the shim's own cgroup ID.
         """
         pid = None
         try:
@@ -325,8 +296,8 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             AttributeError,
             TypeError,
         ) as exc:
-            # A read failure is not evidence that the shim omitted its ID flags.
-            # Keep the failure even when this task is excluded from later views.
+
+
             reason = read_error_text("shim_argv", address, exc)
             errors.append(reason)
             return {
@@ -356,13 +327,13 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             "error": "; ".join(identity["errors"]) or None,
         }
 
-    # ---- 태스크 상세 (구 9번) + 교차 검증 (구 10번) --------------------------
+
 
     def _task_detail(self, task, readers, module, shims, *, ancestry=None):
-        """한 태스크의 상세 값과 조상·shim 계보·소속 교차 검증 결과를 모은다.
+        """Collect task details and cross-check membership against shim ancestry.
 
-        로직: 호스트/네임스페이스 PID, 부모 PID, 명령행, 시작 시각, EUID, capability,
-        cgroup 경로를 읽고, 조상 체인에서 가까운 shim을 찾아 소속 근거를 대조한다.
+        Read host and namespace PIDs, parent, argv, timing, credentials, capabilities,
+        and cgroups, then compare the nearest shim lineage with cgroup attribution.
         """
         address = int(task.vol.offset)
         detail = {
@@ -420,7 +391,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         except (exceptions.VolatilityException, ValueError, AttributeError) as exc:
             record_error("parent_pid", exc)
 
-        # 명령행·시작 시각 (구 9번)
+
         try:
             detail["Cmdline"] = " ".join(
                 docker_artifacts.DockerArtifacts.read_task_argv(
@@ -450,7 +421,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             ) as exc:
                 record_error("process_start", exc)
 
-        # PID namespace 계층 (구 9번, 소속 PID/TID 연결)
+
         try:
             chain = docker_artifacts.DockerArtifacts.read_pid_chain(
                 self.context,
@@ -471,10 +442,10 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             detail["NSPID"] = next(
                 x["id"] for x in leader_chain if x["namespace"] == detail["PIDNS"]
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             record_error("pid_namespace", exc)
 
-        # EUID·capability·user namespace (구 9번)
+
         security = readers["security"]
         try:
             if int(task.cred):
@@ -482,7 +453,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 credentials = security.credentials(cred)
                 try:
                     security.enrich_identity(credentials, cred)
-                except Exception as exc:  # noqa: BLE001 - 보강 실패를 기록하고 capability 판독은 보존한다.
+                except Exception as exc:
                     record_error("credentials.identity", exc)
                 detail["EUID"] = credentials.get("ids_kernel", {}).get("euid")
                 detail["capabilities"] = credentials.get("capabilities", {})
@@ -499,10 +470,10 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     if observation not in detail["observations"]:
                         detail["observations"].append(observation)
                     detail["Status"] = "partial"
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             record_error("credentials", exc)
 
-        # cgroup 경로·소속 ID (구 9번 경로 + 구 10번 cgroup 근거)
+
         cgroup_cid = None
         if readers["resolver"] is not None:
             try:
@@ -516,10 +487,10 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     cgroup_cid = group["id"]
                     detail["ContainerID"] = group["id"]
                     detail["ContainerRoot"] = group["root_address"]
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 record_error("container_membership", exc)
 
-        # 조상 체인·shim 계보 (구 10번)
+
         if ancestry is None:
             ancestry = self._ancestors(task)
         detail["ancestry"] = ancestry.records
@@ -557,6 +528,8 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 break
         detail["shim_lineage"] = shim_lineage
 
+        # Cgroup membership and shim ancestry are independent evidence; preserve
+        # disagreements as conflicts instead of selecting one source as authoritative.
         detail["membership"], detail["conflicts"] = self._cross_verify(
             cgroup_cid, shim_lineage
         )
@@ -570,11 +543,11 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
 
     @staticmethod
     def _cross_verify(cgroup_cid, shim_lineage):
-        """독립 소속 근거를 대조해 근거 종류·상태·충돌 목록을 만든다(구 10번).
+        """Compare independent membership evidence and report conflicts.
 
-        로직: cgroup ID와 shim 계보 ID의 존재·일치, runtime namespace가 moby인지,
-        shim 인자 ID와 shim 자신의 cgroup ID가 맞는지 비교한다. 상태는
-        confirmed_agree, single_source, conflict, unresolved로 나눈다.
+        Compare cgroup and shim-lineage IDs, the moby runtime namespace, and the
+        shim argv ID against its cgroup. Classify the result as confirmed_agree,
+        single_source, conflict, or unresolved.
         """
         shim_cid = shim_lineage["container_id"] if shim_lineage else None
         runtime_ns = shim_lineage["runtime_namespace"] if shim_lineage else None
@@ -631,9 +604,9 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
 
     @staticmethod
     def _basis_text(status, sources):
-        """근거 상태를 표에 넣을 짧은 문자열로 만든다.
+        """Convert evidence status and sources into a compact table label.
 
-        로직: 상태와 관측 근거 집합을 사람이 읽기 쉬운 한 단어 형태로 요약한다.
+        The label summarizes the source set without replacing the detailed audit data.
         """
         if status == "confirmed_agree":
             return "cgroup+shim(agree)"
@@ -643,7 +616,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             return next(iter(sources)) + "-only"
         return "unresolved"
 
-    # ---- 실행 ----------------------------------------------------------------
+
 
     def run(self):
         module = self.context.modules[self.config["kernel"]]
@@ -653,7 +626,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         if prefix and not re.fullmatch(r"[0-9a-fA-F]{6,64}", prefix):
             raise ValueError("Container prefix must be 6-64 hexadecimal characters")
         triage = self.config.get("triage", False)
-        # 모든 태스크를 수집하고 표시 방식만 바꾼다. triage는 검토 대상과 관계를 표시한다.
+
         conflicts_only = triage
         include_threads = True
 
@@ -689,7 +662,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             "traversal_errors": [],
         }
 
-        # 1차 순회: 전체 태스크 열거 + shim 등록(태스크·shim 수집 결과 공유)
+
         tasks, shims, seen = [], {}, set()
         try:
             for task in docker_artifacts.DockerArtifacts.list_tasks(
@@ -717,13 +690,13 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                     )
                     shims[hex(address)] = record
                     audit["shims"].append(record)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             audit["traversal_errors"].append(
                 read_error_text("task_enumeration", None, exc)
             )
         audit["enumerated_tasks"] = len(seen)
 
-        # 2차 순회: 컨테이너 후보(태스크의 cgroup Docker 소속 또는 shim 조상)만 상세 수집
+
         for task in tasks:
             ancestry = self._ancestors(task)
             audit["traversal_errors"].extend(
@@ -737,7 +710,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 task, readers, errors=audit["traversal_errors"]
             )
             if cgroup_cid is None and not has_shim_ancestor:
-                continue  # 호스트 태스크: 컨테이너 후보가 아니다.
+                continue
             audit["tasks"].append(
                 self._task_detail(task, readers, module, shims, ancestry=ancestry)
             )
@@ -748,12 +721,12 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             if t["membership"]["status"] in ("conflict", "unresolved")
         )
 
-        # 접두사 고유성 검증
+
         observed_ids = {t["ContainerID"] for t in audit["tasks"] if t["ContainerID"]}
         if prefix and len({cid for cid in observed_ids if cid.startswith(prefix)}) > 1:
             raise ValueError("Container prefix is ambiguous; supply more characters")
 
-        # 컨테이너 단위 요약
+
         containers = {}
         for detail in audit["tasks"]:
             cid = detail["ContainerID"]
@@ -786,7 +759,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             for e in sorted(containers.values(), key=lambda x: x["container_id"])
         ]
 
-        # 표시 대상 선택
+
         displayed = audit["tasks"]
         if prefix:
             displayed = [
@@ -809,7 +782,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         )
         audit["displayed_tasks"] = len(displayed)
 
-        # 근거 JSON 저장. self.open은 Volatility 출력 디렉터리(-o)를 따른다.
+
         with self.open("containertasks-audit.json") as handle:
             handle.write(
                 json.dumps(audit, ensure_ascii=False, indent=2, default=str).encode(
@@ -832,14 +805,14 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
             return self._raw_grid(displayed)
         return self._summary_grid(audit, displayed)
 
-    # ---- 출력 ----------------------------------------------------------------
+
 
     @staticmethod
     def _cell(value):
-        """표 셀 값을 정리한다(제어문자 제거, 미확인 값은 N/A).
+        """Normalize table cells by replacing controls and marking unavailable values.
 
-        로직: None은 Volatility 미확인 값으로, 문자열은 제어문자를 공백으로 바꿔
-        반환한다. 정수·불리언은 그대로 둔다.
+        Convert None into Volatility's unavailable value, sanitize strings, and
+        preserve integer and Boolean values.
         """
         if value is None:
             return renderers.NotAvailableValue()
@@ -848,7 +821,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
         return value
 
     def _raw_grid(self, displayed):
-        """태스크별 상세 raw 표(구 9번 항목 + 구 10번 근거)."""
+        """Build the detailed per-task table with membership evidence."""
         columns = [
             ("ContainerID", str),
             ("CgroupPath", str),
@@ -990,7 +963,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
 
     @staticmethod
     def _is_mismatch(task):
-        # A recorded runtime conflict can coexist with an unresolved ID status.
+
         return bool(task["conflicts"])
 
     def _triage_empty_result(self, audit):
@@ -1055,7 +1028,7 @@ class ContainerTasks(interfaces.plugins.PluginInterface):
                 )
             for task in mismatches:
                 lineage = task["shim_lineage"] or {}
-                # Do not substitute a fallback shim ID for missing cgroup evidence.
+
                 cgroup_id = task["membership"]["sources"].get("cgroup")
                 yield (
                     0,

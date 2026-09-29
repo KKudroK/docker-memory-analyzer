@@ -1,6 +1,9 @@
-# SPDX-License-Identifier: MIT
-# Includes readers by the container-mounts contributors (c) 2026.
-"""Namespace identifiers and PID layouts; attribution stays with callers."""
+"""Recover namespace identifiers and nested PID values for container analyses.
+The readers support task attribution, PID/TID views, and mount/network grouping.
+Flexible pid.numbers layouts are validated and incomplete structures remain explicit.
+
+SPDX-License-Identifier: MIT
+"""
 
 from __future__ import annotations
 
@@ -82,7 +85,7 @@ def inspect_pid_layout(module):
             feature, "upid", "invalid symbol type size"
         )
     layout.update(numbers_offset=offset, upid_size=size)
-    # 이 layout은 아래 판독기의 주소 계산과 외부 호환성 보고에 함께 쓰이는 선택 결과다.
+
     return {"feature": feature, "status": "ok", "layout": layout}
 
 
@@ -107,7 +110,9 @@ def read_pid_chain(task, module):
         level = int(pid.level)
         if not 0 <= level <= 32:
             raise ValueError("pid.level: invalid PID namespace level")
-        # 가변 배열의 실제 원소 수는 pid.level에서, 주소 간격은 심볼의 upid 크기에서 얻는다.
+
+        # ISFs may describe pid.numbers as a fixed or flexible array, so derive
+        # each upid address from the validated symbol offset and element size.
         base = int(pid.vol.offset) + layout["numbers_offset"]
         result = []
         for index in range(level + 1):
@@ -130,7 +135,7 @@ def read_pid_chain(task, module):
             )
             result.append({"level": index, "id": nr, "namespace": inum})
         field = "task_struct.pid"
-        # numbers[0]과 task.pid는 태스크의 호스트 TID다. 프로세스 대표 ID인 tgid와 대조하지 않는다.
+
         if result[0]["id"] != int(task.pid):
             raise ValueError(
                 "task_struct.pid and pid.numbers[0].nr: Host TID and PID-object ID disagree"
@@ -168,8 +173,8 @@ def read_process_pid_chain(task, module):
         raise ValueError(
             f"group_leader={address:#x}: process leader points to another task"
         )
-    # Follow pointers, never look up a different task using a matching PID alone.
-    # Threads in a thread group must share the same active PID namespace chain.
+
+
     task_chain = read_pid_chain(task, module)
     leader_chain = read_pid_chain(leader, module)
     if [row["namespace"] for row in task_chain] != [
@@ -186,17 +191,17 @@ def _pid_namespace_values(task) -> tuple[int | None, int | None]:
         if task.has_member("thread_pid") and task.thread_pid:
             pid_pointer = task.thread_pid
         elif task.has_member("pids") and task.pids[0].pid:
-            # Modern kernels commonly expose thread_pid(task) as a macro over
-            # task->pids[PIDTYPE_PID].pid rather than a task_struct member.
+
+
             pid_pointer = task.pids[0].pid
         else:
             return None, None
         pid_object = pid_pointer.dereference()
         level = int(pid_object.level)
-        # pid.numbers[] is a flexible-array member.  BTF/DWARF ISFs commonly
-        # describe it with count 0 even though the dump contains level + 1
-        # struct upid entries immediately after struct pid.  Recast it with
-        # the runtime length before indexing the innermost namespace entry.
+
+
+
+
         if level < 0 or level > 32:
             return None, None
         numbers = pid_object.numbers.cast(
@@ -218,9 +223,10 @@ def _pid_namespace_values(task) -> tuple[int | None, int | None]:
 
 
 def inventory_pid_chain(reader, task):
-    """태스크의 PID 구조를 따라 각 PID namespace 계층의 PID와 네임스페이스 정보를 수집한다.
+    """Collect PIDs and namespace metadata across the task's PID hierarchy.
 
-    로직: thread_pid 또는 pids에서 PID를 찾아 계층 깊이를 검증하고 upid 배열을 순회한다.
+    Locate the PID through thread_pid or pids, validate hierarchy depth,
+    and traverse the upid array without assuming a fixed layout.
     """
     if task.has_member("thread_pid"):
         pid = task.thread_pid

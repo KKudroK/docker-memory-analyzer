@@ -1,4 +1,8 @@
-"""Capability analysis backend for linux.docker.Docker --inspect-caps."""
+"""Analyze container task capabilities and Linux security context from memory.
+The --inspect-caps option reports capability sets, user namespace scope, seccomp,
+and no-new-privileges through raw and analyst views without assigning a risk score.
+Unsupported layouts and incomplete reads remain explicit instead of becoming zero.
+"""
 
 import datetime
 import json
@@ -15,15 +19,15 @@ from volatility3.plugins.linux._artifacts import core as artifact_core
 from volatility3.plugins.linux._artifacts import credentials as credential_readers
 from volatility3.plugins.linux._artifacts import namespaces as namespace_readers
 
-# 버전은 여기서만 정의한다. Volatility 클래스·감사 JSON이 같은 값을 사용한다.
-# 2.x marks the category/value TreeGrid output contract.
+
+
 VERSION_INFO = (2, 0, 5)
 VERSION = ".".join(map(str, VERSION_INFO))
-# 실행 조건을 기록한다. 버전 번호 허용 목록이나 실제 검증 환경 목록이 아니다.
-# 새 결과에만 저장하며, 과거 결과에 현재 정책을 소급해서 붙이지 않는다.
+
+
 SUPPORT_POLICY = {
-    "summary": "Ubuntu·커널 버전 번호로 제한하지 않고, 심볼 구조에 따라 분석합니다. 모든 커널의 완전한 분석을 보장하지 않습니다.",
-    "requirements": "x86-64 Linux, 덤프와 일치하는 심볼, Volatility의 메모리 계층·태스크 열거 지원이 필요합니다.",
+    "summary": "Analysis follows symbol structure rather than Ubuntu or kernel version numbers; complete support for every kernel is not guaranteed.",
+    "requirements": "Requires x86-64 Linux, symbols matching the dump, and Volatility memory-layer and task-enumeration support.",
     "ubuntu_version_filter": False,
     "kernel_version_filter": False,
     "reader_selection": "symbol_structure",
@@ -39,38 +43,38 @@ CAPS = (
     "cap_ambient",
 )
 CAP_FIELDS = CAPS
-# 손상된 심볼의 거대 배열/정수로 인한 자원 소모를 제한한다. 커널 버전 제한은 아니다.
+
 MAX_CAPABILITY_BYTES = 256
 
 
-# 관측 자료 해석과 Volatility analyst 보기
+
 
 REPORT_VERSION = "1.0"
 REVIEW_CAPS = {
-    "sys_admin": "시스템 관리 작업 범위",
-    "sys_module": "커널 모듈 관련 작업",
-    "sys_ptrace": "다른 프로세스 조사·접근 범위",
-    "sys_rawio": "원시 I/O 접근 범위",
-    "dac_read_search": "파일 읽기·디렉터리 검색 검사 우회 범위",
-    "net_admin": "대상 network namespace의 네트워크 설정",
-    "bpf": "특권 BPF 작업과 추가 권한·seccomp 조건",
-    "perfmon": "성능 관측 작업과 대상 범위",
-    "checkpoint_restore": "PID 설정·복원 관련 작업과 대상 범위",
+    "sys_admin": "system administration operations",
+    "sys_module": "kernel module operations",
+    "sys_ptrace": "inspection of and access to other processes",
+    "sys_rawio": "raw I/O access",
+    "dac_read_search": "bypass of file-read and directory-search checks",
+    "net_admin": "network configuration in the target network namespace",
+    "bpf": "privileged BPF operations and related capability or seccomp conditions",
+    "perfmon": "performance-monitoring operations and target scope",
+    "checkpoint_restore": "PID configuration and restoration operations",
 }
 STATUS = {
-    "ok": "확인",
-    "not_present": "필드 없음",
-    "unsupported": "미지원",
-    "read_error": "읽기 실패",
-    "inconsistent": "불일치",
-    "not_evaluated": "미평가",
+    "ok": "confirmed",
+    "not_present": "field not present",
+    "unsupported": "unsupported",
+    "read_error": "read error",
+    "inconsistent": "inconsistent",
+    "not_evaluated": "not evaluated",
 }
 
 
 def clean(value):
     """Render memory-sourced strings as data, including terminal controls."""
     if value is None:
-        return "확인 불가"
+        return "Unavailable"
     return "".join(
         c
         if not (
@@ -87,7 +91,7 @@ def global_observations(audit):
     if "global_observations" in audit:
         observations = audit["global_observations"]
     else:
-        # 이전 파일을 다시 저장하거나 버전을 바꾸지 않고 기록된 전역 실패를 반영한다.
+
         observations = (audit.get("compatibility") or {}).get("security", [])
     result = []
     for item in observations if isinstance(observations, list) else []:
@@ -110,7 +114,7 @@ def audit_quality(audit):
         )
     }
     issues = [item for item in global_observations(audit) if item["status"] != "ok"]
-    # 전역 실패를 태스크마다 복제하지 않는다. 구성원 자체의 성공 상태도 유지한다.
+
     counts["global_errors"] = sum(
         item["status"] in ("read_error", "inconsistent") for item in issues
     )
@@ -150,7 +154,7 @@ def number(value):
 
 def cap_entry(member, field):
     evidence = (member.get("capability_evidence") or {}).get(field) or {}
-    # 과거 감사 파일의 권한 이름만으로 마스크를 역산하지 않는다. None은 미기록, 0은 빈 집합이다.
+
     mask = number(evidence.get("raw_mask"))
     names = evidence.get("names")
     value = member.get(field)
@@ -179,19 +183,19 @@ def cap_entry(member, field):
     state = (
         STATUS.get(states[0]["status"], states[0]["status"])
         if states
-        else "원시 마스크 미기록"
+        else "raw mask not recorded"
     )
-    text = "없음" if mask == 0 else ", ".join(names) if names else clean(value)
+    text = "None" if mask == 0 else ", ".join(names) if names else clean(value)
     if mask is None:
-        text = (clean(value) if value is not None else state) + " [마스크 확인 불가]"
+        text = (clean(value) if value is not None else state) + " [mask unavailable]"
     return {"mask": mask, "names": names, "text": text, "evidence": evidence}
 
 
 def task_report(member):
-    # 이름 문자열이 아닌 보존된 원시 마스크로 집합 차이를 계산한다. 미기록 값은 미확인이다.
-    # Bounding은 exec 시 취득 제한이므로 E가 B 밖에 있다는 이유만으로 불일치로 분류하지 않는다.
+
+
     sets = {field: cap_entry(member, field) for field in CAPS}
-    # 집합 관계 계산에는 I/P/E/A를 쓰며, Bounding 근거는 sets에 그대로 보존한다.
+
     i, p, e, _, a = (sets[field]["mask"] for field in CAPS)
     deltas = {
         "permitted_not_effective": p & ~e if p is not None and e is not None else None,
@@ -208,35 +212,35 @@ def task_report(member):
     if e == 0:
         add(
             "EFFECTIVE_EMPTY",
-            "관측",
-            "현재 Effective 권한 없음. 일반 UID/GID 기반 접근은 별도.",
+            "Observation",
+            "No effective capabilities are currently set; ordinary UID/GID access is separate.",
         )
     if deltas["permitted_not_effective"]:
         add(
             "PERMITTED_INACTIVE",
-            "검토",
+            "Review",
             "P-E="
             + hex(deltas["permitted_not_effective"])
-            + ": 보유하지만 현재 비활성인 권한.",
+            + ": permitted capabilities that are not currently effective.",
         )
     if deltas["effective_not_permitted"]:
         add(
             "EFFECTIVE_OUTSIDE_PERMITTED",
-            "일관성",
+            "Consistency",
             "E-P="
             + hex(deltas["effective_not_permitted"])
-            + ": 집합 관계 불일치. 원시 바이트·수집 일관성 확인.",
+            + ": set relationship mismatch; verify raw bytes and collection consistency.",
         )
     if deltas["ambient_outside_pi"]:
         add(
             "AMBIENT_OUTSIDE_PI",
-            "일관성",
+            "Consistency",
             "A-(P&I)="
             + hex(deltas["ambient_outside_pi"])
-            + ": ambient 집합 관계 불일치 확인.",
+            + ": ambient set relationship mismatch.",
         )
     if a:
-        add("AMBIENT_PRESENT", "검토", "Ambient가 관측됨. exec 시 권한 전달 조건 확인.")
+        add("AMBIENT_PRESENT", "Review", "Ambient capabilities observed; review exec propagation conditions.")
     for key, code in (
         ("unknown_bits", "UNKNOWN_BITS"),
         ("out_of_range_bits", "OUT_OF_RANGE_BITS"),
@@ -249,33 +253,33 @@ def task_report(member):
         if affected:
             add(
                 code,
-                "일관성",
+                "Consistency",
                 (
-                    "이름 미상 비트: "
+                    "Unnamed bits: "
                     if key == "unknown_bits"
-                    else "커널 유효 범위 밖 비트: "
+                    else "Bits outside the kernel-valid range: "
                 )
                 + ", ".join(affected),
             )
     if any(sets[field]["mask"] is None for field in CAPS):
         add(
             "MASKS_UNAVAILABLE",
-            "미확인",
-            "일부 원시 마스크가 없어 집합 연산·전체 권한 여부를 확정하지 않음.",
+            "Unknown",
+            "Some raw masks are unavailable, so set operations and full-capability status remain unresolved.",
         )
     names = sets["cap_effective"]["names"]
     review = [name for name in (names or []) if name in REVIEW_CAPS]
     if review:
         add(
             "CAP_REVIEW",
-            "검토",
+            "Review",
             "; ".join(name.upper() + ": " + REVIEW_CAPS[name] for name in review),
         )
     if member.get("CredsDiffer") is True:
         add(
             "CREDS_DIFFER",
-            "검토",
-            "task.cred와 real_cred 주소가 다름. 일시적 자격 증명 전환도 가능하며 상승 이력의 증거는 아님.",
+            "Review",
+            "task.cred and real_cred addresses differ; this may be a temporary credential transition and is not proof of escalation history.",
         )
     current, real = (
         member.get("credentials") or {},
@@ -294,14 +298,15 @@ def task_report(member):
     if diffs:
         add(
             "CRED_VALUES_DIFFER",
-            "검토",
-            "현재/객관 자격 증명의 관측 마스크 차이: " + ", ".join(diffs),
+            "Review",
+            "Observed mask differences between current and objective credentials: "
+            + ", ".join(diffs),
         )
     if member.get("SeccompMode") == 0:
         add(
             "SECCOMP_OFF",
-            "검토",
-            "seccomp mode=0 관측. syscall 필터에 의한 제한은 비활성.",
+            "Review",
+            "seccomp mode=0 observed; syscall-filter restrictions are disabled.",
         )
     bad = [o for o in member.get("observations", []) if o.get("status") != "ok"]
     if bad or member.get("Status") == "partial":
@@ -313,7 +318,11 @@ def task_report(member):
             + STATUS.get(o.get("status"), str(o.get("status")))
             for o in bad
         )
-        add("PARTIAL_DATA", "미확인", "부분 관측: " + (detail or "상세 감사 JSON 확인"))
+        add(
+            "PARTIAL_DATA",
+            "Unknown",
+            "Partial observation: " + (detail or "review the detailed audit JSON"),
+        )
     return {
         "pid": member["PID"],
         "tid": member["TID"],
@@ -327,8 +336,8 @@ def task_report(member):
 
 
 def compare(tasks):
-    # 동일 프로세스의 스레드도 권한·제한이 다를 수 있다. 관측 차이와 비교 불가를 따로 기록한다.
-    # 필터 객체의 차이는 규칙별 동작 차이나 접근 성공의 증거로 해석하지 않는다.
+
+
     fields = CAPS + (
         "UserNS",
         "CapabilityScope",
@@ -351,7 +360,7 @@ def compare(tasks):
             v is None or (field == "CapabilityScope" and v == "unknown") for v in values
         ):
             unknown.append(field)
-        # 일부 태스크가 미확인이어도 나머지 관측값끼리 차이가 있으면 두 상태를 함께 남긴다.
+
         if (
             len(
                 {
@@ -395,13 +404,13 @@ def compare(tasks):
 
 
 def build_report(audit, members):
-    # audit의 전체 수집 메타데이터와 선택된 members를 결합하며, source에 원래 관측값을 유지한다.
+
     grouped = {}
     for member in sorted(
         members,
         key=lambda m: (m["ContainerID"], m["ContainerRoot"], m["PID"], m["TID"]),
     ):
-        # 같은 ID라도 cgroup 루트 객체가 다르면 별도 그룹으로 두어 근거가 다른 태스크를 섞지 않는다.
+
         key = (member["ContainerID"], member["ContainerRoot"])
         group = grouped.setdefault(
             key,
@@ -454,15 +463,15 @@ SUMMARY_COLUMNS = (
 
 def summary_rows(report):
     """One row per observed task; full evidence stays in the JSON report."""
-    # 표는 태스크마다 한 행으로 유지한다. Check는 조사할 근거의 요약이며 위험 점수가 아니다.
+
     ids = [g["container_id"] for g in report["groups"]]
     width = 12
-    # 서로 다른 전체 ID의 접두사가 겹치면 구별될 때까지 표시 길이만 늘린다.
+
     while width < 64 and len({cid[:width] for cid in ids}) != len(set(ids)):
         width += 1
     for group in report["groups"]:
         duplicate = ids.count(group["container_id"]) > 1
-        # 전체 ID가 같은 별도 루트 그룹은 /C번호로 구분하고, 실제 루트 주소는 상세 보고서에 둔다.
+
         identity = group["container_id"][:width] + (
             "/" + group["label"] if duplicate else ""
         )
@@ -471,48 +480,48 @@ def summary_rows(report):
             entry = task["sets"]["cap_effective"]
             names = entry["names"]
             if entry["mask"] is None:
-                effective = "미확인"
+                effective = "Unknown"
             elif entry["mask"] == 0:
-                effective = "없음"
+                effective = "None"
             elif names and len(names) <= 2:
                 effective = ",".join(name.upper() for name in names)
             else:
-                effective = f"원시 {entry['mask'].bit_count()}비트"
+                effective = f"Raw {entry['mask'].bit_count()} bits"
             scope = {
-                "initial_user_namespace": "초기",
-                "descendant_user_namespace": "하위",
-            }.get(member.get("CapabilityScope"), "미확인")
+                "initial_user_namespace": "initial",
+                "descendant_user_namespace": "descendant",
+            }.get(member.get("CapabilityScope"), "unknown")
             seccomp = {
                 0: "off",
                 1: "strict",
                 2: "filter/" + clean(member.get("SeccompFilters")),
-            }.get(member.get("SeccompMode"), "미확인")
+            }.get(member.get("SeccompMode"), "unknown")
             codes = {c["code"] for c in task["checks"]}
-            # 한 칸에는 아래 우선순위의 대표 항목을 표시한다. 생략된 checks도 상세 JSON에는 유지된다.
+
             if codes & {"PARTIAL_DATA", "MASKS_UNAVAILABLE"}:
-                check = "부분/미확인"
+                check = "Partial/unknown"
             elif codes & {
                 "EFFECTIVE_OUTSIDE_PERMITTED",
                 "AMBIENT_OUTSIDE_PI",
                 "UNKNOWN_BITS",
                 "OUT_OF_RANGE_BITS",
             }:
-                check = "비트·집합 확인"
+                check = "Review bits/sets"
             elif codes & {"CREDS_DIFFER", "CRED_VALUES_DIFFER"}:
-                check = "cred 차이"
+                check = "Credential difference"
             elif codes & {"PERMITTED_INACTIVE", "AMBIENT_PRESENT"}:
-                check = "권한 전이 검토"
+                check = "Review capability transition"
             elif "SECCOMP_OFF" in codes:
-                check = "필터 비활성"
+                check = "Filter disabled"
             elif "CAP_REVIEW" in codes:
-                check = "권한 검토"
+                check = "Review capabilities"
             else:
                 check = "-"
             comparison = next(
                 c for c in group["comparisons"] if c["pid"] == task["pid"]
             )
             if comparison["different_fields"]:
-                check = "스레드 차이" if check == "-" else check + " +차이"
+                check = "Thread difference" if check == "-" else check + " +difference"
             yield tuple(
                 clean(v)
                 for v in (
@@ -528,10 +537,10 @@ def summary_rows(report):
 
 
 def unresolved_rows(report):
-    # 표를 재사용하기 위한 표시 전용 묶음이다. 컨테이너 ID를 만들거나 groups에 저장하지 않는다.
+
     tasks = [task_report(member) for member in report.get("unresolved_members", [])]
     group = {
-        "container_id": "소속 미확인",
+        "container_id": "Membership unresolved",
         "label": "?",
         "members": tasks,
         "comparisons": [
@@ -542,10 +551,10 @@ def unresolved_rows(report):
     yield from summary_rows({"groups": [group]})
 
 
-# 공통 판독기가 수집한 cgroup 경로의 Docker 표식 해석
 
-# 이름이 containerd-shim인 프로세스의 자식만 고르는 방식이 아니라, 각 태스크의
-# cgroup 소속과 Docker 경로 표식을 확인한다. 표식은 런타임 신원 인증이 아니다.
+
+
+
 
 
 SCOPE = re.compile(r"docker-([0-9a-fA-F]{64})\.scope\Z")
@@ -567,8 +576,8 @@ def identify_docker(chain):
         ):
             cid = name.lower()
         if cid is not None:
-            # 루트에서 태스크 쪽으로 읽으므로 나중의 표식이 가장 가까운 컨테이너다.
-            # root_address는 태스크의 말단 cgroup이 아니라 Docker 표식이 붙은 객체 주소다.
+
+
             found = {
                 "id": cid,
                 "root_address": node["address"],
@@ -592,11 +601,11 @@ def namespace_inum(namespace):
     )
 
 
-# Volatility 옵션 백엔드: 태스크 열거, 수집, 감사 JSON과 표 출력
 
-# 수집 순서: 전체 태스크 → Docker cgroup 소속 → 태스크별 보안 맥락 → 감사 JSON/표.
-# 공식 PsList·렌더러 API를 사용하며, 원본 volatility-docker 코드를 복사하거나
-# 공식 Capabilities 플러그인을 호출하지 않는다.
+
+
+
+
 
 
 LOG = logging.getLogger(__name__)
@@ -609,13 +618,13 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
     explicit; matching symbols do not guarantee complete analysis of every kernel.
     """
 
-    hidden = True  # Exposed through linux.docker.Docker --inspect-caps.
+    hidden = True
     _required_framework_version = (2, 13, 0)
     _version = VERSION_INFO
 
     @classmethod
     def get_requirements(cls):
-        # pslist의 version은 플러그인 API 버전이며 pip 패키지 버전과 구별한다.
+
         return [
             requirements.VersionRequirement(
                 name="docker_artifacts",
@@ -668,7 +677,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
     @staticmethod
     def _observations(member, audit, source, observations):
         """Preserve unavailable data separately from successful empty values."""
-        # 태스크별 근거와 전체 실행의 품질 기록을 함께 갱신한다. partial은 악성 여부가 아니다.
+
         for observation in observations:
             entry = dict(observation, source=source)
             if entry in member["observations"]:
@@ -725,9 +734,9 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         )
 
     def _collect_security(self, task, security, member, audit):
-        # Current credentials remain usable if real_cred or an optional field fails.
-        # 현재 권한의 출처는 task.cred이며 real_cred는 비교 근거로 별도 보존한다.
-        # 주소 차이만으로 권한 상승 이력이나 악성 행위를 판정하지 않는다.
+
+
+
         cred = None
         real_cred = None
         try:
@@ -735,7 +744,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 raise ValueError("task.cred is a null pointer")
             member["CredAddress"] = hex(int(task.cred))
             cred = task.cred.dereference()
-        except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        except Exception as exc:
             self._failure(member, audit, "credential_pointer", exc)
         try:
             if not int(task.real_cred):
@@ -744,7 +753,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
             real_cred = task.real_cred.dereference()
             if cred is not None:
                 member["CredsDiffer"] = int(task.cred) != int(task.real_cred)
-        except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        except Exception as exc:
             self._failure(member, audit, "real_credential_pointer", exc)
         for source, pointer in (("credentials", cred), ("real_credentials", real_cred)):
             if pointer is None:
@@ -758,15 +767,15 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 continue
             try:
                 member[source] = security.credentials(pointer)
-                # Enrichment may fail without discarding the capabilities above.
+
                 try:
                     security.enrich_identity(member[source], pointer)
-                except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+                except Exception as exc:
                     self._failure(member, audit, source + ".identity", exc)
                 self._observations(
                     member, audit, source, member[source].get("observations", [])
                 )
-            except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+            except Exception as exc:
                 self._failure(member, audit, source, exc)
         current = member.get("credentials", {})
         member["EUID"] = current.get("ids_kernel", {}).get("euid")
@@ -789,7 +798,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 self._observations(
                     member, audit, source, member[source].get("observations", [])
                 )
-            except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+            except Exception as exc:
                 self._failure(member, audit, source, exc)
         seccomp = member.get("seccomp", {})
         member["NoNewPrivs"] = seccomp.get("no_new_privs")
@@ -801,13 +810,13 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
 
     def run(self):
         module = self.context.modules[self.config["kernel"]]
-        # 소속 판독을 지원하지 않아도 태스크의 권한 수집은 진행한다. 이 태스크들은
-        # confirmed members에 섞지 않고 unresolved_members에 별도로 보존한다.
+
+
         membership_error = None
         try:
             resolver = membership_resolver(module)
             membership_layout = resolver.compatibility
-        except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        except Exception as exc:
             resolver, membership_error = None, exc
             membership_layout = {
                 "feature": "container_membership",
@@ -833,7 +842,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         show_unresolved = self.config.get("unresolved", False)
         if show_unresolved and prefix:
             raise ValueError("--unresolved cannot be combined with --container")
-        # audit는 실행 전체, members의 각 항목은 태스크 하나의 값과 그 값을 읽은 근거다.
+
         audit = {
             "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "plugin_version": VERSION,
@@ -874,7 +883,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 dict(membership_layout, source="membership")
             )
         if membership_layout.get("coverage") == "default_hierarchy_only":
-            # v2 경로가 읽혔다고 v1/혼합 계층까지 검사했다고 보고하지 않는다.
+
             audit["global_observations"].append(
                 artifact_core.observation(
                     "legacy_membership",
@@ -887,8 +896,8 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         found_groups = {}
         all_tids_by_pid = {}
         try:
-            # 공식 열거 API를 직접 호출한다. 기본값은 스레드 포함이며, 이 목록 밖의
-            # 은닉·연결 해제 태스크까지 복구했다고 주장할 수는 없다.
+
+
             tasks = docker_artifacts.DockerArtifacts.list_tasks(
                 self.context,
                 self.config["kernel"],
@@ -899,7 +908,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 if address in seen:
                     continue
                 seen.add(address)
-                # Linux task.pid는 개별 TID, task.tgid는 프로세스 PID다. 표의 PID/TID도 이 구분을 따른다.
+
                 tid = int(task.pid)
                 tgid = int(task.tgid)
                 all_tids_by_pid.setdefault(tgid, set()).add(tid)
@@ -915,7 +924,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     if group is None:
                         audit["tasks_without_docker_marker"] += 1
                         continue
-                except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+                except Exception as exc:
                     identity_error = exc
                     audit["membership_errors"].append(
                         {
@@ -925,7 +934,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                             "error": artifact_core.exception_text(exc),
                         }
                     )
-                # 같은 ID 표식이라도 다른 cgroup 객체는 합치지 않는다.
+
                 if group is not None:
                     group_key = (group["id"], group["root_address"])
                     found_groups[group_key] = group
@@ -968,7 +977,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     else getattr(identity_error, "membership_evidence", []),
                 }
                 if identity_error is not None:
-                    # 소속 오류는 membership_errors에 이미 집계했다. 필드 오류로 중복 계산하지 않는다.
+
                     self._failure(
                         member,
                         {
@@ -980,10 +989,10 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                     )
                 try:
                     member["Name"] = utility.array_to_string(task.comm)
-                except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+                except Exception as exc:
                     self._failure(member, audit, "process_name", exc)
                 for field in CAP_FIELDS:
-                    # 읽기 전 값은 미확인(None)이다. 읽기에 성공한 빈 권한 집합과 구별한다.
+
                     member[field] = None
                 try:
                     pid_chain = self._pid_chain(task, module)
@@ -1004,7 +1013,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                         for x in leader_chain
                         if x["namespace"] == member["PIDNS"]
                     )
-                except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+                except Exception as exc:
                     self._failure(member, audit, "pid_namespace", exc)
                 else:
                     self._observations(
@@ -1024,10 +1033,10 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
                 self._collect_security(task, security, member, audit)
                 try:
                     member["ExpectedThreads"] = int(task.signal.nr_threads)
-                except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+                except Exception as exc:
                     self._failure(member, audit, "thread_count", exc)
                 audit["members" if group else "unresolved_members"].append(member)
-        except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        except Exception as exc:
             audit["traversal_errors"].append(artifact_core.exception_text(exc))
 
         ids = {key[0] for key in found_groups if key[0].startswith(prefix)}
@@ -1055,8 +1064,8 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
         audit["displayed_tasks"] = (
             audit["unresolved_tasks"] if show_unresolved else len(selected)
         )
-        # 같은 프로세스의 스레드가 다른 cgroup에 있을 수 있어 전체 열거 TID로 nr_threads를 대조한다.
-        # 대표 스레드만 수집했거나 비교 근거가 모자라면 count_matches는 미확인(None)으로 남긴다.
+
+
         for pid in sorted({m["PID"] for m in audit["members"]}):
             members = [m for m in audit["members"] if m["PID"] == pid]
             expected = {
@@ -1102,8 +1111,8 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
             or membership_layout.get("coverage") == "default_hierarchy_only"
         )
         audit["quality"] = audit_quality(audit)
-        # self.open은 Volatility 출력 디렉터리(-o)를 따른다. 화면을 줄여도 원시 근거는
-        # 감사 JSON에 남기며, analyst JSON에는 집합 비교와 확인 항목을 추가한다.
+
+
         with self.open("containercaps-audit.json") as handle:
             handle.write(
                 json.dumps(audit, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1161,7 +1170,7 @@ class ContainerCaps(interfaces.plugins.PluginInterface):
 
         def generate():
             for member in audit["unresolved_members"] if show_unresolved else selected:
-                # TreeGrid는 표시용이다. renderer JSON도 정제된 셀이며 원본은 audit JSON에 있다.
+
                 values = tuple(
                     (clean(member[key]) if kind is str else member[key])
                     if member[key] is not None

@@ -1,18 +1,7 @@
-"""Presence checks for the unified Docker plugin's --detector option.
-
-Run: vol -p /path/to/plugins -f memory.lime linux.docker.Docker --detector
-This module is an internal backend, not a separately advertised CLI plugin.
-
-Inspect network interfaces, Overlay mounts and containerd-shim processes.
-The moby runtime namespace refines a shim observation; no container IDs,
-cgroup membership, process inventory or lifecycle information are collected.
-Threads are traversed only to reach their mount/network namespaces.
-
-FOUND is an observation, not authenticated Docker identity or running state.
-NOT_OBSERVED is limited to completed searches; incomplete reads without a
-positive observation produce UNKNOWN. detector_evidence.json (schema 2) keeps
-counts, coverage and bounded examples, not full object inventories or argv.
-No Volatility core files, capability fields or mount hash symbols are needed.
+"""Detect Docker-related runtime, mount, and network traces in Linux memory.
+The --detector option checks shim processes, moby argv evidence, Overlay mounts,
+and container-style interfaces while separating negative results from read failures.
+It records bounded evidence and coverage without claiming identity or lifecycle state.
 """
 
 import datetime
@@ -30,7 +19,7 @@ from volatility3.plugins.linux._artifacts import network as network_readers
 from volatility3.plugins.linux._artifacts import tasks as task_readers
 
 vollog = logging.getLogger(__name__)
-# Changed output supersedes both the 2.x format and the earlier 3.1.0 lineage.
+
 VERSION = (4, 0, 3)
 EVIDENCE_SAMPLES = 3
 ERROR_SAMPLES_PER_STAGE = 3
@@ -46,7 +35,7 @@ READ_ERRORS = (
     UnicodeError,
 )
 STAGES = ("tasks", "runtime", "mounts", "network")
-# key, description, interpretation, prerequisite coverage
+
 CHECKS = (
     ("docker_interface", "Docker-like interface name", "NAME_HINT", ("network",)),
     ("veth", "Veth device (link kind)", "GENERIC_HINT", ("network",)),
@@ -62,7 +51,7 @@ CHECKS = (
 
 
 def argv_flags(argv):
-    """명령행에서 runtime namespace 값을 추출한다. 두 옵션 표기를 처리하고 빈 값은 오류로 알린다."""
+    """Extract runtime namespace flags from argv and reject missing or empty values."""
     result = {}
     for index, arg in enumerate(argv[1:], 1):
         if arg == "--":
@@ -85,9 +74,9 @@ def argv_flags(argv):
 
 
 def runtime_checks(comm, argv=None):
-    """프로세스 이름으로 shim을 찾고, 인자의 namespace가 moby이면 해당 검사 항목을 추가한다."""
+    """Identify shims by process name and record a moby runtime namespace when present."""
     found = []
-    # Linux comm is only TASK_COMM_LEN bytes; the full shim name is truncated.
+
     if comm and comm.startswith("containerd-shim"):
         found.append("containerd_shim")
         if argv is not None and argv_flags(argv).get("namespace") == ["moby"]:
@@ -96,7 +85,7 @@ def runtime_checks(comm, argv=None):
 
 
 def network_checks(name, kind):
-    """장치 이름과 link kind를 각각 검사해 일치하는 네트워크 항목을 반환한다."""
+    """Evaluate device names and link kinds as independent network indicators."""
     found = []
     if name and (name.startswith("docker") or BRIDGE_NAME.fullmatch(name)):
         found.append("docker_interface")
@@ -106,7 +95,7 @@ def network_checks(name, kind):
 
 
 def summarize(report):
-    """관찰 수와 단계 완전성으로 항목별 상태를 정하고, 생략된 근거 수와 전체 요약을 계산한다."""
+    """Derive check status, omitted evidence counts, and the overall assessment."""
     checks = report["checks"]
     prerequisites_by_key = {key: prerequisites for key, _, _, prerequisites in CHECKS}
     for check in checks:
@@ -146,7 +135,7 @@ class Collector(artifact_core.CollectionSession):
     """Collect from the supplied Volatility context; never launch another CLI."""
 
     def __init__(self, context, kernel_name, limit=100000, progress_callback=None):
-        """커널 접근 환경과 순회 한도를 설정하고, 단계별 오류와 관측 결과의 저장 공간을 준비한다."""
+        """Initialize kernel access, traversal bounds, coverage, and evidence storage."""
         if not 1 <= limit <= 1000000:
             raise ValueError("limit must be in 1..1000000")
         super().__init__(context, kernel_name)
@@ -205,7 +194,7 @@ class Collector(artifact_core.CollectionSession):
         self.checks = {check["key"]: check for check in self.report["checks"]}
 
     def issue(self, operation, obj, exc):
-        """현재 단계의 오류를 유형별로 기록한다. 전체 수를 세되 예시 저장 수는 제한한다."""
+        """Classify stage errors, count all occurrences, and retain bounded examples."""
         self.error_counts[self.stage] += 1
         if self.error_counts[self.stage] > ERROR_SAMPLES_PER_STAGE:
             return
@@ -233,7 +222,7 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def read(self, operation, obj, function, default=None):
-        """읽기 함수를 실행하고 예상한 예외가 나면 오류를 기록한 뒤 기본값을 반환한다."""
+        """Run a read operation, record expected failures, and return its default."""
         try:
             return function()
         except READ_ERRORS as exc:
@@ -241,7 +230,7 @@ class Collector(artifact_core.CollectionSession):
             return default
 
     def evidence(self, check, obj, detail):
-        """검사 항목의 관찰 수를 늘리고, 정해진 개수까지 객체 주소와 상세 근거를 저장한다."""
+        """Count an observation and retain a bounded object-address evidence sample."""
         result = self.checks[check]
         result["count"] += 1
         if len(result["evidence_indices"]) >= EVIDENCE_SAMPLES:
@@ -269,13 +258,13 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def namespace(self, namespace, kind):
-        """namespace를 주소별로 중복 없이 등록하고 inode를 읽어 저장된 항목을 반환한다."""
+        """Register a namespace once by address and retain its decoded inode."""
         address = int(namespace.vol.offset)
         target = self.mount_namespaces if kind == "mount" else self.net_namespaces
         if address not in target:
 
             def inode():
-                """namespace 레이아웃에 따라 ns.inum 또는 proc_inum을 읽는다."""
+                """Read ns.inum or proc_inum according to the available layout."""
                 return namespace_readers.namespace_inum(
                     namespace,
                     missing_error=artifact_core.Unsupported(
@@ -291,23 +280,23 @@ class Collector(artifact_core.CollectionSession):
         return target[address]
 
     def collect_tasks(self):
-        """init_task에서 프로세스와 스레드를 모은 뒤 각 task의 mount/net namespace를 찾는다."""
+        """Collect processes and threads from init_task, then discover their namespaces."""
         init = self.symbol("init_task", "task_struct")
         self.tasks[int(init.vol.offset)] = init
 
         def leaders():
-            """init_task의 process 목록을 순회해 leader를 주소별로 저장한다."""
+            """Walk the init_task process list and retain leaders by address."""
             for task in self.walk(init.tasks, "task_struct", "tasks"):
                 self.tasks[int(task.vol.offset)] = task
 
         self.read("tasks.list", init, leaders)
         self.leaders = list(self.tasks.values())
-        # A thread may expose a namespace its leader does not use. This is
-        # internal discovery only; no thread inventory or membership is saved.
+
+
         for leader in self.leaders:
 
             def threads(*, leader=leader):
-                """사용 가능한 스레드 목록 레이아웃을 선택해 leader의 스레드를 추가한다."""
+                """Select the available thread-list layout and add the leader's threads."""
                 if not leader.signal:
                     return
                 if leader.has_member("thread_node") and leader.signal.has_member(
@@ -326,9 +315,9 @@ class Collector(artifact_core.CollectionSession):
         for task in self.tasks.values():
 
             def namespaces(*, task=task):
-                """task의 nsproxy에서 중복 주소를 제외하고 mount/net namespace를 등록한다."""
+                """Register unique mount and network namespaces from a task's nsproxy."""
                 if not task.nsproxy:
-                    return  # NULL is valid for exiting tasks and some kernel tasks.
+                    return
                 address = int(task.nsproxy)
                 if address in proxies:
                     return
@@ -337,7 +326,7 @@ class Collector(artifact_core.CollectionSession):
                 for kind, member in (("mount", "mnt_ns"), ("net", "net_ns")):
 
                     def get_namespace(m=member):
-                        """선택한 nsproxy 멤버의 포인터를 확인한 뒤 namespace 객체를 역참조한다."""
+                        """Validate the selected nsproxy pointer before dereferencing it."""
                         ptr = proxy.member(m)
                         if not ptr:
                             raise artifact_core.Incomplete(
@@ -362,7 +351,7 @@ class Collector(artifact_core.CollectionSession):
         )
 
     def collect_runtime(self):
-        """leader의 이름으로 shim을 찾는다. 이름 근거를 저장하고 argv의 moby namespace를 확인한다."""
+        """Find shims among leaders and validate moby namespace evidence from argv."""
         for task in self.leaders:
             comm = self.read(
                 "runtime.comm", task, lambda task=task: self.array_string(task.comm)
@@ -378,7 +367,7 @@ class Collector(artifact_core.CollectionSession):
                     artifact_core.Incomplete("Task list entry is not a process leader"),
                 )
                 continue
-            # Preserve the name observation even when argv cannot be read.
+
             self.evidence("containerd_shim", task, {"pid": pid, "comm": comm})
             args = self.read("runtime.argv", task, lambda task=task: self.argv(task))
             if args is None:
@@ -406,25 +395,25 @@ class Collector(artifact_core.CollectionSession):
         return mount_readers.checked_mount_points(self, namespace)
 
     def collect_mounts(self):
-        """발견한 mount namespace를 조사하고 Overlay 계열 파일시스템의 관측 근거를 수집한다."""
+        """Inspect discovered mount namespaces for Overlay-family filesystems."""
         if not self.mount_namespaces:
             raise artifact_core.Incomplete("No reachable mount namespace")
         for ns in self.mount_namespaces.values():
 
             def scan(*, ns=ns):
-                """현재 namespace의 mount별 파일시스템 유형을 읽어 Overlay이면 근거를 기록한다."""
+                """Read each mount's filesystem type and record Overlay observations."""
                 for mount in self.mount_points(ns["object"]):
 
                     def fs_type(*, mount=mount):
-                        """superblock의 파일시스템 이름을 읽고 FUSE subtype이 있으면 이어 붙인다."""
+                        """Read the superblock filesystem name and append a FUSE subtype."""
                         vf = mount.mnt if mount.has_member("mnt") else mount
                         sb = vf.mnt_sb
                         name = self.string(sb.s_type.name, 256)
                         if name in ("fuse", "fuseblk"):
-                            # /proc/mounts joins s_type->name and s_subtype;
-                            # the kernel type name itself is only "fuse".
+
+
                             def subtype():
-                                """FUSE subtype 멤버를 확인하고 포인터가 유효하면 문자열을 읽는다."""
+                                """Validate the FUSE subtype member and read a non-NULL string."""
                                 if not sb.has_member("s_subtype"):
                                     raise artifact_core.Unsupported(
                                         "FUSE superblock subtype is not described"
@@ -451,7 +440,7 @@ class Collector(artifact_core.CollectionSession):
             self.read("mounts.namespace", ns["object"], scan)
 
     def collect_network(self):
-        """전역 및 task 참조로 net namespace를 확보하고 각 장치의 이름과 종류를 검사한다."""
+        """Discover network namespaces globally and from tasks, then inspect devices."""
         if self.kernel.has_symbol("init_net"):
             self.read(
                 "network.init_net",
@@ -460,7 +449,7 @@ class Collector(artifact_core.CollectionSession):
             )
 
         def global_namespaces():
-            """net_namespace_list를 따라 전역 net namespace를 주소별로 등록한다."""
+            """Walk net_namespace_list and register global namespaces by address."""
             head = self.symbol("net_namespace_list", "list_head")
             for ns in self.walk(head, "net", "list"):
                 self.namespace(ns, "net")
@@ -471,14 +460,14 @@ class Collector(artifact_core.CollectionSession):
         for ns in self.net_namespaces.values():
 
             def devices(*, ns=ns):
-                """현재 net namespace의 장치를 순회하고 이름·link kind 검사 결과를 근거로 저장한다."""
+                """Walk devices in one namespace and record name and link-kind indicators."""
                 for dev in network_readers.devices(self, ns["object"]):
                     name = self.read(
                         "network.name", dev, lambda dev=dev: self.array_string(dev.name)
                     )
 
                     def kind(*, dev=dev):
-                        """rtnl_link_ops에서 link kind를 읽고 포인터가 NULL이면 빈 문자열을 반환한다."""
+                        """Read the rtnl_link_ops kind and return an empty string for NULL."""
                         return network_readers.link_kind(
                             dev,
                             lambda ptr: self.string(ptr, 256),
@@ -502,7 +491,7 @@ class Collector(artifact_core.CollectionSession):
             self.read("network.devices", ns["object"], devices)
 
     def collect(self):
-        """수집 단계를 차례로 실행한다. 오류 수로 단계 완전성을 기록한 뒤 검사별 결과를 요약한다."""
+        """Run collection stages, derive coverage from errors, and summarize checks."""
         for index, stage in enumerate(STAGES):
             self.stage = stage
             if self.progress_callback:
@@ -520,7 +509,7 @@ class Collector(artifact_core.CollectionSession):
 
 
 def presentation(report):
-    """검사별 상태와 근거 예시를 TreeGrid 칼럼의 행으로 구성한다. 전체 요약을 첫 행에 둔다."""
+    """Build TreeGrid rows for each check, with the overall assessment first."""
     columns = [
         ("Check", str),
         ("Status", str),
@@ -586,15 +575,15 @@ def presentation(report):
 class Detector(interfaces.plugins.PluginInterface):
     """Backend for linux.docker.Docker --detector; presence checks only."""
 
-    # Volatility's discovery skips hidden classes. The Docker dispatcher loads
-    # this backend directly and supplies its context, settings and file handler.
+
+
     hidden = True
     _required_framework_version = (2, 28, 0)
     _version = VERSION
 
     @classmethod
     def get_requirements(cls):
-        """Linux 커널 모듈과 순회 한도에 필요한 Volatility 실행 설정을 선언한다."""
+        """Declare the Linux kernel module and traversal-limit requirements."""
         return [
             requirements.VersionRequirement(
                 name="docker_artifacts",
@@ -615,7 +604,7 @@ class Detector(interfaces.plugins.PluginInterface):
         ]
 
     def run(self):
-        """순회 한도를 검증하고 근거를 수집한다. JSON 파일을 저장한 뒤 TreeGrid를 반환한다."""
+        """Validate the traversal limit, save evidence JSON, and return a TreeGrid."""
         limit = self.config.get("limit", 100000)
         if not 1 <= limit <= 1000000:
             raise exceptions.VolatilityException("--limit must be in 1..1000000")

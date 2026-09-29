@@ -1,4 +1,7 @@
-"""Network device primitives shared by presence and detailed inspection."""
+"""Read Linux network-device primitives for detection and network inspection.
+The helpers enumerate namespace interfaces and expose stable device attributes.
+They do not infer container identity or render plugin output.
+"""
 
 
 def devices(reader, namespace):

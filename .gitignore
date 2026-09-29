@@ -1,12 +1,9 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 
-# C extensions
 *.so
 
-# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -24,7 +21,6 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
 .venv/
 .venv-*/
 venv/
@@ -33,7 +29,6 @@ ENV/
 env.bak/
 venv.bak/
 
-# Python tool caches and coverage
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -41,17 +36,13 @@ venv.bak/
 .coverage.*
 htmlcov/
 
-# macOS metadata
 .DS_Store
 
-# Project specific
 dumps/
 *.lime
 *.raw
 *.mem
 *.json
-!tests/*.json
 
-# IDE
 .vscode/
 .idea/

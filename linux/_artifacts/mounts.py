@@ -1,6 +1,9 @@
-# SPDX-License-Identifier: MIT
-# Includes readers by the container-mounts contributors (c) 2026.
-"""Mount namespace traversal strategies, independent of selection and display."""
+"""Traverse mount namespaces for Docker detection, mount, process, and file views.
+The reader supports legacy linked lists and newer RB trees with bounds and cycle checks.
+It returns validated mounts and diagnostics without selecting containers or rendering.
+
+SPDX-License-Identifier: MIT
+"""
 
 from __future__ import annotations
 
@@ -115,6 +118,8 @@ def mount_points(mnt_ns, *, diagnostics=None) -> tuple[list[object], str]:
         artifact_core.record_read_error(diagnostics, "mount.layout", exc)
         is_rb_tree = False
 
+    # Older kernels expose namespace mounts as a linked list, while newer
+    # kernels may expose an rb_root; keep both traversal strategies explicit.
     if not is_rb_tree:
         return list_mount_points(mnt_ns, diagnostics=diagnostics)
 
@@ -149,8 +154,8 @@ def mount_points(mnt_ns, *, diagnostics=None) -> tuple[list[object], str]:
                 continue
             node = node_pointer.dereference()
 
-            # Read child pointers before decoding the containing mount so a
-            # bad mount object cannot hide otherwise readable subtrees.
+
+
             for member in ("rb_right", "rb_left"):
                 try:
                     child = node.member(member)
@@ -175,9 +180,9 @@ def mount_points(mnt_ns, *, diagnostics=None) -> tuple[list[object], str]:
                 and artifact_core._object_address(mnt.mnt_ns)
                 != artifact_core._object_address(mnt_ns)
             ):
-                # A readable RB node can still describe an unrelated mount
-                # after corruption or a bad layout interpretation.  Child
-                # pointers are already queued, so preserve those subtrees.
+
+
+
                 skipped_nodes += 1
                 continue
             points.append(mnt)
@@ -199,7 +204,7 @@ def mount_points(mnt_ns, *, diagnostics=None) -> tuple[list[object], str]:
 
 
 def checked_mount_points(reader, namespace):
-    """namespace의 RB tree나 목록에서 mount를 순회하고 소속·개수·root의 일관성을 검사한다."""
+    """Traverse namespace mounts and validate ownership, count, and root consistency."""
     expected = (
         reader.read("mounts.count", namespace, lambda: int(namespace.nr_mounts))
         if namespace.has_member("nr_mounts")
@@ -271,8 +276,8 @@ def checked_mount_points(reader, namespace):
         raise artifact_core.Unsupported(
             "Mount namespace has neither supported RB tree nor list"
         )
-    # A NULL/truncated tree can terminate normally despite missing mounts.
-    # Cross-check available namespace metadata before declaring completion.
+
+
     if expected is not None and expected != len(observed):
         reader.issue(
             "mounts.count",
@@ -303,9 +308,9 @@ def stock_mount_points(namespace):
     return namespace.get_mount_points()
 
 
-# File views retain their stronger object-readability checks and status labels.
+
 def mount_current(mnt):
-    """현대 커널은 mount.mnt, 옛 커널은 vfsmount 자체가 현재 마운트다."""
+    """Use mount.mnt on modern kernels and the vfsmount object on older kernels."""
     if mnt.has_member("mnt"):
         return mnt.mnt
     if str(getattr(mnt.vol, "type_name", "")).endswith("!vfsmount"):
@@ -314,7 +319,7 @@ def mount_current(mnt):
 
 
 def file_mount_points(namespace, max_nodes=100000, *, diagnostics=None):
-    """구형 연결 리스트와 6.8 이후 RB 트리를 각각 상한/순환 검사하며 읽는다."""
+    """Read legacy lists and post-6.8 RB trees with bounds and cycle checks."""
     result, issues = [], 0
     try:
         if not artifact_core._object_readable(namespace, diagnostics=diagnostics):
@@ -323,7 +328,7 @@ def file_mount_points(namespace, max_nodes=100000, *, diagnostics=None):
         table = namespace.vol.type_name.split("!", 1)[0]
         context = namespace._context
         if namespace.has_member("list"):
-            # 리스트의 끝처럼 보이는 지점이 아니라, 정확히 head로 복귀해야 완료다.
+
             head = namespace.list
             if not artifact_core._object_readable(head, diagnostics=diagnostics):
                 raise ValueError("unreadable list head")
@@ -368,7 +373,7 @@ def file_mount_points(namespace, max_nodes=100000, *, diagnostics=None):
             and str(namespace.mounts.vol.type_name).endswith("!rb_root")
         ):
             raise ValueError("unsupported mount namespace layout")
-        # 자식을 mount 해석보다 먼저 큐에 넣어 한 손상 객체가 형제까지 지우지 않게 한다.
+
         pending, seen = [namespace.mounts.rb_node], set()
         while pending:
             cursor = pending.pop()
@@ -425,7 +430,7 @@ def file_mount_points(namespace, max_nodes=100000, *, diagnostics=None):
 
 
 def namespace_covering(mnt_ns, *, diagnostics=None):
-    """프로세스 경로 위에 다른 마운트가 덮여 있는지 확인할 인덱스."""
+    """Build an index for detecting mounts that cover a process-visible path."""
     result, complete, known = {}, True, set()
     mount_list, status = file_mount_points(mnt_ns, diagnostics=diagnostics)
     complete = status == "COMPLETE"

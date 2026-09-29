@@ -1,5 +1,9 @@
-# SPDX-License-Identifier: MIT
-"""Kernel boot/task start time reads; callers own caches, provenance and formatting."""
+"""Recover kernel boot time and task start times for process-oriented analyses.
+The --ps and --container-tasks backends use these values for UTC observations.
+Readers expose provenance and errors while callers own caching and formatting.
+
+SPDX-License-Identifier: MIT
+"""
 
 import dataclasses
 

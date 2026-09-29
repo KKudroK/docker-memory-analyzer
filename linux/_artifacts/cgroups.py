@@ -1,9 +1,9 @@
-# SPDX-License-Identifier: MIT
-# Includes readers by the container-mounts contributors (c) 2026.
-"""Cgroup readers with separate effective-CSS and membership-link strategies.
+"""Recover task cgroup membership across v1 and v2 hierarchies.
+These readers support container attribution for process, capability, task, and file views.
+They distinguish membership links from effective CSS ancestry and retain conflicts.
+Callers supply Docker marker policy instead of embedding runtime decisions here.
 
-These strategies intentionally retain different coverage and error contracts.
-Marker interpretation is supplied by the caller, not inferred by a reader.
+SPDX-License-Identifier: MIT
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from volatility3.framework.objects import utility
 
 from . import core as artifact_core
 
-# Preserve the diagnostic channel consumed by existing mount logs.
+
 vollog = logging.getLogger("volatility3.plugins.inspect_mount")
 
 
@@ -78,8 +78,8 @@ def _cgroup_path(cgroup) -> str:
             if not parent or not artifact_core._object_readable(parent):
                 raise ValueError("kernfs ancestry ended before hierarchy root")
             name = artifact_core._read_kernel_cstring(node.name, max_bytes=256)
-            # kernfs names are individual components, at most NAME_MAX bytes.
-            # Never normalize corrupt names into a different valid path.
+
+
             if not name or len(name) >= 256 or "/" in name or name in {".", ".."}:
                 raise ValueError("invalid or truncated kernfs name")
             parts.append(name)
@@ -232,6 +232,8 @@ def _cgroup_memberships(task, issues_out=None) -> tuple[CgroupMembership, ...]:
         report_issues()
         return ()
 
+    # cgrp_links carries per-hierarchy membership; dfl_cgrp adds the unified v2
+    # membership and must not be interpreted as a v1 controller entry.
     default_root_address = None
     groups, links_complete = _linked_cgroups(css_set, issues)
     unified_cgroup = None
@@ -251,8 +253,8 @@ def _cgroup_memberships(task, issues_out=None) -> tuple[CgroupMembership, ...]:
     ) as exc:
         issues.add(f"default membership unavailable ({exc})")
 
-    # One css_set must have one actual membership per hierarchy.  Reject a
-    # conflicting root entirely, rather than choosing the first ID/path.
+
+
     entries: dict[int, dict[str, object]] = {}
     conflicting_roots = set()
 
@@ -310,8 +312,8 @@ def _cgroup_memberships(task, issues_out=None) -> tuple[CgroupMembership, ...]:
             version, root_address, _, _ = _cgroup_hierarchy(
                 cgroup, default_root_address
             )
-            # v2 effective CSS may belong to any ancestor of dfl_cgrp.  Its
-            # address differs from the membership without becoming a v1 root.
+
+
             if version == "v2":
                 continue
             if root_address not in entries:
@@ -385,17 +387,17 @@ def _cgroup_memberships(task, issues_out=None) -> tuple[CgroupMembership, ...]:
                 cgroup_address=int(entry["address"]),
             )
         )
-    # Keep the internal default-root membership even alongside v1.  '/' alone
-    # cannot distinguish a visible hybrid v2 root from an unused default root;
-    # this output does not infer which cgroup filesystems were mounted.
+
+
+
     report_issues()
     return tuple(memberships)
 
 
 def read_cgroup_chain(start, limit=128, parent_field=None):
     """Follow CSS parents and cross-check every kernfs parent link."""
-    # CSS와 kernfs의 부모 연결을 함께 대조해 경로 복원의 모순을 드러낸다.
-    # 깨진 연결·순환을 만나면 불완전한 경로로 컨테이너를 추정하지 않는다.
+
+
     current, seen, chain = start, set(), []
     while current is not None:
         address = int(current.vol.offset)
@@ -447,7 +449,7 @@ def read_cgroup_chain(start, limit=128, parent_field=None):
             {"address": hex(address), "kernfs": hex(int(node.vol.offset)), "name": name}
         )
         current = parent
-    # 순회는 말단→루트지만 반환은 루트→말단이다. 경로 조립과 표식 선택은 이 순서를 쓴다.
+
     return list(reversed(chain))
 
 
@@ -507,13 +509,13 @@ class CgroupV2Resolver:
             raise ValueError("css_set.dfl_cgrp: null default cgroup pointer")
         cgroup = cset.dfl_cgrp.dereference()
         address = int(cgroup.vol.offset)
-        # 경로 문자열이나 컨테이너 ID가 같아도 서로 다른 cgroup 객체의 결과를 섞지 않는다.
+
         if address not in self.cache:
-            # 전체 경로를 성공적으로 읽은 뒤에만 캐시해 일시적인 읽기 실패를 숨기지 않는다.
+
             chain = read_cgroup_chain(cgroup, parent_field=self.parent_field)
             self.cache[address] = (chain, self.identify(chain))
         chain, group = self.cache[address]
-        # 앞의 두 값은 Volatility 객체, chain/group은 보고서용 값이다. 표식이 없으면 group=None.
+
         return cset, cgroup, chain, group
 
 
@@ -623,8 +625,8 @@ class CgroupLinksResolver:
                 error = ValueError("Docker markers disagree across cgroup hierarchies")
                 error.membership_evidence = evidence
                 raise error
-            # 같은 Docker ID라도 각 계층의 근거는 모두 보존한다. 기본 계층(0)을 우선해
-            # 기존 v2의 루트 주소를 유지하고, v1-only에서는 계층 ID 순서로 대표를 고른다.
+
+
             _, cgroup, chain, group = min(
                 matches or entries, key=lambda entry: entry[0]
             )
@@ -636,8 +638,8 @@ class CgroupLinksResolver:
 
 
 def membership_resolver(module, identify):
-    # 두 판독기는 심볼 구조로 선택한다. 타입이 없는 경우만 대안을 시도하며,
-    # 선택한 판독기의 실제 메모리 오류를 다른 경로의 성공으로 덮지 않는다.
+
+
     try:
         return CgroupLinksResolver(module, identify)
     except (artifact_core.UnsupportedLayoutError, AttributeError, KeyError) as exc:
@@ -751,10 +753,10 @@ def effective_cgroup_path(group, string, limit, *, policy, location=None):
     return "/" + "/".join(p for p in reversed(parts) if p), trace
 
 
-# Actual-membership-only strategy for file views. Unlike _cgroup_memberships,
-# it never promotes subsys-only legacy groups when membership links are lost.
-# Duplicate hierarchy IDs, controller names and string components are checked
-# under the file reader's original stricter contract and diagnostic labels.
+
+
+
+
 def _file_cgroup_hierarchy(cgroup, default_root=None):
     return _cgroup_hierarchy(
         cgroup,
@@ -768,7 +770,7 @@ def _file_cgroup_hierarchy(cgroup, default_root=None):
 
 
 def read_membership_path(cgroup):
-    """해당 계층의 kernfs 루트에 도달한 완전한 경로만 반환한다."""
+    """Return only a complete path that reaches the hierarchy's kernfs root."""
     _, _, root, _ = _file_cgroup_hierarchy(cgroup)
     node = cgroup.kn
     root_node = root.cgrp.kn
@@ -812,7 +814,7 @@ def _file_cgroup_path(cgroup):
 
 
 def _file_cgroup_links(css_set, issues):
-    """포인터 대상, 역방향 연결, css_set 소유자를 함께 검증한다."""
+    """Validate pointer targets, reverse links, and the owning css_set together."""
     groups = []
     try:
         head = css_set.cgrp_links
@@ -859,7 +861,7 @@ def _file_cgroup_links(css_set, issues):
 
 
 def read_link_memberships(task, issues_out=None, *, logger=None):
-    """v1/v2 실제 소속을 읽고 누락·충돌을 별도 표시한다."""
+    """Read effective v1/v2 membership and report omissions and conflicts separately."""
     issues, entries, conflicting_roots = set(), {}, set()
 
     def finish(memberships):
@@ -923,7 +925,7 @@ def read_link_memberships(task, issues_out=None, *, logger=None):
         except artifact_core.READ_ERRORS as exc:
             issues.add(f"cgroup-hierarchy:{type(exc).__name__}:{exc}")
 
-    # subsys[]는 v1 컨트롤러 이름에만 사용한다. v2 effective CSS는 소속이 아니다.
+
     try:
         subsystems = css_set.subsys if css_set.has_member("subsys") else ()
         subsystem_count = len(subsystems)

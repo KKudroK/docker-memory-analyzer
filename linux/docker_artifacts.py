@@ -1,16 +1,7 @@
-"""Versioned collection API for Docker analyses and other Linux plugins.
-
-Depend on ``DockerArtifacts`` with a ``VersionRequirement`` and call its
-classmethods without constructing a plugin. Inputs identify one context,
-kernel module and address space; callers never pass readers or kernel objects.
-Addresses are absolute, not offsets relative to the relocated kernel module.
-
-Task/FD iterators return Volatility objects owned by that same context, like
-PsList. Other results contain ordinary Python values. No method renders output,
-writes evidence, assigns a container identity or keeps a cross-call cache.
-Single reads propagate failures. Traversals that retain partial results also
-return their diagnostics; an empty partial result is not evidence of absence.
-The private ``_artifacts`` package implements the individual reading policies.
+"""Expose a versioned collection API shared by Docker and Linux backends.
+DockerArtifacts returns context-owned task/FD objects or plain evidence values.
+It performs no rendering, identity policy, evidence writing, or cross-call caching.
+Backends use VersionRequirement so compatible API changes remain explicit.
 """
 
 from __future__ import annotations
@@ -46,8 +37,8 @@ class DockerArtifacts(
 
     @classmethod
     def get_requirements(cls) -> list[interfaces.configuration.RequirementInterface]:
-        # VersionRequirement traverses dependencies only for ConfigurableInterface
-        # components. This remains a collection API, not a discoverable plugin.
+
+
         return [
             requirements.VersionRequirement(
                 name="pslist", component=pslist.PsList, version=(4, 0, 0)
@@ -56,8 +47,8 @@ class DockerArtifacts(
 
     @classmethod
     def _kernel(cls, context, kernel_module_name):
-        # Classmethod users do not instantiate VersionableInterface, whose
-        # constructor normally performs the framework compatibility check.
+
+
         framework.require_interface_version(*cls._required_framework_version)
         if not isinstance(kernel_module_name, str) or not kernel_module_name:
             raise ValueError("kernel_module_name must be a nonempty string")
@@ -88,8 +79,8 @@ class DockerArtifacts(
         kernel = cls._kernel(context, kernel_module_name)
         if layer_name is None and native_layer_name is None:
             return kernel.object(type_name, offset=address, absolute=True)
-        # A scan can locate a task in a physical layer while its pointers still
-        # refer to kernel virtual memory. Preserve both layers independently.
+
+
         return context.object(
             kernel.symbol_table_name + "!" + type_name,
             offset=address,
@@ -438,7 +429,7 @@ class DockerArtifacts(
         if include_identity:
             try:
                 reader.enrich_identity(result, cred)
-            except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+            except Exception as exc:
                 result["observations"].append(
                     {
                         "feature": "credentials.identity",

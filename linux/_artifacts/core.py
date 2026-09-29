@@ -1,9 +1,8 @@
-# SPDX-License-Identifier: MIT
-# Includes readers by the container-mounts contributors (c) 2026.
-"""Kernel access and bounded readers shared by Docker analysis backends.
+"""Provide validated kernel-object access for all Docker analysis backends.
+The helpers normalize addresses, verify layouts, bound traversal, and record diagnostics.
+They do not assign container identity or silently convert failed reads into empty values.
 
-No report schema or container attribution belongs here. Callers retain their
-exception boundaries, so a failed read never silently becomes an empty value.
+SPDX-License-Identifier: MIT
 """
 
 import dataclasses
@@ -75,7 +74,7 @@ def require_type(module, name, feature):
 
 
 def require_fields(module, name, fields, feature):
-    # 메모리를 읽기 전에 ISF 타입에 필수 멤버가 있는지 검사하고, 같은 타입 템플릿을 돌려준다.
+
     template = require_type(module, name, feature)
     for field in fields:
         if not template.has_member(field):
@@ -151,7 +150,7 @@ def member(obj, name):
 
 
 def capture(observations, feature, fn, layout=None):
-    # 필드별 실패를 None과 상태로 남긴다. 실패를 0/빈 집합으로 바꾸거나 다른 성공값을 버리지 않는다.
+
     try:
         value = fn()
     except UnsupportedLayout as exc:
@@ -162,7 +161,7 @@ def capture(observations, feature, fn, layout=None):
         observations.append(
             observation(feature, "inconsistent", exception_detail(exc), layout)
         )
-    except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+    except Exception as exc:
         observations.append(
             observation(feature, "read_error", exception_text(exc), layout)
         )
@@ -300,7 +299,7 @@ class CollectionSession:
         return self.kernel.object(name, offset=int(address), absolute=True)
 
     def symbol(self, name, typename):
-        # A symbol can have an address without type metadata in a BTF ISF.
+
         return self.kernel.object(
             typename, offset=self.kernel.get_symbol(name).address, absolute=False
         )
@@ -319,12 +318,12 @@ def bounded(iterator, limit):
 
 
 def strict_string(layer, pointer, maximum=4096):
-    """포인터에서 문자열을 읽는다. 길이와 NUL 종료를 확인한 뒤 UTF-8로 변환한다."""
+    """Read a pointer string, validate its length and NUL terminator, then decode UTF-8."""
     if not pointer:
         raise Incomplete("NULL string pointer")
     address, data = int(pointer), bytearray()
-    # Require a real terminator. Some generic string helpers return a
-    # readable prefix when a later page is absent; that is not a full name.
+
+
     while len(data) < maximum:
         cursor = address + len(data)
         size = min(32, maximum - len(data), 4096 - (cursor & 4095))
@@ -338,7 +337,7 @@ def strict_string(layer, pointer, maximum=4096):
 
 
 def strict_array_string(layer, array):
-    """문자 배열의 타입·길이·NUL 종료를 확인한 뒤 UTF-8 문자열로 변환한다."""
+    """Validate a character array's type, length, and NUL terminator before UTF-8 decoding."""
     if not isinstance(array, objects.Array) or not 0 < array.vol.count <= 4096:
         raise Unsupported("Name is not a bounded character array")
     raw = layer.read(int(array.vol.offset), array.vol.count, pad=False)

@@ -1,12 +1,7 @@
-"""Unified entry point for the volatility-docker-v2 analyses.
-
-Usage: vol -p plugins -s symbols -f memory.lime linux.docker.Docker --detector
-Select exactly one of --detector, --ps, --inspect-mounts, --inspect-networks,
---inspect-caps, --container-tasks or --inspect-files. Analysis-specific settings
-are accepted only with their corresponding selector. Native collectors, defaults, TreeGrid schemas and
-evidence files are preserved. The analysis modules are internal backends;
-linux.docker.Docker is the only public entry point for these seven analyses.
-The official Volatility framework and core Linux plugins are not replaced.
+"""Dispatch seven Docker memory analyses through one Volatility plugin entry point.
+linux.docker.Docker selects one detector, process, mount, network, capability, task,
+or file backend and validates its options, requirements, and defaults before execution.
+The dispatcher adds external functionality without replacing official components.
 """
 
 import copy
@@ -20,21 +15,21 @@ from volatility3.plugins.linux import docker_artifacts
 
 vollog = logging.getLogger(__name__)
 
-# Import only the selected backend here. Volatility itself still discovers
-# all .py plugin files at startup, so this is not isolation from every possible
-# import-time error in another plugin in the search path.
+
+
+
 BACKENDS = {
     "detector": ("detector", "Detector"),
     "ps": ("ps", "run_ps"),
     "inspect-mounts": ("inspect_mount", "ContainerMounts"),
     "inspect-networks": ("inspect_networks", "InspectNetworks"),
-    # Keep the existing filename; importlib can load its hyphenated name.
+
     "inspect-caps": ("inspect-caps", "ContainerCaps"),
     "container-tasks": ("container_tasks", "ContainerTasks"),
     "inspect-files": ("inspect_files", "InspectFiles"),
 }
 
-# Public option -> {analysis selector: native backend setting}.
+
 SETTINGS = {
     "limit": {"detector": "limit"},
     "pids": {"inspect-mounts": "pids", "inspect-files": "pids"},
@@ -87,9 +82,9 @@ class Docker(interfaces.plugins.PluginInterface):
     """
 
     _required_framework_version = (2, 28, 0)
-    # MAJOR: incompatible inputs/output; MINOR: compatible additions; PATCH:
-    # internal fixes. Reset lower components when bumping MAJOR or MINOR.
-    # 3.x accounts for category/value output and the revised task views.
+
+
+
     _version = (3, 2, 3)
 
     @classmethod
@@ -129,9 +124,9 @@ class Docker(interfaces.plugins.PluginInterface):
             for view in choices:
                 if view not in view_choices:
                     view_choices.append(view)
-        # None distinguishes an omitted setting from an explicitly supplied
-        # False/0/empty value (including JSON config). Backend defaults are
-        # obtained from that backend's requirements, not duplicated here.
+
+
+
         result.extend(
             [
                 requirements.IntRequirement(
@@ -284,7 +279,7 @@ class Docker(interfaces.plugins.PluginInterface):
             )
         if "container" in overrides:
             prefixes = overrides["container"]
-            # Accept the earlier single-string JSON configuration as well.
+
             if isinstance(prefixes, str):
                 prefixes = [prefixes]
             if (
@@ -315,8 +310,8 @@ class Docker(interfaces.plugins.PluginInterface):
         try:
             action, overrides = self.resolve_options(self.config)
         except exceptions.VolatilityException as exc:
-            # The CLI hides generic VolatilityException messages. Log only
-            # option validation failures here, then preserve failure semantics.
+
+
             vollog.error("Invalid Docker options: %s", exc)
             raise
         module_name, entry_name = BACKENDS[action]
@@ -342,8 +337,10 @@ class Docker(interfaces.plugins.PluginInterface):
             self.config_path, "analysis", action
         )
         overrides["kernel"] = self.config["kernel"]
-        # Reinitialize native defaults on every invocation, even when the same
-        # context/plugin instance is reused by a non-CLI caller.
+
+
+        # Rebuild backend defaults for every invocation so a reused Volatility
+        # context cannot leak settings from a previous analysis.
         for requirement in native_requirements:
             if isinstance(requirement, requirements.VersionRequirement):
                 continue
@@ -351,7 +348,7 @@ class Docker(interfaces.plugins.PluginInterface):
             self.context.config[
                 interfaces.configuration.path_join(config_path, requirement.name)
             ] = value
-        # Only this analysis's component versions / architecture are required.
+
         failures = backend_class.unsatisfied(self.context, config_path)
         if failures:
             raise exceptions.VolatilityException(

@@ -1,5 +1,9 @@
-# SPDX-License-Identifier: MIT
-"""VFS path and host-alias readers; no container selection or display logic."""
+"""Resolve container-visible VFS paths and host mount aliases from Linux memory.
+Process, mount, and file views reuse these readers without selection or display policy.
+Incomplete walks and multiple valid aliases are preserved instead of guessed away.
+
+SPDX-License-Identifier: MIT
+"""
 
 import dataclasses
 import logging
@@ -49,7 +53,7 @@ MOUNT_PATH = PathPolicy(
 
 
 def read_dentry_name(dentry, *, policy=FILE_PATH):
-    """qstr 길이와 실제 이름을 대조한다. 잘린 이름으로 경로를 확정하지 않는다."""
+    """Compare qstr length with the decoded name and reject truncated components."""
     qname = dentry.d_name
     length = int(qname.len) if qname.has_member("len") else None
     if length is not None and not 1 <= length <= 255:
@@ -83,7 +87,7 @@ def walk_mount_path(
     policy=FILE_PATH,
     diagnostics=None,
 ):
-    """정확한 (mount, dentry) 루트까지 연결된 경로만 반환한다."""
+    """Return only paths connected to the exact mount and dentry root pair."""
 
     def readable(obj):
         return (
@@ -126,7 +130,7 @@ def walk_mount_path(
             if not readable(mount_root):
                 return "", policy.mount_root_error
             if key[1] == artifact_core._object_address(mount_root):
-                # unlink된 파일도 bind의 루트라면 그 bind 경로는 살아 있을 수 있다.
+
                 parent_mount = vfsmnt.get_vfsmnt_parent()
                 attachment = vfsmnt.get_mnt_mountpoint()
                 if not (readable(parent_mount) and readable(attachment)):
@@ -163,7 +167,7 @@ class SourceResolution:
 
 
 class FileHostMountResolver:
-    """파일 dentry를 입력받아 캡처된 호스트 마운트의 보이는 별칭을 찾는다."""
+    """Resolve visible aliases for a file dentry across captured host mounts."""
 
     def __init__(self, host_task, *, logger=None, diagnostics=None):
         self.diagnostics = diagnostics
@@ -263,6 +267,8 @@ class FileHostMountResolver:
             artifact_core.record_read_error(diagnostics, "host_mount.resolve", exc)
             return SourceResolution((), "PARTIAL")
         paths, complete = set(), self.complete
+        # One superblock may be visible through multiple host mounts, so preserve
+        # every resolved alias and partial traversal state instead of choosing one.
         for candidate in candidates:
             path, state = walk_mount_path(
                 self.root_dentry,

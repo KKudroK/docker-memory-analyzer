@@ -1,7 +1,8 @@
-# Internal network backend for linux.docker.Docker; shared readers live in linux/_artifacts.
-
-# Source section: identity
-"""Runtime argv evidence supplements cgroups without treating ancestry as proof."""
+"""Analyze container network state recovered from Linux memory.
+The --inspect-networks option exposes sockets, containers, interfaces, relations,
+conntrack entries, and diagnostics as separate views over shared evidence.
+Collection failures and unsupported structures remain visible in diagnostics.
+"""
 
 import ipaddress
 import json
@@ -240,8 +241,8 @@ def identity_collect(c, records):
             )
     for record in records:
         if record.get("shim_task"):
-            # A nested shim has its own runtime identity. Its parent's argv
-            # must not overwrite that scope, including on the shim's threads.
+
+
             continue
         node, seen = (record, set())
         while node.get("parent") in by_address:
@@ -291,7 +292,7 @@ def identity_collect(c, records):
         ns["container_candidates"] = sorted(candidates)
 
 
-# Source section: sockets
+
 """FD ownership and bounded reciprocal UNIX peer discovery."""
 
 
@@ -459,8 +460,8 @@ def sockets_collect(c, task_records=None):
             start_row = len(rows)
             indices = []
             fdt, count = sockets_fd_table(task.files.dereference(), c.limit)
-            # fd is file **. Dereferencing it reads slot zero before the
-            # per-slot failure boundary, hiding later pages if that slot faults.
+
+
             fds = (
                 c.context.object(
                     c.kernel.symbol_table_name + "!array",
@@ -531,7 +532,7 @@ def sockets_collect(c, task_records=None):
     return list(unique.values())
 
 
-# Source section: conntrack
+
 """Confirmed conntrack tuples (observed flows, not firewall configuration)."""
 
 
@@ -683,7 +684,7 @@ def conntrack_collect(c, unsupported):
     return rows
 
 
-# Source section: context
+
 """Observed ID references, FD holders and direct kernel object relations only."""
 
 
@@ -873,7 +874,7 @@ def context_build(report):
     }
 
 
-# Source section: collector
+
 """Kernel objects are identities; IP prefixes and names are attributes only."""
 
 
@@ -934,7 +935,7 @@ class Collector(artifact_core.CollectionSession):
             self._active_task = obj
         try:
             return fn(*args)
-        except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        except Exception as exc:
             self.issue(stage, obj, exc)
             return default
         finally:
@@ -977,7 +978,7 @@ class Collector(artifact_core.CollectionSession):
                 return None
 
             def read_inode():
-                # This backend supports Intel64 kernel virtual objects only.
+
                 if not address & ((self.layer.address_mask + 1) >> 1):
                     raise ValueError(
                         "network namespace is not a kernel virtual address"
@@ -1099,7 +1100,7 @@ class Collector(artifact_core.CollectionSession):
             }
             if alias not in evidence["address_aliases"]:
                 evidence["address_aliases"].append(alias)
-        except Exception as exc:  # noqa: BLE001 - Keep rejected scan evidence and the exact validation failure.
+        except Exception as exc:
             evidence["task_status"] = "unverified"
             evidence["validation"].append(
                 {
@@ -1116,7 +1117,7 @@ class Collector(artifact_core.CollectionSession):
         been detached. Readability does not prove the old css_set was not reused.
         """
         if task.cgroups and not task.cgroups.is_readable():
-            # Recover the actual Volatility fault layer/address when available.
+
             self.layer.read(int(task.cgroups), 1)
             raise ValueError(
                 f"unreadable residual css_set pointer {int(task.cgroups):#x}"
@@ -1140,7 +1141,7 @@ class Collector(artifact_core.CollectionSession):
         def check(name, reader):
             try:
                 valid = bool(reader())
-            except Exception as exc:  # noqa: BLE001 - Preserve failed candidate checks as evidence.
+            except Exception as exc:
                 evidence["validation"].append(
                     {
                         "check": name,
@@ -1164,7 +1165,7 @@ class Collector(artifact_core.CollectionSession):
         if state_valid and evidence["exit_state"] and ids_valid:
             evidence["task_status"] = "residual"
         elif not source.startswith("PsScan"):
-            # A partially readable linked task must still supply independent FDs.
+
             evidence["task_status"] = "linked"
         elif ids_valid and state_valid:
             valid = check("task_structure", task.is_valid)
@@ -1250,7 +1251,7 @@ class Collector(artifact_core.CollectionSession):
                 self.append_tasks,
                 args=(hidden_leaders, seen, "PsScan"),
             )
-        except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+        except Exception as exc:
             self.issue("tasks.psscan", "PsScan.scan_tasks", exc)
         for leader in list(self.tasks[linked_count:]):
             if not self.task_references_allowed(leader):
@@ -1299,14 +1300,14 @@ class Collector(artifact_core.CollectionSession):
         if self.kernel.has_symbol("net_namespace_list"):
             list_head = "net_namespace_list"
             try:
-                # ISF symbol addresses need the module's relocation offset.
-                # Supplying the type also supports BTF symbols without type metadata.
+
+
                 list_head = self.symbol("net_namespace_list", "list_head")
                 for net in self.walk(list_head, "net", "list"):
                     self.read(
                         "net", net, self.namespace, args=(net, "net_namespace_list")
                     )
-            except Exception as exc:  # noqa: BLE001 - Record the failure and preserve independent evidence.
+            except Exception as exc:
                 self.issue("net_namespace_list", list_head, exc)
         if self.kernel.has_symbol("init_net"):
             init_net = self.read(
@@ -1317,7 +1318,7 @@ class Collector(artifact_core.CollectionSession):
                     "net", init_net, self.namespace, args=(init_net, "init_net")
                 )
                 if entry is not None:
-                    # Use the same relocated, layer-masked address as task pointers.
+
                     self.init_net_address = entry["address"]
 
     def collect_tasks(self):
@@ -1650,7 +1651,7 @@ class Collector(artifact_core.CollectionSession):
         return report
 
 
-# Source section: views
+
 """Container membership and namespace context, without endpoint-based ownership.
 
 All IDs in a shared namespace remain visible even when one member is selected.
@@ -1891,7 +1892,7 @@ def views_rows(report, view, prefixes=None):
             )
 
 
-# Source section: plugin
+
 """Typed socket/holder records; rendering belongs to the selected CLI renderer."""
 vollog = logging.getLogger(__name__)
 
@@ -1918,9 +1919,9 @@ def plugin_namespace_inode(nets, address):
 
 
 class InspectNetworks(interfaces.plugins.PluginInterface):
-    hidden = True  # Exposed through linux.docker.Docker --inspect-networks.
+    hidden = True
     _required_framework_version = (2, 22, 0)
-    # 12.x marks the category/value TreeGrid output contract.
+
     _version = (12, 2, 2)
 
     @classmethod

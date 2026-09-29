@@ -1,13 +1,10 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 container-mounts contributors
-"""Read container mount views with Volatility 3 2.28.0.
+"""Analyze mount namespaces associated with container tasks in Linux memory.
+The --inspect-mounts option reports container paths, host aliases, filesystem types,
+and access modes using cgroup/runtime evidence or explicitly requested host PIDs.
+Every decoded mount and partial or multiple path result is preserved without scoring.
 
-Automatic selection uses recognized task cgroup membership or a supported
-runtime supervisor.  Explicit host PIDs bypass that selection.  Every decoded
-mount of a selected view is returned, without risk policy, scores or path filters.
-Container identity comes from task membership, not from files mounted into it.
-Host paths describe aliases in the captured host topology, not the original
-mount command.  Read failures and multiple aliases are preserved explicitly.
+SPDX-License-Identifier: MIT
+Copyright (c) 2026 container-mounts contributors
 """
 
 from __future__ import annotations
@@ -33,7 +30,7 @@ from volatility3.plugins.linux._artifacts import paths as path_readers
 vollog = logging.getLogger(__name__)
 
 
-# These states describe recovery, not risk or a probability of correctness.
+
 PATH_SINGLE = "SINGLE"
 PATH_MULTIPLE = "MULTIPLE"
 PATH_UNRESOLVED = "UNRESOLVED"
@@ -51,8 +48,8 @@ class Identity:
     evidence: str
 
 
-# Parse only task cgroup naming conventions here.  A mounted runtime storage
-# directory is not evidence that its ID owns the task inspecting that mount.
+
+
 IDENTITY_PATTERNS: tuple[tuple[re.Pattern, str, str, str], ...] = (
     (
         re.compile(rf"(?:^|/)docker-({_HEX64})\.scope(?=/|$)", re.IGNORECASE),
@@ -111,12 +108,12 @@ IDENTITY_PATTERNS: tuple[tuple[re.Pattern, str, str, str], ...] = (
 )
 
 
-# These names can identify a runtime supervisor in a task ancestry chain.
-# Short-lived launchers such as runc/crun and broad parents such as systemd or
-# dockerd are intentionally absent: their presence alone is not container
-# evidence.  Linux task comm is at most 15 visible bytes, so long signatures
-# are compared with their explicit 15-byte truncation, never by reverse
-# startswith matching.
+
+
+
+
+
+
 RUNTIME_SUPERVISORS: tuple[tuple[str, str], ...] = (
     ("containerd-shim", "containerd"),
     ("conmon", "podman/cri-o"),
@@ -201,7 +198,7 @@ def _cgroup_identity(
         for identity in _path_identities(membership.path):
             found.append((membership, identity))
 
-    # Do not resolve a conflict by order of controllers or by preferring v2.
+
     for kind in ("container", "pod"):
         identifiers = {item.identifier for _, item in found if item.id_kind == kind}
         if len(identifiers) > 1:
@@ -210,8 +207,8 @@ def _cgroup_identity(
     for id_kind in ("container", "pod"):
         candidates = [item for item in found if item[1].id_kind == id_kind]
         if candidates:
-            # Identical IDs may occur in several hierarchies.  Pick a stable
-            # description; this is not a confidence score.
+
+
             candidates.sort(
                 key=lambda item: (
                     0 if item[0].version == "v2" else 1,
@@ -662,8 +659,8 @@ def _read_mount_info(
             issues.append(name)
             return default
 
-    # A missing device name/flag is not a reason to discard an otherwise
-    # readable mount.  Keep failed flags empty so RO/RW cannot become guessed rw.
+
+
     parent_id = read_field("parent-id", lambda: int(mnt.mnt_parent.mnt_id), -1)
     st_dev = read_field(
         "device", lambda: f"{int(superblock.major)}:{int(superblock.minor)}", "-"
@@ -707,8 +704,8 @@ def _read_mount_info(
         exceptions.VolatilityException,
     ) as exc:
         artifact_core.record_read_error(diagnostics, "mount.path", exc)
-    # A detached self-parent namespace sentinel is intentionally outside the
-    # task root.  This proven absence is not an unreadable-path failure.
+
+
     expected_internal_root = (
         path_status == "OUTSIDE_ROOT"
         and mnt_id == parent_id
@@ -783,9 +780,9 @@ def _mount_access(data) -> tuple[bool | None, str]:
 class ContainerMounts(plugins.PluginInterface):
     """Find container-backed mount namespaces and inspect their mounts."""
 
-    hidden = True  # Exposed through linux.docker.Docker --inspect-mounts.
+    hidden = True
     _required_framework_version = (2, 13, 0)
-    # 1.x marks the category/value TreeGrid output contract.
+
     _version = (1, 1, 1)
 
     @classmethod
@@ -814,9 +811,9 @@ class ContainerMounts(plugins.PluginInterface):
                 name="pids",
                 description="Inspect these positive host PIDs without automatic target selection",
                 element_type=int,
-                # Also prevents Volatility's optional-list validation from
-                # rewriting an omitted value to [], which would erase the
-                # distinction between automatic mode and an empty --pids.
+
+
+
                 min_elements=1,
                 optional=True,
             ),
@@ -947,7 +944,7 @@ class ContainerMounts(plugins.PluginInterface):
             task_address = None
             try:
                 task_address = int(task.vol.offset)
-                # Do not read every task's cgroups for a manually selected PID.
+
                 pid = int(task.pid)
                 if wanted is not None and pid not in wanted:
                     continue
@@ -959,8 +956,8 @@ class ContainerMounts(plugins.PluginInterface):
                         for item in task_diagnostics
                     )
                 if observation is None:
-                    # Kernel threads normally have no filesystem/namespace
-                    # view; that is not a damaged mount in automatic mode.
+
+
                     if wanted is not None or (task.fs and task.nsproxy):
                         failed += 1
                     continue
@@ -984,7 +981,7 @@ class ContainerMounts(plugins.PluginInterface):
             else:
                 if namespace_address == host_address:
                     continue
-                # Selection is a declared relation, not a weighted score.
+
                 related = (
                     observation.identity is not None
                     or "cgroup-id-conflict" in observation.evidence
@@ -994,8 +991,8 @@ class ContainerMounts(plugins.PluginInterface):
                 )
                 if not related:
                     continue
-            # The address identifies the object.  An inode alone can collide
-            # in a damaged capture and must not merge unrelated namespaces.
+
+
             namespaces.setdefault(namespace_address, []).append(observation)
         if wanted is not None and wanted - found_pids:
             vollog.warning(
@@ -1024,8 +1021,8 @@ class ContainerMounts(plugins.PluginInterface):
             if item.identity and item.identity.id_kind == "container":
                 owner = ("container", item.identity.runtime, item.identity.identifier)
             else:
-                # A pod, an unknown ID or an unreadable hierarchy must not
-                # borrow the identity of a sibling simply sharing its MNT NS.
+
+
                 owner = (
                     "membership",
                     item.runtime,
@@ -1117,9 +1114,9 @@ class ContainerMounts(plugins.PluginInterface):
                 root_identity_unknown = False
                 if internal_root_candidate:
                     try:
-                        # Only sentinel candidates need this identity check.
-                        # Path/root fields are optional: a second failed read
-                        # must not discard the mount data already recovered.
+
+
+
                         mount_key = (
                             artifact_core._object_address(mnt.get_vfsmnt_current()),
                             artifact_core._object_address(mnt.get_mnt_root()),
@@ -1145,8 +1142,8 @@ class ContainerMounts(plugins.PluginInterface):
                 if is_internal_root:
                     source = path_readers.SourceResolution((), PATH_UNRESOLVED)
                 elif root_identity_unknown:
-                    # Do not guess whether an unreadable root is a sentinel
-                    # or the task's real root; retain its other fields.
+
+
                     source = path_readers.SourceResolution((), PATH_PARTIAL)
                 else:
                     if mount_address not in path_cache:
@@ -1201,8 +1198,8 @@ class ContainerMounts(plugins.PluginInterface):
             item.identifier for item in identities if item.id_kind == "container"
         }
         pod_ids = {item.identifier for item in identities if item.id_kind == "pod"}
-        # A cgroup path may contain both a pod scope and a leaf container ID.
-        # Read the pod label independently without putting it in Container ID.
+
+
         for observation in observations:
             for membership in observation.cgroup_memberships:
                 for identity in _path_identities(membership.path):
@@ -1250,7 +1247,7 @@ class ContainerMounts(plugins.PluginInterface):
         tasks = []
         task_list_partial = False
         try:
-            # Extend the existing list so an iterator failure preserves its prefix.
+
             tasks.extend(
                 docker_artifacts.DockerArtifacts.list_tasks(
                     self.context, self.config["kernel"]
@@ -1327,7 +1324,7 @@ class ContainerMounts(plugins.PluginInterface):
                     )
                 for record in records:
                     _writable, mode = _mount_access(record.data)
-                    # No per-path classifier or filtering runs here.
+
                     row = (
                         representative.pid,
                         int(representative.mnt_ns_id),
@@ -1351,7 +1348,7 @@ class ContainerMounts(plugins.PluginInterface):
             )
 
     def run(self):
-        self._requested_pids()  # Reject an empty --pids before starting dump traversal.
+        self._requested_pids()
         columns = [
             ("PID", int),
             ("MNT NS", int),
